@@ -32,9 +32,9 @@ from face_tracker import (
 import cv2
 
 ollama_config = {
-    "model": "llama3.1",
+    #"model": "llama3.1",
     #"model": "google/gemma-4-E4B-it",
-    #"model": "PetrosStav/gemma3-tools:12b",
+    "model": "PetrosStav/gemma3-tools:12b",
     "base_url": "http://localhost:11434/v1/",
     "api_key": "ollama"
 }
@@ -195,17 +195,22 @@ def compose_messages(sysp, mlst, augs, greet):
     n = 0
     i1 = 0
     i2 = 0
-    for i in reversed(range(len(mlst))):
-        if type(mlst[i])==dict and mlst[i]["role"] == 'user':
-            n += 1
-            if n == 1:
-                i2 = i
-            if n == messages_trunclen:
-                i1 = i
-                break
     if greet:
-        return [sysp] + mlst + augs + [greet]
+        i2 = len(mlst)
+        for i in reversed(range(len(mlst))):
+            if type(mlst[i])==dict and mlst[i]["role"] != 'tool':
+                i2 = i+1
+                break
+        return [sysp] + mlst[:i2] + augs + [greet] + mlst[i2:] 
     else:
+        for i in reversed(range(len(mlst))):
+            if type(mlst[i])==dict and mlst[i]["role"] == 'user':
+                n += 1
+                if n == 1:
+                    i2 = i
+                if n == messages_trunclen:
+                    i1 = i
+                    break
         return [sysp] + mlst[i1:i2] + augs + mlst[i2:]
 
 def clear_messages():
@@ -290,7 +295,7 @@ async def main():
                  'talk':      ((0.95, 0.75, 0), "~~~", ""),
                  }
         if has_name:
-            tmp = await client.read_resource("url://service_name")
+            tmp = await client.read_resource("url://get_service_name")
             name = tmp[0].text
         else:
             name = "MCP Speech Client"
@@ -469,12 +474,12 @@ async def main():
                             result_message = {
                                 "role": "tool",
                                 "content": json.dumps({
-                                    "result": result.content[0].text
+                                    "result": (result[0].text if type(result)==list else result.content[0].text)
                                 }),
                                 "tool_call_id": tool_call.id
                             }
                             print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                            print(  "  Result:   ", result.content[0].text)
+                            print(  "  Result:   ", (result[0].text if type(result)==list else result.content[0].text))
                             messages.append(result_message)
                         except exceptions.ToolError:
                             result_message = {
@@ -502,8 +507,8 @@ async def main():
                 print(f'\n  Response: {reply_text}')
                 set_win_state('talk')
                 if reply_text:
-                    #voice_out.speak(reply_text)
-                    speak(reply_text, lang)
+                    voice_out.speak(reply_text, lang)
+                    #speak(reply_text, lang)
                 set_state(state, 'listen')
                 if listener:
                     listener.paused = False

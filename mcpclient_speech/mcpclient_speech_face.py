@@ -70,18 +70,23 @@ voice_in: VoiceInput | None = None
 voice_out: VoiceOutput | None = None
 listener: ContinuousListener | None = None
 tracker: FaceTracker | None = None
+model: str | None = None
 
 def on_exit(state):
+    print("\n(Exit event)")
     state['evtime'] = time.time()
     state['newstate'] = 'exit'
 
 def on_face_change(id):
     global messages, state, curr_person
+    print("\n(Face change event)")
     if state['newstate'] == 'exit':
         return
     if curr_person:
         curr_person.lasttime = time.time()
         curr_person.lastmessages = messages
+        print("(Storing current person)")
+
     if id is None:
         messages = []
         curr_person = None
@@ -91,16 +96,21 @@ def on_face_change(id):
         if id in persondict:
             curr_person = persondict[id]
             messages = list(curr_person.lastmessages or [])
+            print(f"(Retrieving person {id} from memory)")
         else:
             curr_person = Person(None)
             persondict[id] = curr_person
             messages = []
+            print(f"(Creating person {id})")
         state['evtime'] = time.time()
         state['newstate'] = 'greet'
 
 def on_speech(txt):
     global curr_prompt, state
-    if state['currstate'] == 'listen' and state['newstate'] is None:
+    print("\n(Speech event)")
+    if state['newstate'] == 'exit':
+        return
+    if state['currstate'] == 'listen' and (state['newstate'] is None or state['newstate'] == 'listen'):
         curr_prompt = txt
         state['evtime'] = time.time()
         state['newstate'] = 'process'
@@ -115,6 +125,8 @@ def check_statechange(state):
         return False
 
 def set_state(state, newstate):
+    if listener:
+        listener.paused = (newstate != 'listen')
     state['currstate'] = newstate
     state['statetime'] = time.time()
     state['newstate'] = None
@@ -191,7 +203,7 @@ def greet_prompt():
     duration = int((time.time() - curr_person.lasttime) / 60)
     return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
 
-def compose_messages(sysp, mlst, augs, greet):
+def compose_messages(sysp, mlst, augs):
     n = 0
     i1 = 0
     i2 = 0
@@ -203,10 +215,7 @@ def compose_messages(sysp, mlst, augs, greet):
             if n == messages_trunclen:
                 i1 = i
                 break
-    if greet:
-        return [sysp] + mlst + augs + [greet]
-    else:
-        return [sysp] + mlst[i1:i2] + augs + mlst[i2:]
+    return [sysp] + mlst[i1:i2] + augs + mlst[i2:]
 
 def clear_messages():
     global messages
@@ -225,10 +234,16 @@ def kp_clear_messages(_event, _state):
     print("\n  (Cleared history)")
     clear_messages()
 
+def messagedump(messages):
+    print("\nMessages:")
+    for msg in messages:
+        print(msg)
+
 async def main():
     global messages
     global tools
     global win
+    global model
     global has_sysprompt
     global has_sysprompt_lang
     global has_augprompt
@@ -290,7 +305,7 @@ async def main():
                  'talk':      ((0.95, 0.75, 0), "~~~", ""),
                  }
         if has_name:
-            tmp = await client.read_resource("url://service_name")
+            tmp = await client.read_resource("url://get_service_name")
             name = tmp[0].text
         else:
             name = "MCP Speech Client"
@@ -326,8 +341,8 @@ async def main():
         ### Initialize the face_tracker here, with on_face_change as callback
         face_db = FaceDatabase()
         face_db.load()
-        emotion_detector = EmotionDetector()
-        tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
+        #emotion_detector = EmotionDetector()
+        tracker = FaceTracker(db=face_db) #, emotion_detector=emotion_detector)
 
         def _on_face_event(ev):
             new_id = ev.payload.new_track_id
@@ -414,15 +429,11 @@ async def main():
 
             if newstate in ('wait', 'listen'):
                 set_state(state, newstate)
-                if listener:
-                    listener.paused = (newstate != 'listen')
                 newstate = False
                 continue
 
             if newstate == 'process' or newstate == 'greet':
                 set_state(state, newstate)
-                if listener:
-                    listener.paused = True
 
                 if newstate == 'process':
                     # prompt came from speech (curr_prompt) or stdin (prompt)
@@ -436,23 +447,21 @@ async def main():
                 sysprompt = await system_message(client, lang)
                 augprompt = await augmentation_message(client, lang)
                 augpromptlist = []
-                greetprompt = False
                 if augprompt:
                     print("\n  Augmentation:")
                     print(augprompt['content'])
                     augpromptlist.append(augprompt)
-                if newstate == 'greet':
-                    greetprompt = greet_prompt()
-                    if greetprompt:
-                        print("\n  Greeting:")
-                        print(greetprompt['content'])
                 augpromptlist.append(langprompt)
                 if newstate == 'process':
                     print("\n  User: (", lang, ") ", prompt)
                     messages.append(user_message(prompt))
+                elif newstate == 'greet':
+                    greetprompt = greet_prompt()
+                    print("\n  Greeting:", greetprompt['content'])
+                    messages.append(greetprompt)
 
-                msg = compose_messages(sysprompt, messages, augpromptlist, greetprompt)
-                print(msg)
+                msg = compose_messages(sysprompt, messages, augpromptlist)
+                messagedump(msg)
                 response = openai.chat.completions.create(
                     model=model,
                     messages=msg,
@@ -466,15 +475,19 @@ async def main():
                         try:
                             result = await client.call_tool(tool_call.function.name,
                                                             json.loads(tool_call.function.arguments))
+                            if type(result)==list:
+                                resulttxt = result[0].text
+                            else:
+                                resulttxt = result.content[0].text
                             result_message = {
                                 "role": "tool",
                                 "content": json.dumps({
-                                    "result": result.content[0].text
+                                    "result": resulttxt
                                 }),
                                 "tool_call_id": tool_call.id
                             }
                             print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                            print(  "  Result:   ", result.content[0].text)
+                            print(  "  Result:   ", resulttxt)
                             messages.append(result_message)
                         except exceptions.ToolError:
                             result_message = {
@@ -487,8 +500,8 @@ async def main():
                             print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
                             messages.append(result_message)
     
-                    msg = compose_messages(sysprompt, messages, augpromptlist, greetprompt)
-                    print(msg)
+                    msg = compose_messages(sysprompt, messages, augpromptlist)
+                    messagedump(msg)
                     response = openai.chat.completions.create(
                         model=model,
                         messages=msg,
@@ -502,11 +515,10 @@ async def main():
                 print(f'\n  Response: {reply_text}')
                 set_win_state('talk')
                 if reply_text:
-                    #voice_out.speak(reply_text)
-                    speak(reply_text, lang)
+                    voice_out.speak(reply_text, lang)
+                    #speak(reply_text, lang)
                 set_state(state, 'listen')
-                if listener:
-                    listener.paused = False
+
                 newstate = False
     
         if has_exit:

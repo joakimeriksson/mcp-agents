@@ -445,7 +445,7 @@ class VoiceInput:
 
     def __init__(self, *,
                  whisper_model_size: str = "medium",
-                 whisper_compute_type: str = "int8",
+                 whisper_compute_type: str = "float16",
                  sample_rate: int = SAMPLE_RATE,
                  vad_threshold: float = VAD_THRESHOLD,
                  vad_silence_ms: int = VAD_SILENCE_MS,
@@ -520,7 +520,8 @@ class VoiceInput:
         try:
             logger.info(f"Loading whisper model ({self._whisper_size})...")
             self._whisper_model = WhisperModel(self._whisper_size,
-                                                compute_type=self._whisper_compute)
+                                               compute_type=self._whisper_compute,
+                                               device="cuda")
             self._emit(VoiceEventType.MODEL_READY,
                        ModelReadyPayload("whisper", f"{self._whisper_size} ({self._whisper_compute})"))
             logger.info("Whisper model loaded.")

@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import sys
+import re
 
 import openai
 from openai import OpenAI
@@ -72,6 +73,45 @@ listener: ContinuousListener | None = None
 tracker: FaceTracker | None = None
 model: str | None = None
 
+def extract_dialog_messages(messages):
+    return [ msg for msg in messages if (msg['role'] == 'user' if type(msg)==dict else msg.content) ]
+
+def distill_user_info(messages):
+    prompt = {'role':'user', 'content':'Summarize the above conversation in this form about the user, leaving fields blank if no information:\nName: \nLanguage: \nPreferences: \n'}
+    response = openai.chat.completions.create(
+        model=model,
+        messages=messages + [prompt],
+    )
+    return response.choices[0].message.content
+
+def extract_value(key, info):
+    reg = "[-+ *#]*" + key + "[-+ *#]*"
+    lst = info.split("\n")
+    for s in lst:
+        m = re.match(reg, s)
+        if m:
+            return s[m.end():]
+    return None
+
+def extract_language(info):
+    languages = {"English": "en",
+                 "Swedish": "sv",
+                 "Svenska": "sv",
+                 "German": "de",
+                 "Deutch": "de",
+                 "French": "fr",
+                 "Française": "fr",
+                 "Francaise": "fr",
+                 "Spanish": "es",
+                 "Espanol": "es",
+                 "Español": "es"}
+    s = extract_value("Language:", info)
+    if s:
+        for l in languages:
+            if re.search(l, s):
+                return languages[l]
+    return "en"
+
 def on_exit(state):
     print("\n(Exit event)")
     state['evtime'] = time.time()
@@ -83,10 +123,19 @@ def on_face_change(id):
     if state['newstate'] == 'exit':
         return
     if curr_person:
+        print("(Storing current person)")
         curr_person.lasttime = time.time()
         curr_person.lastmessages = messages
-        print("(Storing current person)")
-
+        info = distill_user_info(extract_dialog_messages(messages))
+        name = extract_value("Name:", info)
+        if name:
+            curr_person.name = name
+        lang = extract_language(info)
+        if lang:
+            curr_person.lang = lang
+        pref = extract_value("Preferences:", info)
+        if pref:
+            curr_person.profileinfo = pref
     if id is None:
         messages = []
         curr_person = None
@@ -201,7 +250,7 @@ def greet_prompt():
     if curr_person.lasttime is None:
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
     duration = int((time.time() - curr_person.lasttime) / 60)
-    return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
+    return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. {("Known preferences: " + curr_person.preferences if curr_person.preferences else "")} It was {duration} minutes since you last met. Produce a suitable greeting.'}
 
 def compose_messages(sysp, mlst, augs):
     n = 0
@@ -341,8 +390,8 @@ async def main():
         ### Initialize the face_tracker here, with on_face_change as callback
         face_db = FaceDatabase()
         face_db.load()
-        #emotion_detector = EmotionDetector()
-        tracker = FaceTracker(db=face_db) #, emotion_detector=emotion_detector)
+        emotion_detector = EmotionDetector()
+        tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
 
         def _on_face_event(ev):
             new_id = ev.payload.new_track_id
@@ -512,11 +561,11 @@ async def main():
                 # No tool calls, just print the response.
                 messages.append(response.choices[0].message)
                 reply_text = response.choices[0].message.content or ""
-                print(f'\n  Response: {reply_text}')
+                print(f'\n  Response: {reply_text}  (lang={lang})')
                 set_win_state('talk')
                 if reply_text:
-                    voice_out.speak(reply_text, lang)
-                    #speak(reply_text, lang)
+                    #voice_out.speak(reply_text, lang)
+                    speak(reply_text, lang)
                 set_state(state, 'listen')
 
                 newstate = False

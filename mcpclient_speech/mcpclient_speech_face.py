@@ -402,9 +402,10 @@ async def main():
                           event_types={FaceEventType.FOCUS_CHANGED})
 
         def _camera_loop():
-            cap = cv2.VideoCapture(4)
+            cam_index = int(os.environ.get('FACE_CAMERA_INDEX', '4'))
+            cap = cv2.VideoCapture(cam_index)
             if not cap.isOpened():
-                print('Could not open camera 0')
+                print(f'Could not open camera {cam_index}')
                 return
             try:
                 while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
@@ -413,6 +414,23 @@ async def main():
                         time.sleep(0.05)
                         continue
                     tracker.process_frame(frame)
+                    if win is not None:
+                        primary = tracker.get_primary_face()
+                        primary_tid = primary.track_id if primary else None
+                        for face in tracker.get_visible_faces():
+                            top, right, bottom, left = face.bbox
+                            focused = face.track_id == primary_tid
+                            color = (0, 255, 255) if focused else (0, 200, 0)
+                            thickness = 3 if focused else 2
+                            cv2.rectangle(frame, (left, top), (right, bottom),
+                                          color, thickness)
+                            label = f"#{face.track_id}"
+                            if face.emotion:
+                                label += f" {face.emotion}"
+                            cv2.putText(frame, label, (left, max(12, top - 6)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
+                                        cv2.LINE_AA)
+                        win.set_camera_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             finally:
                 cap.release()
 

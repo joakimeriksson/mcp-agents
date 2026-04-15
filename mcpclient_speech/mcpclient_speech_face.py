@@ -724,7 +724,16 @@ def run():
             print("ERROR: No cameras found. Use --camera N.")
             sys.exit(1)
 
-    asyncio.run(main(args))
+    try:
+        asyncio.run(main(args))
+    except (ConnectionError, OSError) as e:
+        print(f"ERROR: Cannot connect to MCP server at {args.server}: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nShutting down")
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

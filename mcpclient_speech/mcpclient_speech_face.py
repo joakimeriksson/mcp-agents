@@ -3,11 +3,12 @@
 # and using a speechbased LLM interface with whisper and piper.
 #
 
+import argparse
 import asyncio
 from fastmcp import Client, exceptions
 from fastmcp.client.transports import SSETransport
-import base64
 import json
+import logging
 import os
 import threading
 import time
@@ -24,7 +25,6 @@ if _FACE_DIR not in sys.path:
 
 from readnb import *
 from eyewindow import *
-from record import *
 from voice_input import VoiceInput, ContinuousListener, VoiceEventType
 from voice_output import VoiceOutput
 from face_tracker import (
@@ -32,15 +32,52 @@ from face_tracker import (
 )
 import cv2
 
+logger = logging.getLogger("mcpclient_speech")
+
 ollama_config = {
-    #"model": "llama3.1",
-    #"model": "google/gemma-4-E4B-it",
     "model": "PetrosStav/gemma3-tools:12b",
     "base_url": "http://localhost:11434/v1/",
     "api_key": "ollama"
 }
 
 default_lang = "sv"
+
+def list_cameras(max_index=10):
+    available = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            info = {
+                'index': i,
+                'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                'fps': cap.get(cv2.CAP_PROP_FPS),
+                'backend': cap.getBackendName(),
+            }
+            available.append(info)
+            cap.release()
+    return available
+
+
+def find_first_camera(max_index=10):
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            cap.release()
+            return i
+    return None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="MCP Speech Client with Face Tracking")
+    parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
+    parser.add_argument('--camera', type=int, default=None, help='Camera index (default: auto-detect)')
+    parser.add_argument('--server', default="http://127.0.0.1:7999/sse", help='MCP server SSE URL')
+    parser.add_argument('--llm-model', default="PetrosStav/gemma3-tools:12b", help='LLM model name')
+    parser.add_argument('--llm-url', default="http://localhost:11434/v1/", help='LLM base URL')
+    parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
+    return parser.parse_args()
+
 messages_trunclen = 8
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
@@ -200,7 +237,20 @@ def init_llm(conf):
     if "base_url" in default_config:
         openai.base_url = default_config["base_url"]
     model = default_config["model"]
-    llm = OpenAI(api_key=openai.api_key)
+    llm = OpenAI(api_key=openai.api_key, base_url=openai.base_url)
+
+    # Verify connection and model availability
+    try:
+        available = llm.models.list()
+        model_ids = [m.id for m in available.data]
+        if model not in model_ids:
+            print(f"ERROR: Model '{model}' not available in Ollama.")
+            print(f"Available models: {', '.join(model_ids)}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Cannot connect to LLM server at {openai.base_url}: {e}")
+        sys.exit(1)
+
     return (llm, model)
 
 def map_tool_definition(f):
@@ -299,7 +349,7 @@ def messagedump(messages):
     for msg in messages:
         print(msg)
 
-async def main():
+async def main(args):
     global messages
     global tools
     global win
@@ -314,8 +364,8 @@ async def main():
     global voice_in, voice_out, listener, tracker
     global curr_prompt
 
-    # Connect via stdio to a local script
-    async with Client(transport=SSETransport("http://127.0.0.1:7999/sse")) as client:
+    # Connect via SSE to the MCP server
+    async with Client(transport=SSETransport(args.server)) as client:
         ### Initialization phase
 
         # Check MCP server capabilities
@@ -354,7 +404,12 @@ async def main():
 
         make_nonblocking(sys.stdin)
 
-        llm, model = init_llm(ollama_config)
+        llm_config = {
+            "model": args.llm_model,
+            "base_url": args.llm_url,
+            "api_key": "ollama",
+        }
+        llm, model = init_llm(llm_config)
         print(f'LLM Chatbot using model {model}')
 
         # new states: wait, listen, greet, process, talk
@@ -413,9 +468,9 @@ async def main():
                           event_types={FaceEventType.FOCUS_CHANGED})
 
         def _camera_loop():
-            cap = cv2.VideoCapture(0)
+            cap = cv2.VideoCapture(args.camera)
             if not cap.isOpened():
-                print('Could not open camera 0')
+                logger.error("Could not open camera %d", args.camera)
                 return
             try:
                 while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
@@ -622,6 +677,42 @@ async def main():
         #exit_audio()
         print('Exiting')
 
+def run():
+    args = parse_args()
+
+    # Configure logging
+    log_level = logging.WARNING
+    if args.verbose >= 2:
+        log_level = logging.DEBUG
+    elif args.verbose >= 1:
+        log_level = logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    # List cameras and exit
+    if args.list_cameras:
+        cameras = list_cameras()
+        if cameras:
+            print("Available cameras:")
+            for c in cameras:
+                print(f"  Index {c['index']}: {c['width']}x{c['height']} @ {c['fps']:.1f} fps ({c['backend']})")
+        else:
+            print("No cameras found")
+        sys.exit(0)
+
+    # Resolve camera index
+    if args.camera is None:
+        args.camera = find_first_camera()
+        if args.camera is not None:
+            print(f"Auto-selected camera at index {args.camera}")
+        else:
+            print("ERROR: No cameras found. Use --camera N.")
+            sys.exit(1)
+
+    asyncio.run(main(args))
+
+
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    run()

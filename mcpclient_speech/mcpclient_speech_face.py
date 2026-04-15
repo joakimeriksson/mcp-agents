@@ -470,11 +470,12 @@ async def main(args):
         tracker.subscribe(_on_face_event,
                           event_types={FaceEventType.FOCUS_CHANGED})
 
+        cap = cv2.VideoCapture(args.camera)
+        if not cap.isOpened():
+            print(f"ERROR: Could not open camera {args.camera}")
+            sys.exit(1)
+
         def _camera_loop():
-            cap = cv2.VideoCapture(args.camera)
-            if not cap.isOpened():
-                logger.error("Could not open camera %d", args.camera)
-                return
             try:
                 while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
                     ret, frame = cap.read()

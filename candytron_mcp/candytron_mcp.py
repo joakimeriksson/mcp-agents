@@ -1,7 +1,6 @@
 #----------------
 
 from fastmcp import FastMCP
-from fastmcp.prompts import Message
 import argparse
 import atexit
 import logging
@@ -43,7 +42,7 @@ def service_exit() -> bool:
 
 
 @mcp.prompt()
-def get_service_prompt(lang: str) -> Message:
+def get_service_prompt(lang: str) -> str:
     """Return the system message snippet suitable for this service."""
     names = { "en": "Candy Tron",
               "sv": "Kandutron",
@@ -53,7 +52,7 @@ def get_service_prompt(lang: str) -> Message:
     if not lang in names:
         lang = 'en'
     name = names[lang]
-    return Message(f"Your name is {name}. You are situated at an exhibition to demonstrate how several AI systems can be connected, such as speech recognition, a large language model, speech synthesis, computer vision, and a robot arm. You are this system. Specifically, you have a robot arm, which allows you to move different types of candy between different positions on a table. You can chat with the visitors, and they may ask about your demonstration. They may also ask you to move candy around on the table or to give them some specific candy. When you know what specific candy on the table the user wants (but not before), you hand it out to them by moving it to the special position O0. Information on the latest positions of candy and their characteristics will be regularly provided by the vision system, for you to internally look up information needed to answer questions or perform moves. However, you never give this type of lists directly to the user. Your replies are friendly, concise and as plain text with no formatting.")
+    return f"Your name is {name}. You are situated at an exhibition to demonstrate how several AI systems can be connected, such as speech recognition, a large language model, speech synthesis, computer vision, and a robot arm. You are this system. Specifically, you have a robot arm, which allows you to move different types of candy between different positions on a table. You can chat with the visitors, and they may ask about your demonstration. They may also ask you to move candy around on the table or to give them some specific candy. When you know what specific candy on the table the user wants (but not before), you hand it out to them by moving it to the special position O0. Information on the latest positions of candy and their characteristics will be regularly provided by the vision system, for you to internally look up information needed to answer questions or perform moves. However, you never give this type of lists directly to the user. Your replies are friendly, concise and as plain text with no formatting."
 
 def scene_message(scene, lang):
     if not lang in transhead:
@@ -69,10 +68,10 @@ def scene_message(scene, lang):
     return content
 
 @mcp.prompt()
-def get_service_augmentation(lang: str) -> Message:
+def get_service_augmentation(lang: str) -> str:
     """Return extra information on the current state, to insert before the user prompt"""
     scene = scene_state.get_scene()
-    return Message(scene_message(scene, lang))
+    return scene_message(scene, lang)
 
 @mcp.tool()
 def show_demo_move() -> str:

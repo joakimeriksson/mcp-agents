@@ -25,7 +25,7 @@ if _FACE_DIR not in sys.path:
 
 from readnb import *
 from eyewindow import *
-from voice_input import VoiceInput, ContinuousListener, VoiceEventType
+from voice_input import VoiceInput, ContinuousListener, VoiceEventType, list_input_devices
 from voice_output import VoiceOutput
 from face_tracker import (
     FaceTracker, FaceDatabase, EmotionDetector, FaceEventType,
@@ -108,6 +108,8 @@ def parse_args():
     parser.add_argument('--server', default="http://127.0.0.1:7999/sse", help='MCP server SSE URL')
     parser.add_argument('--llm-model', default="PetrosStav/gemma3-tools:12b", help='LLM model name')
     parser.add_argument('--llm-url', default="http://localhost:11434/v1/", help='LLM base URL')
+    parser.add_argument('-m', '--list-mics', action='store_true', help='List available microphones and exit')
+    parser.add_argument('--mic', type=int, default=None, help='Microphone device index (default: system default)')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
     return parser.parse_args()
 
@@ -432,7 +434,7 @@ async def main(args):
         print('Created the interaction window')
 
         ### Initialize voice_input library, as ContinuousListener with on_speech as callback here
-        voice_in = VoiceInput()
+        voice_in = VoiceInput(device=args.mic)
         voice_in.subscribe(
             lambda ev: on_speech(ev.payload.text),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
@@ -667,6 +669,17 @@ def run():
         level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # List microphones and exit
+    if args.list_mics:
+        mics = list_input_devices()
+        if mics:
+            print("Available microphones:")
+            for idx, name, channels, rate in mics:
+                print(f"  Index {idx}: {name} ({channels}ch, {int(rate)}Hz)")
+        else:
+            print("No microphones found")
+        sys.exit(0)
 
     # List cameras and exit
     if args.list_cameras:

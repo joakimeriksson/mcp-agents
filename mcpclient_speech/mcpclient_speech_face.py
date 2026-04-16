@@ -160,26 +160,26 @@ def kp_toggle_mute(_event, _obj):
     if muted:
         if listener:
             listener.paused = True
-        print("\n  (Muted)")
+        logger.info("Muted")
         if win:
             win.set_state('muted')
     else:
-        print("\n  (Unmuted)")
+        logger.info("Unmuted")
         if win:
             win.set_state(state.get('currstate', 'wait'))
 
 def on_exit(state):
-    print("\n(Exit event)")
+    logger.info("Exit event")
     state['evtime'] = time.time()
     state['newstate'] = 'exit'
 
 def on_face_change(id):
     global messages, state, curr_person
-    print("\n(Face change event)")
+    logger.info("Face change event")
     if muted or state['newstate'] == 'exit':
         return
     if curr_person:
-        print("(Storing current person)")
+        logger.info("Storing current person")
         curr_person.lasttime = time.time()
         if curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
             curr_person.lastmessages = messages
@@ -204,12 +204,12 @@ def on_face_change(id):
         if id in persondict:
             curr_person = persondict[id]
             messages = list(curr_person.lastmessages or [])
-            print(f"(Retrieving person {id} from memory)")
+            logger.info("Retrieving person %s from memory", id)
         else:
             curr_person = Person(None)
             persondict[id] = curr_person
             messages = []
-            print(f"(Creating person {id})")
+            logger.info("Creating person %s", id)
         state['evtime'] = time.time()
         if curr_person.lasttime and state['evtime'] - curr_person.lasttime < 60:
             state['newstate'] = 'listen'
@@ -220,7 +220,7 @@ def on_speech(txt):
     global curr_prompt, state
     if muted:
         return
-    print("\n(Speech event)")
+    logger.info("Speech event")
     if state['newstate'] == 'exit':
         return
     if state['currstate'] == 'listen' and (state['newstate'] is None or state['newstate'] == 'listen'):

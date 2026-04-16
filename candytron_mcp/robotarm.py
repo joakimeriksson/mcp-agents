@@ -1,5 +1,9 @@
+import logging
 import ned2
 import threading
+
+logger = logging.getLogger("candytron.robot")
+
 
 class SingleJobWorker:
     def __init__(self, target_func):
@@ -37,6 +41,7 @@ class SingleJobWorker:
         """Block until no job is running."""
         self.job_done.wait()
 
+
 ned: ned2.Ned2 | None = None
 _ned_worker: SingleJobWorker | None = None
 
@@ -45,7 +50,7 @@ def _async_ned_call(args: dict) -> None:
     if not ned:
         return
     if not 'op' in args:
-        print(f"Error: async ned: unknown command {args}")
+        logger.error("Unknown command: %s", args)
         return
     op = args['op']
     if op == 'home':
@@ -56,14 +61,14 @@ def _async_ned_call(args: dict) -> None:
         try:
             ned.pick_and_place(src, dst)
         except Exception as e:
-            print(f"Failed to move {e}")
+            logger.error("Failed to move: %s", e)
             if ned.collision_detected:
                 ned.clear_collision_detected()
                 args['next'] = 'home'
         if 'next' in args and args['next'] == 'home':
             ned.move_to_home_pose()
     else:
-        print(f"async-ned: unknown op {op}")
+        logger.error("Unknown op: %s", op)
 
 def ned_move_home():
     if _ned_worker:
@@ -95,4 +100,3 @@ def exit_ned():
     if _ned_worker:
         _ned_worker.wait_until_idle()
         ned.close()
-

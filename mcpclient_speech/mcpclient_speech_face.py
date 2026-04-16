@@ -482,12 +482,28 @@ async def main(args):
         emotion_detector = EmotionDetector()
         tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
 
-        def _on_face_event(ev):
-            new_id = ev.payload.new_track_id
-            on_face_change(new_id if new_id else None)
+        focus_state = {"track_id": None, "person_id": None}
 
-        tracker.subscribe(_on_face_event,
-                          event_types={FaceEventType.FOCUS_CHANGED})
+        def _emit(person_id):
+            if person_id != focus_state["person_id"]:
+                focus_state["person_id"] = person_id
+                on_face_change(person_id)
+
+        def _on_face_event(ev):
+            if ev.type == FaceEventType.FOCUS_CHANGED:
+                focus_state["track_id"] = ev.payload.new_track_id
+                _emit(ev.payload.new_person_id)
+            elif ev.type in (FaceEventType.IDENTITY_CONFIRMED,
+                             FaceEventType.FACE_ENROLLED):
+                if ev.track_id == focus_state["track_id"]:
+                    _emit(ev.payload.person_id)
+
+        tracker.subscribe(
+            _on_face_event,
+            event_types={FaceEventType.FOCUS_CHANGED,
+                         FaceEventType.IDENTITY_CONFIRMED,
+                         FaceEventType.FACE_ENROLLED},
+        )
 
         cap = cv2.VideoCapture(args.camera)
         if not cap.isOpened():

@@ -84,6 +84,8 @@ messages_trunclen = 8
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
 
+muted = False
+
 has_sysprompt = False
 has_sysprompt_lang = False
 has_augprompt = False
@@ -152,6 +154,20 @@ def extract_language(info):
                 return languages[l]
     return "en"
 
+def kp_toggle_mute(_event, _obj):
+    global muted
+    muted = not muted
+    if muted:
+        if listener:
+            listener.paused = True
+        print("\n  (Muted)")
+        if win:
+            win.set_state('muted')
+    else:
+        print("\n  (Unmuted)")
+        if win:
+            win.set_state(state.get('currstate', 'wait'))
+
 def on_exit(state):
     print("\n(Exit event)")
     state['evtime'] = time.time()
@@ -160,7 +176,7 @@ def on_exit(state):
 def on_face_change(id):
     global messages, state, curr_person
     print("\n(Face change event)")
-    if state['newstate'] == 'exit':
+    if muted or state['newstate'] == 'exit':
         return
     if curr_person:
         print("(Storing current person)")
@@ -202,6 +218,8 @@ def on_face_change(id):
 
 def on_speech(txt):
     global curr_prompt, state
+    if muted:
+        return
     print("\n(Speech event)")
     if state['newstate'] == 'exit':
         return
@@ -221,7 +239,7 @@ def check_statechange(state):
 
 def set_state(state, newstate):
     if listener:
-        listener.paused = (newstate != 'listen')
+        listener.paused = muted or (newstate != 'listen')
     state['currstate'] = newstate
     state['statetime'] = time.time()
     state['newstate'] = None
@@ -420,6 +438,7 @@ async def main(args):
                  'greet':     ((0.9, 0.5, 0), "Contact", "Please wait"),
                  'process':   ((0.9, 0.5, 0), "Processing", "Please wait"),
                  'talk':      ((0.95, 0.75, 0), "~~~", ""),
+                 'muted':     ((0.4, 0.4, 0.4), "MUTED", "Press 'm' to unmute"),
                  }
         if has_name:
             tmp = await client.read_resource("url://get_service_name")
@@ -428,7 +447,7 @@ async def main(args):
             name = "MCP Speech Client"
         win = EyeWindow(name, sdict, 'ready')
         win.set_exit_callback(on_exit, state)
-        #win.keydict["c"] = (kp_clear_messages, None)
+        win.keydict["m"] = (kp_toggle_mute, None)
         win.check_events()
         print('Created the interaction window')
 

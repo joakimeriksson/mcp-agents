@@ -327,7 +327,7 @@ def greet_prompt():
     if curr_person.lasttime is None: # This alternative was added by Claude but it should actually never happen
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
     duration = int((time.time() - curr_person.lasttime) / 60)
-    pref = ("Known preferences: " + curr_person.preferences) if curr_person.preferences else ""
+    pref = ("Known preferences: " + curr_person.profileinfo) if curr_person.profileinfo else ""
     if not curr_person.name:
         return {'role':'user', 'content': f'A person has appeared in front of you. {pref} It was {duration} minutes since you last met, but you still dont know the name. Produce a suitable greeting and ask for the name.'}
     else:

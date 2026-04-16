@@ -72,7 +72,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="MCP Speech Client with Face Tracking")
     parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
     parser.add_argument('--camera', type=int, default=None, help='Camera index (default: auto-detect)')
-    parser.add_argument('--server', default="http://127.0.0.1:7999/sse", help='MCP server SSE URL')
+    parser.add_argument('--server', default="http://127.0.0.1:8000/sse", help='MCP server SSE URL')
     parser.add_argument('--llm-model', default="PetrosStav/gemma3-tools:12b", help='LLM model name')
     parser.add_argument('--llm-url', default="http://localhost:11434/v1/", help='LLM base URL')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
@@ -193,7 +193,7 @@ def on_face_change(id):
             messages = []
             print(f"(Creating person {id})")
         state['evtime'] = time.time()
-        if state['evtime'] - curr_person.lasttime < 60:
+        if curr_person.lasttime and state['evtime'] - curr_person.lasttime < 60:
             state['newstate'] = 'listen'
         else:
             state['newstate'] = 'greet'

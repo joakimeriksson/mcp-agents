@@ -140,6 +140,7 @@ class EyeWindow:
             if frame.shape[:2] != self.cam_im.get_array().shape[:2]:
                 self.cam_ax.set_xlim(-0.5, frame.shape[1] - 0.5)
                 self.cam_ax.set_ylim(frame.shape[0] - 0.5, -0.5)
-            self.win.fig.canvas.draw_idle()
+            self.cam_ax.draw_artist(self.cam_im)
+            self.win.fig.canvas.blit(self.cam_ax.bbox)
         self.win.fig.canvas.flush_events()
 

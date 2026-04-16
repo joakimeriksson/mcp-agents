@@ -33,9 +33,9 @@ from face_tracker import (
 import cv2
 
 ollama_config = {
-    "model": "llama3.1",
+    #"model": "llama3.1",
     #"model": "google/gemma-4-E4B-it",
-    #"model": "PetrosStav/gemma3-tools:12b",
+    "model": "PetrosStav/gemma3-tools:12b",
     "base_url": "http://localhost:11434/v1/",
     "api_key": "ollama"
 }
@@ -413,7 +413,7 @@ async def main():
                           event_types={FaceEventType.FOCUS_CHANGED})
 
         def _camera_loop():
-            cap = cv2.VideoCapture(4)
+            cap = cv2.VideoCapture(0)
             if not cap.isOpened():
                 print('Could not open camera 0')
                 return
@@ -423,7 +423,31 @@ async def main():
                     if not ret:
                         time.sleep(0.05)
                         continue
-                    tracker.process_frame(frame)
+                    faces = tracker.process_frame(frame)
+                    focus_id = tracker.focus_track_id
+                    for face in (faces or []):
+                        top, right, bottom, left = face.bbox
+                        is_focus = (focus_id is not None and face.track_id == focus_id)
+                        pid = tracker.get_person_id(face.track_id)
+                        if is_focus:
+                            color, thickness = (100, 255, 0), 3
+                        elif pid:
+                            color, thickness = (0, 200, 0), 2
+                        else:
+                            color, thickness = (200, 0, 0), 1
+                        cv2.rectangle(frame, (left, top), (right, bottom), color[::-1], thickness)
+                        label = f"#{face.track_id}"
+                        if pid:
+                            label += f" {pid}"
+                        if is_focus:
+                            label += " [FOCUS]"
+                        if face.emotion and face.emotion != "neutral":
+                            label += f" {face.emotion}"
+                        cv2.rectangle(frame, (left, bottom), (right, bottom + 22), color[::-1], cv2.FILLED)
+                        cv2.putText(frame, label, (left + 4, bottom + 16),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    win.set_camera_frame(rgb)
             finally:
                 cap.release()
 

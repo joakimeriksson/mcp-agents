@@ -177,12 +177,14 @@ VoiceEventCallback = Callable[[VoiceEvent], None]
 class AudioMonitor:
     """Monitors microphone input levels (RMS, peak, dB)."""
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, decay: float = AUDIO_METER_DECAY):
+    def __init__(self, sample_rate: int = SAMPLE_RATE, decay: float = AUDIO_METER_DECAY,
+                 device: int | None = None):
         self.rms: float = 0.0
         self.peak: float = 0.0
         self.max_seen: float = 0.001
         self._sample_rate = sample_rate
         self._decay = decay
+        self._device = device
         self._stream = None
 
     def start(self):
@@ -200,7 +202,7 @@ class AudioMonitor:
 
         self._stream = sd.InputStream(
             samplerate=self._sample_rate, channels=1, dtype='float32',
-            blocksize=blocksize, callback=callback
+            blocksize=blocksize, callback=callback, device=self._device
         )
         self._stream.start()
 
@@ -241,8 +243,10 @@ class EchoDetector:
     def __init__(self,
                  stream_rate: int = SAMPLE_RATE,
                  speech_threshold: float = 0.08,
-                 min_duration_ms: int = 200):
+                 min_duration_ms: int = 200,
+                 device: int | None = None):
         self._stream_rate = stream_rate
+        self._device = device
         self._speech_threshold = speech_threshold
         self._min_chunks = max(1, min_duration_ms // 10)  # 10ms frames
         self._stream: Optional[sd.Stream] = None
@@ -387,7 +391,7 @@ class EchoDetector:
         self._stream = sd.Stream(
             samplerate=sr, channels=1, dtype='float32',
             blocksize=frame_samples * 10,  # 100ms blocks (10 APM frames)
-            callback=callback,
+            callback=callback, device=self._device,
         )
         self._stream.start()
         logger.info(f"[AEC] started full-duplex stream at {sr}Hz, "
@@ -437,6 +441,13 @@ class EchoDetector:
 # VoiceInput
 # ---------------------------------------------------------------------------
 
+def list_input_devices():
+    """Return a list of available input devices with index, name, channels, and sample rate."""
+    devices = sd.query_devices()
+    return [(i, d['name'], d['max_input_channels'], d['default_samplerate'])
+            for i, d in enumerate(devices) if d['max_input_channels'] > 0]
+
+
 class VoiceInput:
     """Speech-to-text engine: VAD + whisper transcription.
 
@@ -452,10 +463,12 @@ class VoiceInput:
                  vad_max_speech_s: float = VAD_MAX_SPEECH_S,
                  vad_pre_speech_ms: int = VAD_PRE_SPEECH_MS,
                  noise_reduce: bool = NOISE_REDUCE,
-                 record_seconds: int = RECORD_SECONDS):
+                 record_seconds: int = RECORD_SECONDS,
+                 device: int | None = None):
         self._whisper_size = whisper_model_size
         self._whisper_compute = whisper_compute_type
         self._sample_rate = sample_rate
+        self._device = device
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
         self._vad_max_speech_s = vad_max_speech_s
@@ -609,7 +622,7 @@ class VoiceInput:
 
         stream = sd.InputStream(
             samplerate=self._sample_rate, channels=1, dtype='float32',
-            blocksize=chunk_samples
+            blocksize=chunk_samples, device=self._device
         )
         stream.start()
 
@@ -722,7 +735,7 @@ class VoiceInput:
         self.listen_phase = "recording"
         self._emit(VoiceEventType.RECORDING_STARTED, RecordingStartedPayload("fixed"))
 
-        audio = sd.rec(int(seconds * self._sample_rate),
+        audio = sd.rec(int(seconds * self._sample_rate), device=self._device,
                        samplerate=self._sample_rate, channels=1, dtype="float32")
         sd.wait()
         audio = audio.flatten()

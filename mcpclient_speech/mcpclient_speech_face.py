@@ -3,11 +3,12 @@
 # and using a speechbased LLM interface with whisper and piper.
 #
 
+import argparse
 import asyncio
 from fastmcp import Client, exceptions
 from fastmcp.client.transports import SSETransport
-import base64
 import json
+import logging
 import os
 import threading
 import time
@@ -24,18 +25,17 @@ if _FACE_DIR not in sys.path:
 
 from readnb import *
 from eyewindow import *
-from record import *
-from voice_input import VoiceInput, ContinuousListener, VoiceEventType
+from voice_input import VoiceInput, ContinuousListener, VoiceEventType, list_input_devices
 from voice_output import VoiceOutput
 from face_tracker import (
     FaceTracker, FaceDatabase, EmotionDetector, FaceEventType,
 )
 import cv2
 
+logger = logging.getLogger("mcpclient_speech")
+
 ollama_config = {
-    "model": "llama3.1",
-    #"model": "google/gemma-4-E4B-it",
-    #"model": "PetrosStav/gemma3-tools:12b",
+    "model": "PetrosStav/gemma3-tools:12b",
     "base_url": "http://localhost:11434/v1/",
     "api_key": "ollama"
 }
@@ -44,6 +44,8 @@ default_lang = "sv"
 messages_trunclen = 8
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
+
+muted = False
 
 has_sysprompt = False
 has_sysprompt_lang = False
@@ -73,6 +75,46 @@ voice_out: VoiceOutput | None = None
 listener: ContinuousListener | None = None
 tracker: FaceTracker | None = None
 model: str | None = None
+
+
+def list_cameras(max_index=10):
+    available = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            info = {
+                'index': i,
+                'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                'fps': cap.get(cv2.CAP_PROP_FPS),
+                'backend': cap.getBackendName(),
+            }
+            available.append(info)
+            cap.release()
+    return available
+
+
+def find_first_camera(max_index=10):
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            cap.release()
+            return i
+    return None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="MCP Speech Client with Face Tracking")
+    parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
+    parser.add_argument('--camera', type=int, default=None, help='Camera index (default: auto-detect)')
+    parser.add_argument('--server', default="http://127.0.0.1:8000/sse", help='MCP server SSE URL')
+    parser.add_argument('--llm-model', default="PetrosStav/gemma3-tools:12b", help='LLM model name')
+    parser.add_argument('--llm-url', default="http://localhost:11434/v1/", help='LLM base URL')
+    parser.add_argument('-m', '--list-mics', action='store_true', help='List available microphones and exit')
+    parser.add_argument('--mic', type=int, default=None, help='Microphone device index (default: system default)')
+    parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
+    return parser.parse_args()
+
 
 def extract_dialog_messages(messages):
     return [ msg for msg in messages if (msg['role'] == 'user' if type(msg)==dict else msg.content) ]
@@ -113,18 +155,32 @@ def extract_language(info):
                 return languages[l]
     return "en"
 
+def kp_toggle_mute(_event, _obj):
+    global muted
+    muted = not muted
+    if muted:
+        if listener:
+            listener.paused = True
+        logger.info("Muted")
+        if win:
+            win.set_state('muted')
+    else:
+        logger.info("Unmuted")
+        if win:
+            win.set_state(state.get('currstate', 'wait'))
+
 def on_exit(state):
-    print("\n(Exit event)")
+    logger.info("Exit event")
     state['evtime'] = time.time()
     state['newstate'] = 'exit'
 
 def on_face_change(id):
     global messages, state, curr_person
-    print("\n(Face change event)")
-    if state['newstate'] == 'exit':
+    logger.info("Face change event")
+    if muted or state['newstate'] == 'exit':
         return
     if curr_person:
-        print("(Storing current person)")
+        logger.info("Storing current person")
         curr_person.lasttime = time.time()
         if curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
             curr_person.lastmessages = messages
@@ -149,21 +205,23 @@ def on_face_change(id):
         if id in persondict:
             curr_person = persondict[id]
             messages = list(curr_person.lastmessages or [])
-            print(f"(Retrieving person {id} from memory)")
+            logger.info("Retrieving person %s from memory", id)
         else:
             curr_person = Person(None)
             persondict[id] = curr_person
             messages = []
-            print(f"(Creating person {id})")
+            logger.info("Creating person %s", id)
         state['evtime'] = time.time()
-        if state['evtime'] - curr_person.lasttime < 60:
+        if curr_person.lasttime and state['evtime'] - curr_person.lasttime < 60:
             state['newstate'] = 'listen'
         else:
             state['newstate'] = 'greet'
 
 def on_speech(txt):
     global curr_prompt, state
-    print("\n(Speech event)")
+    if muted:
+        return
+    logger.info("Speech event")
     if state['newstate'] == 'exit':
         return
     if state['currstate'] == 'listen' and (state['newstate'] is None or state['newstate'] == 'listen'):
@@ -182,7 +240,7 @@ def check_statechange(state):
 
 def set_state(state, newstate):
     if listener:
-        listener.paused = (newstate != 'listen')
+        listener.paused = muted or (newstate != 'listen')
     state['currstate'] = newstate
     state['statetime'] = time.time()
     state['newstate'] = None
@@ -200,7 +258,20 @@ def init_llm(conf):
     if "base_url" in default_config:
         openai.base_url = default_config["base_url"]
     model = default_config["model"]
-    llm = OpenAI(api_key=openai.api_key)
+    llm = OpenAI(api_key=openai.api_key, base_url=openai.base_url)
+
+    # Verify connection and model availability
+    try:
+        available = llm.models.list()
+        model_ids = [m.id for m in available.data]
+        if model not in model_ids:
+            print(f"ERROR: Model '{model}' not available in Ollama.")
+            print(f"Available models: {', '.join(model_ids)}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Cannot connect to LLM server at {openai.base_url}: {e}")
+        sys.exit(1)
+
     return (llm, model)
 
 def map_tool_definition(f):
@@ -257,7 +328,7 @@ def greet_prompt():
     if curr_person.lasttime is None: # This alternative was added by Claude but it should actually never happen
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
     duration = int((time.time() - curr_person.lasttime) / 60)
-    pref = ("Known preferences: " + curr_person.preferences) if curr_person.preferences else ""
+    pref = ("Known preferences: " + curr_person.profileinfo) if curr_person.profileinfo else ""
     if not curr_person.name:
         return {'role':'user', 'content': f'A person has appeared in front of you. {pref} It was {duration} minutes since you last met, but you still dont know the name. Produce a suitable greeting and ask for the name.'}
     else:
@@ -299,7 +370,7 @@ def messagedump(messages):
     for msg in messages:
         print(msg)
 
-async def main():
+async def main(args):
     global messages
     global tools
     global win
@@ -314,8 +385,8 @@ async def main():
     global voice_in, voice_out, listener, tracker
     global curr_prompt
 
-    # Connect via stdio to a local script
-    async with Client(transport=SSETransport("http://127.0.0.1:7999/sse")) as client:
+    # Connect via SSE to the MCP server
+    async with Client(transport=SSETransport(args.server)) as client:
         ### Initialization phase
 
         # Check MCP server capabilities
@@ -354,7 +425,12 @@ async def main():
 
         make_nonblocking(sys.stdin)
 
-        llm, model = init_llm(ollama_config)
+        llm_config = {
+            "model": args.llm_model,
+            "base_url": args.llm_url,
+            "api_key": "ollama",
+        }
+        llm, model = init_llm(llm_config)
         print(f'LLM Chatbot using model {model}')
 
         # new states: wait, listen, greet, process, talk
@@ -363,6 +439,7 @@ async def main():
                  'greet':     ((0.9, 0.5, 0), "Contact", "Please wait"),
                  'process':   ((0.9, 0.5, 0), "Processing", "Please wait"),
                  'talk':      ((0.95, 0.75, 0), "~~~", ""),
+                 'muted':     ((0.4, 0.4, 0.4), "MUTED", "Press 'm' to unmute"),
                  }
         if has_name:
             tmp = await client.read_resource("url://get_service_name")
@@ -371,12 +448,12 @@ async def main():
             name = "MCP Speech Client"
         win = EyeWindow(name, sdict, 'ready')
         win.set_exit_callback(on_exit, state)
-        #win.keydict["c"] = (kp_clear_messages, None)
+        win.keydict["m"] = (kp_toggle_mute, None)
         win.check_events()
         print('Created the interaction window')
 
         ### Initialize voice_input library, as ContinuousListener with on_speech as callback here
-        voice_in = VoiceInput()
+        voice_in = VoiceInput(device=args.mic)
         voice_in.subscribe(
             lambda ev: on_speech(ev.payload.text),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
@@ -405,25 +482,66 @@ async def main():
         emotion_detector = EmotionDetector()
         tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
 
-        def _on_face_event(ev):
-            new_id = ev.payload.new_track_id
-            on_face_change(new_id if new_id else None)
+        focus_state = {"track_id": None, "person_id": None}
 
-        tracker.subscribe(_on_face_event,
-                          event_types={FaceEventType.FOCUS_CHANGED})
+        def _emit(person_id):
+            if person_id != focus_state["person_id"]:
+                focus_state["person_id"] = person_id
+                on_face_change(person_id)
+
+        def _on_face_event(ev):
+            if ev.type == FaceEventType.FOCUS_CHANGED:
+                focus_state["track_id"] = ev.payload.new_track_id
+                _emit(ev.payload.new_person_id)
+            elif ev.type in (FaceEventType.IDENTITY_CONFIRMED,
+                             FaceEventType.FACE_ENROLLED):
+                if ev.track_id == focus_state["track_id"]:
+                    _emit(ev.payload.person_id)
+
+        tracker.subscribe(
+            _on_face_event,
+            event_types={FaceEventType.FOCUS_CHANGED,
+                         FaceEventType.IDENTITY_CONFIRMED,
+                         FaceEventType.FACE_ENROLLED},
+        )
+
+        cap = cv2.VideoCapture(args.camera)
+        if not cap.isOpened():
+            print(f"ERROR: Could not open camera {args.camera}")
+            sys.exit(1)
 
         def _camera_loop():
-            cap = cv2.VideoCapture(4)
-            if not cap.isOpened():
-                print('Could not open camera 0')
-                return
             try:
                 while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
                     ret, frame = cap.read()
                     if not ret:
                         time.sleep(0.05)
                         continue
-                    tracker.process_frame(frame)
+                    faces = tracker.process_frame(frame)
+                    focus_id = tracker.focus_track_id
+                    for face in (faces or []):
+                        top, right, bottom, left = face.bbox
+                        is_focus = (focus_id is not None and face.track_id == focus_id)
+                        pid = tracker.get_person_id(face.track_id)
+                        if is_focus:
+                            color, thickness = (100, 255, 0), 3
+                        elif pid:
+                            color, thickness = (0, 200, 0), 2
+                        else:
+                            color, thickness = (200, 0, 0), 1
+                        cv2.rectangle(frame, (left, top), (right, bottom), color[::-1], thickness)
+                        label = f"#{face.track_id}"
+                        if pid:
+                            label += f" {pid}"
+                        if is_focus:
+                            label += " [FOCUS]"
+                        if face.emotion and face.emotion != "neutral":
+                            label += f" {face.emotion}"
+                        cv2.rectangle(frame, (left, bottom), (right, bottom + 22), color[::-1], cv2.FILLED)
+                        cv2.putText(frame, label, (left + 4, bottom + 16),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    win.set_camera_frame(rgb)
             finally:
                 cap.release()
 
@@ -598,6 +716,62 @@ async def main():
         #exit_audio()
         print('Exiting')
 
+def run():
+    args = parse_args()
+
+    # Configure logging
+    log_level = logging.WARNING
+    if args.verbose >= 2:
+        log_level = logging.DEBUG
+    elif args.verbose >= 1:
+        log_level = logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    # List microphones and exit
+    if args.list_mics:
+        mics = list_input_devices()
+        if mics:
+            print("Available microphones:")
+            for idx, name, channels, rate in mics:
+                print(f"  Index {idx}: {name} ({channels}ch, {int(rate)}Hz)")
+        else:
+            print("No microphones found")
+        sys.exit(0)
+
+    # List cameras and exit
+    if args.list_cameras:
+        cameras = list_cameras()
+        if cameras:
+            print("Available cameras:")
+            for c in cameras:
+                print(f"  Index {c['index']}: {c['width']}x{c['height']} @ {c['fps']:.1f} fps ({c['backend']})")
+        else:
+            print("No cameras found")
+        sys.exit(0)
+
+    # Resolve camera index
+    if args.camera is None:
+        args.camera = find_first_camera()
+        if args.camera is not None:
+            print(f"Auto-selected camera at index {args.camera}")
+        else:
+            print("ERROR: No cameras found. Use --camera N.")
+            sys.exit(1)
+
+    try:
+        asyncio.run(main(args))
+    except (ConnectionError, OSError) as e:
+        print(f"ERROR: Cannot connect to MCP server at {args.server}: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nShutting down")
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    run()

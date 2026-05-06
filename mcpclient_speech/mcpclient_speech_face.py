@@ -249,11 +249,11 @@ def set_state(state, newstate):
     state['currstate'] = newstate
     state['statetime'] = time.time()
     state['newstate'] = None
-    win.set_state(newstate)
+    win.set_state('muted' if muted else newstate)
     win.check_events()
 
 def set_win_state(newstate):
-    win.set_state(newstate)
+    win.set_state('muted' if muted else newstate)
     win.check_events()
 
 def init_llm(conf):

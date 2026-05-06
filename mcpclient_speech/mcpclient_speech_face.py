@@ -172,7 +172,7 @@ def kp_toggle_mute(_event, _obj):
 
 def kp_force_process(_event, _obj):
     if state.get('currstate') == 'listen' and voice_in is not None:
-        voice_in._cancel_listen = True
+        voice_in.flush_listen()
 
 def on_exit(state):
     logger.info("Exit event")

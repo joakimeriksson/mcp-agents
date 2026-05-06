@@ -487,6 +487,7 @@ class VoiceInput:
         self.vad_prob: float = 0.0
         self.listen_phase: str = ""  # "", "waiting", "recording", "transcribing"
         self._cancel_listen: bool = False
+        self._flush_listen: bool = False
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
 
@@ -573,6 +574,12 @@ class VoiceInput:
 
     # --- Core operations ---
 
+    def flush_listen(self) -> None:
+        """Stop a VAD-driven listen() in progress and proceed to transcribe
+        whatever speech has been captured so far. If no speech has started
+        yet, this is equivalent to cancelling. Safe to call from any thread."""
+        self._flush_listen = True
+
     def listen(self, seconds: int = None, on_segment: Callable = None) -> Optional[str]:
         """Blocking STT. Tries VAD, falls back to fixed recording.
         Returns transcribed text or None."""
@@ -602,6 +609,7 @@ class VoiceInput:
         self.listen_phase = "waiting"
         self.vad_prob = 0.0
         self._cancel_listen = False
+        self._flush_listen = False
 
         vad_model = self._vad_model
         vad_model.reset_states()
@@ -630,6 +638,12 @@ class VoiceInput:
             while True:
                 if self._cancel_listen:
                     logger.info("[VAD] listen cancelled")
+                    return None
+                if self._flush_listen:
+                    if speech_started:
+                        logger.info("[VAD] listen flushed; transcribing captured audio")
+                        break
+                    logger.info("[VAD] listen flushed before speech detected; nothing to transcribe")
                     return None
 
                 data, _ = stream.read(chunk_samples)

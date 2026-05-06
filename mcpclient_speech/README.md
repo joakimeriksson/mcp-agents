@@ -77,6 +77,7 @@ The MCP server must already be running on SSE before the client starts.
 | Ctrl     | Hold to record         | —                                   |
 | Space    | Stop recording, send   | Stop listening, transcribe captured audio |
 | `m`      | —                      | Toggle mute (mic + TTS)             |
+| `s`      | —                      | Arm next recording for saving (press N times for N saves) |
 | `c`      | Clear conversation     | —                                   |
 | `r`      | Repeat last response   | —                                   |
 | `q`      | Quit                   | Quit                                |
@@ -85,6 +86,13 @@ Pressing space in the face client while VAD is stuck on background
 noise will flush the captured speech to Whisper instead of discarding
 it; the LLM responds as usual. Mute (`m`) immediately silences the
 microphone *and* aborts any TTS playback in progress.
+
+Pressing `s` in the face client arms the next VAD recording for
+saving as a 16-bit mono WAV under `recordings/` (auto-created). Press
+it N times to queue N saves. The pending count is shown in the top-left
+corner of the window ("Save next 3"); each saved recording decrements
+the counter. Recordings are written before noise reduction so the file
+contains the raw mic audio.
 
 ## Tips
 

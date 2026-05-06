@@ -176,6 +176,19 @@ def kp_force_process(_event, _obj):
     else:
         logger.debug("force-process pressed but ignored (state=%s)", state.get('currstate'))
 
+def _refresh_save_indicator(count: int) -> None:
+    if win is None:
+        return
+    win.set_indicator(f"Save next {count}" if count > 0 else None)
+    win.check_events()
+
+def kp_save_recording(_event, _obj):
+    if voice_in is None:
+        return
+    pending = voice_in.save_next_recordings(1)
+    _refresh_save_indicator(pending)
+    logger.info("Save-next-recordings count is now %d", pending)
+
 def on_exit(state):
     logger.info("Exit event")
     state['evtime'] = time.time()
@@ -464,6 +477,7 @@ async def main(args):
         win.set_exit_callback(on_exit, state)
         win.keydict["m"] = (kp_toggle_mute, None)
         win.keydict[" "] = (kp_force_process, None)
+        win.keydict["s"] = (kp_save_recording, None)
         win.check_events()
         print('Created the interaction window')
 
@@ -472,6 +486,10 @@ async def main(args):
         voice_in.subscribe(
             lambda ev: on_speech(ev.payload.text),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
+        )
+        voice_in.subscribe(
+            lambda ev: _refresh_save_indicator(ev.payload.remaining),
+            event_types={VoiceEventType.RECORDING_SAVED},
         )
         print('Loading whisper model...')
         voice_in.load_sync()

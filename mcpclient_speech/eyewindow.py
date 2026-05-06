@@ -64,6 +64,7 @@ class EyeWindow:
         self.txt0 = CCText(self.win.fig, (0.5, 0.9), name, 1.0/20)
         self.txt1 = CCText(self.win.fig, (0.5, 0.45), "", 1.0/20)
         self.txt2 = CCText(self.win.fig, (0.5, 0.38), "", 1.0/40)
+        self.txt_indicator = CCText(self.win.fig, (0.05, 0.95), "", 1.0/40)
         self.cam_ax = self.win.fig.add_axes((0.78, 0.80, 0.20, 0.18))
         self.cam_ax.set_xticks([]); self.cam_ax.set_yticks([])
         for s in self.cam_ax.spines.values():
@@ -94,6 +95,7 @@ class EyeWindow:
         self.txt0.resize()
         self.txt1.resize()
         self.txt2.resize()
+        self.txt_indicator.resize()
 
     def exit_event(self, ev):
         if self.exitfunc:
@@ -105,6 +107,9 @@ class EyeWindow:
             self.eye.set_color(col)
             self.txt1.text.set_text(txt1)
             self.txt2.text.set_text(txt2)
+
+    def set_indicator(self, text):
+        self.txt_indicator.text.set_text(text or "")
 
     def key_press_event(self, event):
         if event.key == "control":

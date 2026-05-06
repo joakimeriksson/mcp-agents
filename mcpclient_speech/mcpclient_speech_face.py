@@ -159,6 +159,8 @@ def kp_toggle_mute(_event, _obj):
             listener.paused = True
         if voice_in is not None:
             voice_in._cancel_listen = True
+        if voice_out is not None and voice_out.speaking:
+            voice_out.stop_speaking()
         logger.info("Muted")
         if win:
             win.set_state('muted')
@@ -712,12 +714,16 @@ async def main(args):
                 reply_text = response.choices[0].message.content or ""
                 print(f'\n  Response: {reply_text}  (lang={lang})')
                 set_win_state('talk')
-                if reply_text:
+                if reply_text and not muted:
                     # Simple TTS: pause mic for the whole utterance, no AEC.
                     # Resume is handled by the state-machine transition below.
                     listener.paused = True
-                    voice_out.speak(reply_text, lang)
-                    time.sleep(0.5)  # let room reverb decay before mic reopens
+                    voice_out.speak_async(reply_text, lang)
+                    while voice_out.speaking:
+                        win.check_events()
+                        time.sleep(0.05)
+                    if not voice_out.interrupted:
+                        time.sleep(0.5)  # let room reverb decay before mic reopens
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
                 else:

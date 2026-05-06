@@ -7,7 +7,7 @@ _DEFAULTS: dict = {
         "base_url": "http://localhost:11434/v1/",
         "api_key": "ollama",
     },
-    "behavior": {
+    "face": {
         "omit_names_and_prefs": False,
     },
     "devices": {},

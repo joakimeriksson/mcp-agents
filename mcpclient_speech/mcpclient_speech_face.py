@@ -788,7 +788,7 @@ def run():
     if args.mic is None:
         args.mic = cfg["devices"].get("microphone")
 
-    omit_names_and_prefs = cfg["behavior"]["omit_names_and_prefs"]
+    omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
 
     # Resolve camera index (auto-detect if still None after config)
     if args.camera is None:

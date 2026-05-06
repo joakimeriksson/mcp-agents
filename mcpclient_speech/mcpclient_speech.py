@@ -391,5 +391,4 @@ async def main(args):
         print('Exiting')
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main(parse_args()))

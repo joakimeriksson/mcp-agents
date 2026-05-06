@@ -160,7 +160,7 @@ def kp_toggle_mute(_event, _obj):
             listener.paused = True
         if voice_in is not None:
             voice_in._cancel_listen = True
-        if voice_out is not None and voice_out.speaking:
+        if voice_out is not None:
             voice_out.stop_speaking()
         logger.info("Muted")
         if win:
@@ -173,6 +173,8 @@ def kp_toggle_mute(_event, _obj):
 def kp_force_process(_event, _obj):
     if state.get('currstate') == 'listen' and voice_in is not None:
         voice_in.flush_listen()
+    else:
+        logger.debug("force-process pressed but ignored (state=%s)", state.get('currstate'))
 
 def on_exit(state):
     logger.info("Exit event")
@@ -720,11 +722,17 @@ async def main(args):
                     # Resume is handled by the state-machine transition below.
                     listener.paused = True
                     voice_out.speak_async(reply_text, lang)
-                    while voice_out.speaking:
-                        win.check_events()
-                        await asyncio.sleep(0.05)
-                    if not voice_out.interrupted:
-                        await asyncio.sleep(0.5)  # let room reverb decay before mic reopens
+                    # Give the async thread a moment to flip speaking=True so we
+                    # don't fall through (and skip the reverb wait) on a slow start.
+                    deadline = time.monotonic() + 0.2
+                    while not voice_out.speaking and time.monotonic() < deadline:
+                        await asyncio.sleep(0.01)
+                    if voice_out.speaking:
+                        while voice_out.speaking:
+                            win.check_events()
+                            await asyncio.sleep(0.05)
+                        if not voice_out.interrupted:
+                            await asyncio.sleep(0.5)  # let room reverb decay before mic reopens
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
                 else:

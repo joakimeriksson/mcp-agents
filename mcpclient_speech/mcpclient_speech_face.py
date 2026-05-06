@@ -599,7 +599,7 @@ async def main(args):
             # focus-in -> if listen first do focus out, fetch profile, go to greet
             # sound-ready -> go to process (stop listen?)
             while not newstate:
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
                 newstate = check_statechange(state)
                 ### Remove?
                 if nb_available(sys.stdin):
@@ -722,9 +722,9 @@ async def main(args):
                     voice_out.speak_async(reply_text, lang)
                     while voice_out.speaking:
                         win.check_events()
-                        time.sleep(0.05)
+                        await asyncio.sleep(0.05)
                     if not voice_out.interrupted:
-                        time.sleep(0.5)  # let room reverb decay before mic reopens
+                        await asyncio.sleep(0.5)  # let room reverb decay before mic reopens
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
                 else:

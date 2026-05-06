@@ -11,12 +11,17 @@ device_sample_rate = DEFAULT_SAMPLE_RATE
 whisperdir = "../../whisper.cpp/"
 tempfile = "temp.wav"
 
-def init_audio(microphone_name=None, sample_rate=0) -> bool:
+def init_audio(microphone_name=None, sample_rate=0, device_idx=None) -> bool:
     global audio, device_index, device_sample_rate
-    if microphone_name is None:
-        microphone_name = 'Samson C03U'
     device_sample_rate = DEFAULT_SAMPLE_RATE if sample_rate == 0 else sample_rate
     audio = pyaudio.PyAudio()
+    if device_idx is not None:
+        device_index = device_idx
+        name = audio.get_device_info_by_index(device_idx).get("name", str(device_idx))
+        print(f"Using microphone {name} at {device_idx}")
+        return True
+    if microphone_name is None:
+        microphone_name = 'Samson C03U'
     device_index, device_name = hardware_devices.find_microphone_index(microphone_name, audio=audio, sample_rate=device_sample_rate)
     if device_index >= 0:
         print(f"Found microphone {device_name} at {device_index}")

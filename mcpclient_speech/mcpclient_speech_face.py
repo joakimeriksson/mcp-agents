@@ -31,14 +31,9 @@ from face_tracker import (
     FaceTracker, FaceDatabase, EmotionDetector, FaceEventType,
 )
 import cv2
+from config import load_config
 
 logger = logging.getLogger("mcpclient_speech")
-
-ollama_config = {
-    "model": "PetrosStav/gemma3-tools:12b",
-    "base_url": "http://localhost:11434/v1/",
-    "api_key": "ollama"
-}
 
 default_lang = "sv"
 messages_trunclen = 8
@@ -109,8 +104,8 @@ def parse_args():
     parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
     parser.add_argument('--camera', type=int, default=None, help='Camera index (default: auto-detect)')
     parser.add_argument('--server', default="http://127.0.0.1:8000/sse", help='MCP server SSE URL')
-    parser.add_argument('--llm-model', default="PetrosStav/gemma3-tools:12b", help='LLM model name')
-    parser.add_argument('--llm-url', default="http://localhost:11434/v1/", help='LLM base URL')
+    parser.add_argument('--llm-model', default=None, help='LLM model name')
+    parser.add_argument('--llm-url', default=None, help='LLM base URL')
     parser.add_argument('-m', '--list-mics', action='store_true', help='List available microphones and exit')
     parser.add_argument('--mic', type=int, default=None, help='Microphone device index (default: system default)')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
@@ -730,6 +725,8 @@ async def main(args):
         print('Exiting')
 
 def run():
+    global omit_names_and_prefs
+
     args = parse_args()
 
     # Configure logging
@@ -765,7 +762,21 @@ def run():
             print("No cameras found")
         sys.exit(0)
 
-    # Resolve camera index
+    # Load config file; CLI args take priority over config, config over built-in defaults
+    cfg = load_config()
+
+    if args.llm_model is None:
+        args.llm_model = cfg["llm"]["model"]
+    if args.llm_url is None:
+        args.llm_url = cfg["llm"]["base_url"]
+    if args.camera is None:
+        args.camera = cfg["devices"].get("camera")
+    if args.mic is None:
+        args.mic = cfg["devices"].get("microphone")
+
+    omit_names_and_prefs = cfg["behavior"]["omit_names_and_prefs"]
+
+    # Resolve camera index (auto-detect if still None after config)
     if args.camera is None:
         args.camera = find_first_camera()
         if args.camera is not None:

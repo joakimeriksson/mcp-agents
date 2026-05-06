@@ -17,12 +17,7 @@ from openai import OpenAI
 from readnb import *
 from eyewindow import *
 from record import *
-
-ollama_config = {
-    "model": "PetrosStav/gemma3-tools:12b",
-    "base_url": "http://localhost:11434/v1/",
-    "api_key": "ollama"
-}
+from config import load_config
 
 messages_trunclen = 4
 messages = []
@@ -180,6 +175,10 @@ async def main():
     global has_init
     global has_exit
 
+    cfg = load_config()
+    ollama_config = cfg["llm"]
+    mic_index = cfg["devices"].get("microphone")
+
     # Connect via stdio to a local script
     async with Client(transport=SSETransport("http://127.0.0.1:8000/sse")) as client:
         ### Initialization phase
@@ -220,8 +219,7 @@ async def main():
 
         make_nonblocking(sys.stdin)
 
-        #if init_audio(microphone_name="sof-hda-dsp", sample_rate=16000):
-        if init_audio():
+        if init_audio(device_idx=mic_index):
             print('Initialized speech recognition and synthesis')
         else:
             print('Error: failed to initialize audio')

@@ -1,6 +1,7 @@
 import cv2
 import logging
 import os
+import time
 from ultralytics import YOLO
 
 logger = logging.getLogger("candytron.camera")
@@ -114,9 +115,16 @@ class CameraManager:
                  (bx.xyxy[0][0] + bx.xyxy[0][2]) / 2,
                  (bx.xyxy[0][1] + bx.xyxy[0][3]) / 2) for bx in res.boxes]
 
-    def check_event(self, wait_ms: int = 1) -> bool:
+    def check_event(self, wait_ms: int = 50) -> bool:
+        """Pump the GUI event loop and pace the caller.
+
+        Always sleeps ``wait_ms`` ms (via ``cv2.waitKey`` when a window is
+        shown, otherwise ``time.sleep``). Returns True if the user pressed 'q'.
+        """
         if self.has_camera() and self.show_window:
             return cv2.waitKey(wait_ms) & 0xFF == ord('q')
+        if wait_ms > 0:
+            time.sleep(wait_ms / 1000.0)
         return False
 
     def calibrate_positions(self, n: int, m: int) -> bool:

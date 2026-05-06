@@ -109,6 +109,7 @@ def parse_args():
     parser.add_argument('-m', '--list-mics', action='store_true', help='List available microphones and exit')
     parser.add_argument('--mic', type=int, default=None, help='Microphone device index (default: system default)')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
+    parser.add_argument('--config', default=None, help='Path to config TOML file (default: config.toml next to this script)')
     return parser.parse_args()
 
 
@@ -776,7 +777,7 @@ def run():
         sys.exit(0)
 
     # Load config file; CLI args take priority over config, config over built-in defaults
-    cfg = load_config()
+    cfg = load_config(args.config)
 
     if args.llm_model is None:
         args.llm_model = cfg["llm"]["model"]

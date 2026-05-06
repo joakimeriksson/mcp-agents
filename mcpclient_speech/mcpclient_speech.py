@@ -3,6 +3,7 @@
 # and using a speechbased LLM interface with whisper and piper.
 #
 
+import argparse
 import asyncio
 from fastmcp import Client, exceptions
 from fastmcp.client.transports import SSETransport
@@ -168,7 +169,13 @@ def kp_repeat_last(_event, state):
     state['evtime'] = time.time()
     state['newstate'] = 'repeat'
 
-async def main():
+def parse_args():
+    parser = argparse.ArgumentParser(description="MCP Speech Client (push-to-talk)")
+    parser.add_argument('--config', default=None, help='Path to config TOML file (default: config.toml next to this script)')
+    return parser.parse_args()
+
+
+async def main(args):
     global messages
     global tools
     global win
@@ -180,7 +187,7 @@ async def main():
     global has_init
     global has_exit
 
-    cfg = load_config()
+    cfg = load_config(args.config)
     ollama_config = cfg["llm"]
     mic_index = cfg["devices"].get("microphone")
 
@@ -385,4 +392,4 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    asyncio.run(main(parse_args()))

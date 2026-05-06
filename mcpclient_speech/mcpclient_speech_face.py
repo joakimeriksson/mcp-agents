@@ -157,6 +157,8 @@ def kp_toggle_mute(_event, _obj):
     if muted:
         if listener:
             listener.paused = True
+        if voice_in is not None:
+            voice_in._cancel_listen = True
         logger.info("Muted")
         if win:
             win.set_state('muted')

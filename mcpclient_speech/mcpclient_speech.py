@@ -51,6 +51,11 @@ def on_release(_event, state):
         state['evtime'] = time.time()
         state['newstate'] = 'processing'
 
+def kp_stop_listening(_event, state):
+    if state['currstate'] in ('listening1', 'listening2'):
+        state['evtime'] = time.time()
+        state['newstate'] = 'processing'
+
 def check_statechange(state):
     win.check_events()
     t = time.time()
@@ -244,6 +249,7 @@ async def main():
         win.set_exit_callback(on_exit, state)
         win.keydict["c"] = (kp_clear_messages, None)
         win.keydict["r"] = (kp_repeat_last, state)
+        win.keydict[" "] = (kp_stop_listening, state)
         win.check_events()
         print('Created the interaction window')
 

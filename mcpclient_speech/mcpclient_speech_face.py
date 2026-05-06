@@ -165,6 +165,10 @@ def kp_toggle_mute(_event, _obj):
         if win:
             win.set_state(state.get('currstate', 'wait'))
 
+def kp_force_process(_event, _obj):
+    if state.get('currstate') == 'listen' and voice_in is not None:
+        voice_in._cancel_listen = True
+
 def on_exit(state):
     logger.info("Exit event")
     state['evtime'] = time.time()
@@ -452,6 +456,7 @@ async def main(args):
         win = EyeWindow(name, sdict, 'ready')
         win.set_exit_callback(on_exit, state)
         win.keydict["m"] = (kp_toggle_mute, None)
+        win.keydict[" "] = (kp_force_process, None)
         win.check_events()
         print('Created the interaction window')
 

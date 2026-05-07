@@ -5,11 +5,13 @@
 
 import argparse
 import asyncio
+import atexit
 from fastmcp import Client, exceptions
 from fastmcp.client.transports import SSETransport
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 import sys
@@ -32,8 +34,29 @@ from face_tracker import (
 )
 import cv2
 from config import load_config
+from interaction_logger import InteractionLogger
 
 logger = logging.getLogger("mcpclient_speech")
+
+interaction_log: InteractionLogger | None = None
+
+
+def _ilog(event_type: str, **fields) -> None:
+    if interaction_log is not None:
+        interaction_log.log(event_type, **fields)
+
+
+def _git_commit_short() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        return out.decode().strip() or None
+    except Exception:
+        return None
 
 default_lang = "sv"
 messages_trunclen = 8
@@ -110,6 +133,9 @@ def parse_args():
     parser.add_argument('--mic', type=int, default=None, help='Microphone device index (default: system default)')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
     parser.add_argument('--config', default=None, help='Path to config TOML file (default: config.toml next to this script)')
+    log_group = parser.add_mutually_exclusive_group()
+    log_group.add_argument('--log-file', default=None, help='Log every interaction event to this JSONL file (overwrites on each run)')
+    log_group.add_argument('--log-dir', default=None, help='Log every interaction event to a new timestamped JSONL file in this directory')
     return parser.parse_args()
 
 
@@ -155,12 +181,14 @@ def extract_language(info):
 def kp_toggle_mute(_event, _obj):
     global muted
     muted = not muted
+    interrupted = False
     if muted:
         if listener:
             listener.paused = True
         if voice_in is not None:
             voice_in._cancel_listen = True
         if voice_out is not None:
+            interrupted = bool(getattr(voice_out, "speaking", False))
             voice_out.stop_speaking()
         logger.info("Muted")
         if win:
@@ -169,6 +197,7 @@ def kp_toggle_mute(_event, _obj):
         logger.info("Unmuted")
         if win:
             win.set_state(state.get('currstate', 'wait'))
+    _ilog("mute", muted=muted, interrupted_speech=interrupted)
 
 def kp_force_process(_event, _obj):
     if state.get('currstate') == 'listen' and voice_in is not None:
@@ -191,6 +220,7 @@ def kp_save_recording(_event, _obj):
 
 def on_exit(state):
     logger.info("Exit event")
+    _ilog("state_change", **{"from": state.get('currstate'), "to": "exit"})
     state['evtime'] = time.time()
     state['newstate'] = 'exit'
 
@@ -199,6 +229,7 @@ def on_face_change(id):
     logger.info("Face change event")
     if muted or state['newstate'] == 'exit':
         return
+    prev_face_id = next((pid for pid, p in persondict.items() if p is curr_person), None)
     if curr_person:
         logger.info("Storing current person")
         curr_person.lasttime = time.time()
@@ -214,9 +245,16 @@ def on_face_change(id):
             pref = extract_value("Preferences:", info)
             if pref:
                 curr_person.profileinfo = pref
+            _ilog("person_distillation",
+                  face_id=prev_face_id,
+                  raw_summary=info,
+                  parsed_name=name,
+                  parsed_lang=lang,
+                  parsed_preferences=pref)
         else:
             print("(Nothing new to extract)")
     if id is None:
+        _ilog("face_change", face_id=None, status="none", name=None, lang=None, last_seen_seconds_ago=None)
         messages = []
         curr_person = None
         state['evtime'] = time.time()
@@ -226,11 +264,25 @@ def on_face_change(id):
             curr_person = persondict[id]
             messages = list(curr_person.lastmessages or [])
             logger.info("Retrieving person %s from memory", id)
+            last_seen = (time.time() - curr_person.lasttime) if curr_person.lasttime else None
+            _ilog("face_change",
+                  face_id=id,
+                  status="known",
+                  name=curr_person.name,
+                  lang=curr_person.lang,
+                  last_seen_seconds_ago=last_seen)
+            _ilog("person_resumed",
+                  face_id=id,
+                  name=curr_person.name,
+                  lang=curr_person.lang,
+                  profileinfo=curr_person.profileinfo,
+                  restored_message_count=len(messages))
         else:
             curr_person = Person(None)
             persondict[id] = curr_person
             messages = []
             logger.info("Creating person %s", id)
+            _ilog("face_change", face_id=id, status="new", name=None, lang=None, last_seen_seconds_ago=None)
         state['evtime'] = time.time()
         if curr_person.lasttime and state['evtime'] - curr_person.lasttime < 60:
             state['newstate'] = 'listen'
@@ -259,6 +311,7 @@ def check_statechange(state):
         return False
 
 def set_state(state, newstate):
+    prev = state.get('currstate')
     if listener:
         listener.paused = muted or (newstate != 'listen')
     state['currstate'] = newstate
@@ -266,6 +319,8 @@ def set_state(state, newstate):
     state['newstate'] = None
     win.set_state('muted' if muted else newstate)
     win.check_events()
+    if prev != newstate:
+        _ilog("state_change", **{"from": prev, "to": newstate})
 
 def set_win_state(newstate):
     win.set_state('muted' if muted else newstate)
@@ -312,6 +367,7 @@ async def system_message(client, lang):
         else:
             pr = await client.get_prompt("get_service_prompt", {})
         txt = pr.messages[0].content.text
+        _ilog("mcp_prompt", kind="system", lang=lang, content=txt)
     else:
         txt = "You are a helpful assistant that can control various devices."
     return {"role": "system", "content": txt}
@@ -323,6 +379,7 @@ async def augmentation_message(client, lang):
         else:
             pr = await client.get_prompt("get_service_augmentation", {})
         txt = pr.messages[0].content.text
+        _ilog("mcp_prompt", kind="augmentation", lang=lang, content=txt)
         return {"role": "system", "content": txt}
     else:
         return False
@@ -378,6 +435,7 @@ def compose_messages(sysp, mlst, augs):
 def clear_messages():
     global messages
     messages = []
+    _ilog("clear_history")
 
 ### remove next 2?
 def trim_last_message():
@@ -396,6 +454,24 @@ def messagedump(messages):
     print("\nMessages:")
     for msg in messages:
         print(msg)
+
+def _serialize_tool_calls(tool_calls):
+    if not tool_calls:
+        return []
+    out = []
+    for tc in tool_calls:
+        args_str = tc.function.arguments
+        try:
+            args_parsed = json.loads(args_str)
+        except (TypeError, ValueError):
+            args_parsed = None
+        out.append({
+            "id": tc.id,
+            "name": tc.function.name,
+            "arguments": args_str,
+            "arguments_parsed": args_parsed,
+        })
+    return out
 
 async def main(args):
     global messages
@@ -484,11 +560,25 @@ async def main(args):
         ### Initialize voice_input library, as ContinuousListener with on_speech as callback here
         voice_in = VoiceInput(device=args.mic)
         voice_in.subscribe(
+            lambda ev: _ilog("transcription",
+                             text=ev.payload.text,
+                             language=ev.payload.language,
+                             language_probability=ev.payload.language_probability,
+                             audio_duration_ms=ev.payload.audio_duration_ms),
+            event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
+        )
+        voice_in.subscribe(
             lambda ev: on_speech(ev.payload.text),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
         )
         voice_in.subscribe(
             lambda ev: _refresh_save_indicator(ev.payload.remaining),
+            event_types={VoiceEventType.RECORDING_SAVED},
+        )
+        voice_in.subscribe(
+            lambda ev: _ilog("recording_saved",
+                             remaining=ev.payload.remaining,
+                             wav_path=ev.payload.path),
             event_types={VoiceEventType.RECORDING_SAVED},
         )
         print('Loading whisper model...')
@@ -610,6 +700,7 @@ async def main(args):
 
         set_state(state, 'wait')
         newstate = False
+        prompt_source = None
         while True:
 
             # In this loop, state is either wait or listen
@@ -628,11 +719,15 @@ async def main(args):
                         res = res.strip(" \n")
                         if res[0:5] == "/lang":
                             txtlang = res[5:].strip(" ")
+                            _ilog("stdin_command", cmd="/lang", arg=txtlang)
                         elif res[0:5] == "/exit":
+                            _ilog("stdin_command", cmd="/exit", arg=None)
                             newstate = 'exit'
                         elif len(res):
+                            _ilog("stdin_command", cmd="text", arg=res)
                             prompt = res
                             lang = txtlang
+                            prompt_source = "stdin"
                             newstate = 'process'
                             set_state(state, newstate)
     
@@ -654,6 +749,7 @@ async def main(args):
                         if voice_in and voice_in.detected_language:
                             lang = voice_in.detected_language
                         curr_prompt = ""
+                        prompt_source = "speech"
 
                 if newstate == 'greet':
                     if curr_person and curr_person.lang and curr_person.lang in ['en','sv','de','fr','es']:
@@ -672,6 +768,8 @@ async def main(args):
                 augpromptlist.append(langprompt)
                 if newstate == 'process':
                     print("\n  User: (", lang, ") ", prompt)
+                    _ilog("user_turn", kind=prompt_source or "unknown", content=prompt, lang=lang)
+                    prompt_source = None
                     messages.append(user_message(prompt))
                 elif newstate == 'greet':
                     if omit_names_and_prefs:
@@ -679,20 +777,46 @@ async def main(args):
                     else:
                         greetprompt = greet_prompt()
                     print("\n  Greeting:", greetprompt['content'])
+                    _ilog("user_turn",
+                          kind="greet_noname" if omit_names_and_prefs else "greet",
+                          content=greetprompt['content'],
+                          lang=lang)
                     messages.append(greetprompt)
 
+                iteration = 0
                 msg = compose_messages(sysprompt, messages, augpromptlist)
                 #messagedump(msg)
-                response = openai.chat.completions.create(
-                    model=model,
-                    messages=msg,
-                    tools=tools,
-                )
-    
+                _ilog("llm_request",
+                      iteration=iteration,
+                      model=model,
+                      messages_full=list(messages),
+                      messages_sent=msg,
+                      tool_count=len(tools or []))
+                try:
+                    response = openai.chat.completions.create(
+                        model=model,
+                        messages=msg,
+                        tools=tools,
+                    )
+                except Exception as e:
+                    _ilog("llm_error",
+                          iteration=iteration,
+                          error_class=type(e).__name__,
+                          error_message=str(e))
+                    raise
+                _ilog("llm_response",
+                      iteration=iteration,
+                      content=response.choices[0].message.content,
+                      tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
+
                 tool_calls = response.choices[0].message.tool_calls
                 while tool_calls:
                     messages.append(response.choices[0].message)
                     for tool_call in tool_calls:
+                        try:
+                            args_parsed = json.loads(tool_call.function.arguments)
+                        except (TypeError, ValueError):
+                            args_parsed = None
                         try:
                             result = await client.call_tool(tool_call.function.name,
                                                             json.loads(tool_call.function.arguments))
@@ -709,8 +833,14 @@ async def main(args):
                             }
                             print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
                             print(  "  Result:   ", resulttxt)
+                            _ilog("mcp_tool_call",
+                                  name=tool_call.function.name,
+                                  arguments=tool_call.function.arguments,
+                                  arguments_parsed=args_parsed,
+                                  success=True,
+                                  result_text=resulttxt)
                             messages.append(result_message)
-                        except exceptions.ToolError:
+                        except exceptions.ToolError as te:
                             result_message = {
                                 "role": "tool",
                                 "content": json.dumps({
@@ -719,15 +849,39 @@ async def main(args):
                                 "tool_call_id": tool_call.id
                             }
                             print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
+                            _ilog("mcp_tool_call",
+                                  name=tool_call.function.name,
+                                  arguments=tool_call.function.arguments,
+                                  arguments_parsed=args_parsed,
+                                  success=False,
+                                  error_message=f"ToolError: {te}")
                             messages.append(result_message)
-    
+
+                    iteration += 1
                     msg = compose_messages(sysprompt, messages, augpromptlist)
                     #messagedump(msg)
-                    response = openai.chat.completions.create(
-                        model=model,
-                        messages=msg,
-                        tools=tools,
-                    )
+                    _ilog("llm_request",
+                          iteration=iteration,
+                          model=model,
+                          messages_full=list(messages),
+                          messages_sent=msg,
+                          tool_count=len(tools or []))
+                    try:
+                        response = openai.chat.completions.create(
+                            model=model,
+                            messages=msg,
+                            tools=tools,
+                        )
+                    except Exception as e:
+                        _ilog("llm_error",
+                              iteration=iteration,
+                              error_class=type(e).__name__,
+                              error_message=str(e))
+                        raise
+                    _ilog("llm_response",
+                          iteration=iteration,
+                          content=response.choices[0].message.content,
+                          tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
                     tool_calls = response.choices[0].message.tool_calls
 
                 # No tool calls, just print the response.
@@ -735,7 +889,11 @@ async def main(args):
                 reply_text = response.choices[0].message.content or ""
                 print(f'\n  Response: {reply_text}  (lang={lang})')
                 set_win_state('talk')
-                if reply_text and not muted:
+                if not reply_text:
+                    _ilog("tts_speak", text="", lang=lang, status="empty")
+                elif muted:
+                    _ilog("tts_speak", text=reply_text, lang=lang, status="muted_suppressed")
+                else:
                     # Simple TTS: pause mic for the whole utterance, no AEC.
                     # Resume is handled by the state-machine transition below.
                     listener.paused = True
@@ -751,6 +909,10 @@ async def main(args):
                             await asyncio.sleep(0.05)
                         if not voice_out.interrupted:
                             await asyncio.sleep(0.5)  # let room reverb decay before mic reopens
+                    _ilog("tts_speak",
+                          text=reply_text,
+                          lang=lang,
+                          status="interrupted" if getattr(voice_out, "interrupted", False) else "spoken")
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
                 else:
@@ -825,16 +987,51 @@ def run():
             print("ERROR: No cameras found. Use --camera N.")
             sys.exit(1)
 
+    global interaction_log
+    interaction_log = InteractionLogger.from_args(args)
+    if interaction_log is not None:
+        atexit.register(interaction_log.close, "atexit")
+        _ilog("session_start",
+              schema=1,
+              pid=os.getpid(),
+              git_commit=_git_commit_short(),
+              args={
+                  "server": args.server,
+                  "llm_model": args.llm_model,
+                  "llm_url": args.llm_url,
+                  "lang_default": default_lang,
+                  "mic": args.mic,
+                  "camera": args.camera,
+                  "omit_names_and_prefs": omit_names_and_prefs,
+                  "log_file": args.log_file,
+                  "log_dir": args.log_dir,
+              })
+
     try:
         asyncio.run(main(args))
     except (ConnectionError, OSError) as e:
         print(f"ERROR: Cannot connect to MCP server at {args.server}: {e}")
+        if interaction_log is not None:
+            interaction_log.close("connection_error",
+                                  error_class=type(e).__name__,
+                                  error_message=str(e))
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nShutting down")
+        if interaction_log is not None:
+            interaction_log.close("keyboard_interrupt")
     except Exception as e:
+        import traceback
         logger.error("Unexpected error: %s", e)
+        if interaction_log is not None:
+            interaction_log.close("exception",
+                                  error_class=type(e).__name__,
+                                  error_message=str(e),
+                                  traceback=traceback.format_exc())
         sys.exit(1)
+    else:
+        if interaction_log is not None:
+            interaction_log.close("normal")
 
 
 if __name__ == "__main__":

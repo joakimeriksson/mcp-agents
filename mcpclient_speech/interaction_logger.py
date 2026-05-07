@@ -61,6 +61,8 @@ class InteractionLogger:
         log_file = getattr(args, "log_file", None)
         log_dir = getattr(args, "log_dir", None)
         if log_file:
+            if not log_file.endswith(".jsonl"):
+                log_file = log_file + ".jsonl"
             return cls(log_file, overwrite=True)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)

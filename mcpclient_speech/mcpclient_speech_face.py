@@ -990,6 +990,7 @@ def run():
     global interaction_log
     interaction_log = InteractionLogger.from_args(args)
     if interaction_log is not None:
+        print(f"Interaction log: {interaction_log.path}")
         atexit.register(interaction_log.close, "atexit")
         _ilog("session_start",
               schema=1,
@@ -1003,7 +1004,7 @@ def run():
                   "mic": args.mic,
                   "camera": args.camera,
                   "omit_names_and_prefs": omit_names_and_prefs,
-                  "log_file": args.log_file,
+                  "log_path": interaction_log.path,
                   "log_dir": args.log_dir,
               })
 

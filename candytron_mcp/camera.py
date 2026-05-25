@@ -1,6 +1,8 @@
 import cv2
 import logging
 import os
+import threading
+import time
 from ultralytics import YOLO
 
 logger = logging.getLogger("candytron.camera")
@@ -35,6 +37,9 @@ class CameraManager:
         self.positions: dict[str, tuple] = {}
         self.positions_thresdist: float = 0
         self._open_window_count: int = 0
+        self._last_frame = None
+        self._last_raw_frame = None
+        self._last_frame_lock = threading.Lock()
 
     @staticmethod
     def list_cameras(max_index: int = 10) -> list[dict]:
@@ -86,6 +91,20 @@ class CameraManager:
     def has_camera(self) -> bool:
         return self.yolomodel is not None
 
+    def get_last_frame(self):
+        """Return a copy of the most recent annotated camera frame, or None if unavailable."""
+        with self._last_frame_lock:
+            if self._last_frame is None:
+                return None
+            return self._last_frame.copy()
+
+    def get_last_raw_frame(self):
+        """Return a copy of the most recent raw camera frame, or None if unavailable."""
+        with self._last_frame_lock:
+            if self._last_raw_frame is None:
+                return None
+            return self._last_raw_frame.copy()
+
     def acquire_scene_one(self, refresh: bool = False) -> list[tuple]:
         if not self.has_camera():
             return list(_SIMULATED_DETECTIONS)
@@ -99,13 +118,17 @@ class CameraManager:
             logger.error("Failed to read frame from camera")
             return []
         res = self.yolomodel(fr, verbose=False)[0]
+        annotated_frame = res.plot()
+        with self._last_frame_lock:
+            self._last_frame = annotated_frame
+            self._last_raw_frame = fr
 
         if self.show_window:
-            annotated_frame = res.plot()
             h, w = annotated_frame.shape[:2]
+            display_frame = annotated_frame
             if w > 1280:
-                annotated_frame = cv2.resize(annotated_frame, (w // 2, h // 2))
-            cv2.imshow('YOLO Detection', annotated_frame)
+                display_frame = cv2.resize(annotated_frame, (w // 2, h // 2))
+            cv2.imshow('YOLO Detection', display_frame)
             if self._open_window_count == 0:
                 cv2.moveWindow('YOLO Detection', 200, 50)
             self._open_window_count += 1
@@ -114,9 +137,16 @@ class CameraManager:
                  (bx.xyxy[0][0] + bx.xyxy[0][2]) / 2,
                  (bx.xyxy[0][1] + bx.xyxy[0][3]) / 2) for bx in res.boxes]
 
-    def check_event(self, wait_ms: int = 1) -> bool:
+    def check_event(self, wait_ms: int = 50) -> bool:
+        """Pump the GUI event loop and pace the caller.
+
+        Always sleeps ``wait_ms`` ms (via ``cv2.waitKey`` when a window is
+        shown, otherwise ``time.sleep``). Returns True if the user pressed 'q'.
+        """
         if self.has_camera() and self.show_window:
             return cv2.waitKey(wait_ms) & 0xFF == ord('q')
+        if wait_ms > 0:
+            time.sleep(wait_ms / 1000.0)
         return False
 
     def calibrate_positions(self, n: int, m: int) -> bool:

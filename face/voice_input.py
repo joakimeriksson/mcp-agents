@@ -65,6 +65,7 @@ class VoiceEventType(Enum):
     TRANSCRIPTION_COMPLETE = auto()
     TRANSCRIPTION_EMPTY = auto()
     LISTEN_FAILED = auto()
+    RECORDING_SAVED = auto()
 
     # Continuous listener
     CONTINUOUS_STARTED = auto()
@@ -146,6 +147,12 @@ class ListenFailedPayload:
 
 
 @dataclass(frozen=True)
+class RecordingSavedPayload:
+    path: str
+    remaining: int
+
+
+@dataclass(frozen=True)
 class ContinuousStatePayload:
     pass
 
@@ -156,7 +163,7 @@ VoiceEventPayload = Union[
     RecordingStartedPayload, TranscriptionStartedPayload,
     TranscriptionSegmentPayload, TranscriptionCompletePayload,
     TranscriptionEmptyPayload, ListenFailedPayload,
-    ContinuousStatePayload,
+    RecordingSavedPayload, ContinuousStatePayload,
 ]
 
 
@@ -487,6 +494,9 @@ class VoiceInput:
         self.vad_prob: float = 0.0
         self.listen_phase: str = ""  # "", "waiting", "recording", "transcribing"
         self._cancel_listen: bool = False
+        self._flush_listen: bool = False
+        self._save_next_count: int = 0
+        self._save_dir: str = "recordings"
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
 
@@ -573,6 +583,37 @@ class VoiceInput:
 
     # --- Core operations ---
 
+    def flush_listen(self) -> None:
+        """Stop a VAD-driven listen() in progress and proceed to transcribe
+        whatever speech has been captured so far. If no speech has started
+        yet, this is equivalent to cancelling. Safe to call from any thread."""
+        self._flush_listen = True
+
+    def save_next_recordings(self, n: int = 1, directory: Optional[str] = None) -> int:
+        """Arm the next N completed VAD recordings for saving to WAV files
+        in `directory` (default: 'recordings' under the working directory).
+        Each saved recording decrements the counter and emits a
+        RECORDING_SAVED event. Returns the new pending count."""
+        if directory:
+            self._save_dir = directory
+        self._save_next_count += int(n)
+        return self._save_next_count
+
+    def _save_recording(self, audio: np.ndarray) -> str:
+        import wave
+        os.makedirs(self._save_dir, exist_ok=True)
+        ms = int(time.time() * 1000) % 1000
+        fname = f"recording_{time.strftime('%Y%m%d_%H%M%S')}_{ms:03d}.wav"
+        path = os.path.join(self._save_dir, fname)
+        pcm16 = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self._sample_rate)
+            wf.writeframes(pcm16.tobytes())
+        logger.info(f"Saved recording to {path}")
+        return path
+
     def listen(self, seconds: int = None, on_segment: Callable = None) -> Optional[str]:
         """Blocking STT. Tries VAD, falls back to fixed recording.
         Returns transcribed text or None."""
@@ -602,6 +643,7 @@ class VoiceInput:
         self.listen_phase = "waiting"
         self.vad_prob = 0.0
         self._cancel_listen = False
+        self._flush_listen = False
 
         vad_model = self._vad_model
         vad_model.reset_states()
@@ -630,6 +672,12 @@ class VoiceInput:
             while True:
                 if self._cancel_listen:
                     logger.info("[VAD] listen cancelled")
+                    return None
+                if self._flush_listen:
+                    if speech_started:
+                        logger.info("[VAD] listen flushed; transcribing captured audio")
+                        break
+                    logger.info("[VAD] listen flushed before speech detected; nothing to transcribe")
                     return None
 
                 data, _ = stream.read(chunk_samples)
@@ -689,6 +737,16 @@ class VoiceInput:
         self.vad_prob = 0.0
         audio = np.concatenate(speech_chunks)
         audio_duration_ms = int(len(audio) / self._sample_rate * 1000)
+
+        if self._save_next_count > 0:
+            try:
+                saved_path = self._save_recording(audio)
+            except Exception as e:
+                logger.warning(f"Failed to save recording: {e}")
+            else:
+                self._save_next_count -= 1
+                self._emit(VoiceEventType.RECORDING_SAVED,
+                           RecordingSavedPayload(saved_path, self._save_next_count))
 
         noise_reduced = False
         if self._noise_reduce:

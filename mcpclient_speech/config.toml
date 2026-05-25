@@ -1,0 +1,11 @@
+[llm]
+model    = "PetrosStav/gemma3-tools:12b"
+base_url = "http://localhost:11434/v1/"
+api_key  = "ollama"
+
+[face]
+omit_names_and_prefs = false
+
+[devices]
+# camera     = 0   # uncomment to set default camera index (face client only)
+# microphone = 0   # uncomment to set default microphone device index

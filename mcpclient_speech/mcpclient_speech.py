@@ -3,6 +3,7 @@
 # and using a speechbased LLM interface with whisper and piper.
 #
 
+import argparse
 import asyncio
 from fastmcp import Client, exceptions
 from fastmcp.client.transports import SSETransport
@@ -17,12 +18,7 @@ from openai import OpenAI
 from readnb import *
 from eyewindow import *
 from record import *
-
-ollama_config = {
-    "model": "PetrosStav/gemma3-tools:12b",
-    "base_url": "http://localhost:11434/v1/",
-    "api_key": "ollama"
-}
+from config import load_config
 
 messages_trunclen = 4
 messages = []
@@ -53,6 +49,11 @@ def on_release(_event, state):
         state['evtime'] = time.time()
         state['newstate'] = 'listening1'
     elif state['currstate'] == 'listening1' or state['currstate'] == 'listening2':
+        state['evtime'] = time.time()
+        state['newstate'] = 'processing'
+
+def kp_stop_listening(_event, state):
+    if state['currstate'] in ('listening1', 'listening2'):
         state['evtime'] = time.time()
         state['newstate'] = 'processing'
 
@@ -168,7 +169,13 @@ def kp_repeat_last(_event, state):
     state['evtime'] = time.time()
     state['newstate'] = 'repeat'
 
-async def main():
+def parse_args():
+    parser = argparse.ArgumentParser(description="MCP Speech Client (push-to-talk)")
+    parser.add_argument('--config', default=None, help='Path to config TOML file (default: config.toml next to this script)')
+    return parser.parse_args()
+
+
+async def main(args):
     global messages
     global tools
     global win
@@ -179,6 +186,10 @@ async def main():
     global has_name
     global has_init
     global has_exit
+
+    cfg = load_config(args.config)
+    ollama_config = cfg["llm"]
+    mic_index = cfg["devices"].get("microphone")
 
     # Connect via stdio to a local script
     async with Client(transport=SSETransport("http://127.0.0.1:8000/sse")) as client:
@@ -220,8 +231,7 @@ async def main():
 
         make_nonblocking(sys.stdin)
 
-        #if init_audio(microphone_name="sof-hda-dsp", sample_rate=16000):
-        if init_audio():
+        if init_audio(device_idx=mic_index):
             print('Initialized speech recognition and synthesis')
         else:
             print('Error: failed to initialize audio')
@@ -246,6 +256,7 @@ async def main():
         win.set_exit_callback(on_exit, state)
         win.keydict["c"] = (kp_clear_messages, None)
         win.keydict["r"] = (kp_repeat_last, state)
+        win.keydict[" "] = (kp_stop_listening, state)
         win.check_events()
         print('Created the interaction window')
 
@@ -380,5 +391,4 @@ async def main():
         print('Exiting')
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    asyncio.run(main(parse_args()))

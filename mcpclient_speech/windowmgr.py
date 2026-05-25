@@ -180,6 +180,7 @@ class WindowMgr:
         mpl.rcParams['keymap.yscale'] = []
         mpl.rcParams['keymap.grid'] = []
         mpl.rcParams['keymap.grid_minor'] = []
+        mpl.rcParams['keymap.save'] = []
 
     def start_event_loop(self):
         self.add_close_callback(self.exit_event_loop)

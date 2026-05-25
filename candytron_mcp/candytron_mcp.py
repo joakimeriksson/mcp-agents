@@ -12,6 +12,7 @@ from camera import CameraManager
 from robotarm import init_ned, exit_ned, ned_move_between
 from transtable import transhead, transtable
 from scene_state import SceneState
+from scene_logger import SceneLogger
 
 logger = logging.getLogger("candytron")
 
@@ -19,6 +20,7 @@ mcp = FastMCP("Candytron 4000")
 
 cam: CameraManager | None = None
 scene_state = SceneState()
+scene_logger: SceneLogger | None = None
 use_robot = True
 
 @mcp.resource("url://get_service_name")
@@ -71,7 +73,12 @@ def scene_message(scene, lang):
 def get_service_augmentation(lang: str) -> str:
     """Return extra information on the current state, to insert before the user prompt"""
     scene = scene_state.get_scene()
-    return scene_message(scene, lang)
+    message = scene_message(scene, lang)
+    if scene_logger is not None:
+        frame = cam.get_last_frame() if cam else None
+        raw_frame = cam.get_last_raw_frame() if cam else None
+        scene_logger.log(scene, frame, raw_frame, lang, message)
+    return message
 
 @mcp.tool()
 def show_demo_move() -> str:
@@ -116,7 +123,7 @@ def _run_mcp_server(args):
 
 
 def main():
-    global use_robot, cam
+    global use_robot, cam, scene_logger
 
     parser = argparse.ArgumentParser(description=mcp.name)
     parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
@@ -127,6 +134,7 @@ def main():
     parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
     parser.add_argument('--camera', type=int, default=None, help='Camera index to use (default: auto-detect first available)')
     parser.add_argument('--no-window', action='store_true', help='Disable the OpenCV display window')
+    parser.add_argument('--log-scenes-dir', default=None, help='If set, log every scene request (annotated camera frame + returned state) to this directory')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
     args = parser.parse_args()
 
@@ -140,6 +148,11 @@ def main():
         level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # Enable scene-request logging if requested
+    if args.log_scenes_dir:
+        scene_logger = SceneLogger(args.log_scenes_dir)
+        logger.info("Scene-request logging enabled at %s", args.log_scenes_dir)
 
     # List cameras and exit
     if args.list_cameras:

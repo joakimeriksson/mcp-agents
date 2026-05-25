@@ -38,6 +38,7 @@ class CameraManager:
         self.positions_thresdist: float = 0
         self._open_window_count: int = 0
         self._last_frame = None
+        self._last_raw_frame = None
         self._last_frame_lock = threading.Lock()
 
     @staticmethod
@@ -91,11 +92,18 @@ class CameraManager:
         return self.yolomodel is not None
 
     def get_last_frame(self):
-        """Return a copy of the most recent camera frame, or None if unavailable."""
+        """Return a copy of the most recent annotated camera frame, or None if unavailable."""
         with self._last_frame_lock:
             if self._last_frame is None:
                 return None
             return self._last_frame.copy()
+
+    def get_last_raw_frame(self):
+        """Return a copy of the most recent raw camera frame, or None if unavailable."""
+        with self._last_frame_lock:
+            if self._last_raw_frame is None:
+                return None
+            return self._last_raw_frame.copy()
 
     def acquire_scene_one(self, refresh: bool = False) -> list[tuple]:
         if not self.has_camera():
@@ -113,6 +121,7 @@ class CameraManager:
         annotated_frame = res.plot()
         with self._last_frame_lock:
             self._last_frame = annotated_frame
+            self._last_raw_frame = fr
 
         if self.show_window:
             h, w = annotated_frame.shape[:2]

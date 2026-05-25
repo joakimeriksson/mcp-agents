@@ -76,7 +76,8 @@ def get_service_augmentation(lang: str) -> str:
     message = scene_message(scene, lang)
     if scene_logger is not None:
         frame = cam.get_last_frame() if cam else None
-        scene_logger.log(scene, frame, lang, message)
+        raw_frame = cam.get_last_raw_frame() if cam else None
+        scene_logger.log(scene, frame, raw_frame, lang, message)
     return message
 
 @mcp.tool()

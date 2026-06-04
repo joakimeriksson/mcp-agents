@@ -715,39 +715,49 @@ def _dedupe_person_facts(
     return kept, changes
 
 
-def _load_face_encodings_by_person(db_dir: str) -> dict:
-    """Load ``known_faces/faces.pkl`` and return {person_id: [encoding, ...]}.
+def _load_face_encodings_by_person(db_dir: str) -> tuple[dict, str]:
+    """Load the face db and return ({person_id: [encoding, ...]}, metric).
 
-    NOTE: this reads the legacy dlib db (``faces.pkl``, 128-d, Euclidean) used by
-    the offline ``dedupe``/``similar`` CLIs. The live recognition path now defaults
-    to the InsightFace backend, which writes ``faces_arcface.pkl`` (512-d, cosine);
-    those CLIs and the L2 thresholds in ``main()`` are not yet updated for it.
+    Prefers the InsightFace db (``faces_arcface.pkl``, 512-d, cosine) and falls
+    back to the legacy dlib db (``faces.pkl``, 128-d, Euclidean); the returned
+    metric tells callers how to compare the encodings. ``({}, "cosine")`` when
+    neither db exists.
     """
-    path = os.path.join(db_dir, "faces.pkl")
-    if not os.path.exists(path):
-        return {}
     import pickle
-    with open(path, "rb") as fh:
-        db = pickle.load(fh)
-    out: dict = {}
-    for pid, enc in zip(db.get("person_ids", []), db.get("encodings", [])):
-        out.setdefault(pid, []).append(enc)
-    return out
+    for fname, metric in (("faces_arcface.pkl", "cosine"), ("faces.pkl", "euclidean")):
+        path = os.path.join(db_dir, fname)
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as fh:
+            db = pickle.load(fh)
+        out: dict = {}
+        for pid, enc in zip(db.get("person_ids", []), db.get("encodings", [])):
+            out.setdefault(pid, []).append(enc)
+        return out, metric
+    return {}, "cosine"
 
 
-def _pair_face_distances(encs_a: list, encs_b: list) -> tuple[float, float]:
-    """Return (min, mean) L2 distance between two encoding sets.
+def _pair_face_distances(encs_a: list, encs_b: list,
+                         metric: str = "cosine") -> tuple[float, float]:
+    """Return (min, mean) distance between two encoding sets under ``metric``.
 
-    ``(inf, inf)`` if either set is empty.
+    ``"cosine"`` (``1 - cos``) for L2-normalized ArcFace embeddings, ``"euclidean"``
+    for legacy dlib encodings. ``(inf, inf)`` if either set is empty.
     """
     if not encs_a or not encs_b:
         return float("inf"), float("inf")
     import numpy as _np
-    A = _np.asarray(encs_a)
-    B = _np.asarray(encs_b)
-    # Pairwise L2: ||a-b|| for every a in A, b in B
-    diffs = A[:, None, :] - B[None, :, :]
-    d = _np.linalg.norm(diffs, axis=2)
+    A = _np.asarray(encs_a, dtype=float)
+    B = _np.asarray(encs_b, dtype=float)
+    if metric == "cosine":
+        # Normalize defensively, then cosine distance = 1 - A·B for every pair.
+        A = A / (_np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+        B = B / (_np.linalg.norm(B, axis=1, keepdims=True) + 1e-12)
+        d = 1.0 - A @ B.T
+    else:
+        # Pairwise L2: ||a-b|| for every a in A, b in B
+        diffs = A[:, None, :] - B[None, :, :]
+        d = _np.linalg.norm(diffs, axis=2)
     return float(d.min()), float(d.mean())
 
 
@@ -770,13 +780,20 @@ def _facts_similarity(facts_a: list[str], facts_b: list[str]) -> float:
     return _jaccard(toks_a, toks_b)
 
 
-def _similarity_verdict(face_min: float, name: float, facts: float) -> Optional[str]:
-    """Classify a pair. Returns a short label or None to hide."""
-    if face_min < 0.40:
+def _similarity_verdict(face_min: float, name: float, facts: float,
+                        metric: str = "cosine") -> Optional[str]:
+    """Classify a pair. Returns a short label or None to hide.
+
+    Face thresholds depend on the metric: cosine distance for ArcFace embeddings
+    sits on a different scale than dlib's Euclidean, so each gets its own
+    "same / maybe" cutoffs.
+    """
+    same, maybe = (0.30, 0.45) if metric == "cosine" else (0.40, 0.55)
+    if face_min < same:
         return "LIKELY SAME"
-    if face_min < 0.55 and (name > 0.85 or facts > 0.30):
+    if face_min < maybe and (name > 0.85 or facts > 0.30):
         return "LIKELY SAME"
-    if face_min < 0.55:
+    if face_min < maybe:
         return "maybe"
     if name > 0.90:
         return "name collision"
@@ -1007,10 +1024,13 @@ def main():
         if not pids:
             print("No people records.")
             return
-        encs_by_pid = _load_face_encodings_by_person(args.db_dir)
+        encs_by_pid, face_metric = _load_face_encodings_by_person(args.db_dir)
         if not encs_by_pid:
-            print(f"Warning: no face encodings loaded from {args.db_dir}/faces.pkl — "
-                  "falling back to name+facts only.")
+            print(f"Warning: no face encodings found in {args.db_dir} "
+                  "(faces_arcface.pkl / faces.pkl) — falling back to name+facts only.")
+        else:
+            print(f"Comparing faces with {face_metric} distance "
+                  f"({len(encs_by_pid)} people).\n")
 
         def meta(pid):
             s = mem._stored.get(pid, {})
@@ -1029,10 +1049,10 @@ def main():
                     continue
                 name_b, facts_b = meta(pid_b)
                 encs_b = encs_by_pid.get(pid_b, [])
-                face_min, face_mean = _pair_face_distances(encs_a, encs_b)
+                face_min, face_mean = _pair_face_distances(encs_a, encs_b, face_metric)
                 name_sim = _name_similarity(name_a, name_b)
                 facts_sim = _facts_similarity(facts_a, facts_b)
-                verdict = _similarity_verdict(face_min, name_sim, facts_sim)
+                verdict = _similarity_verdict(face_min, name_sim, facts_sim, face_metric)
                 if verdict is None and not args.all:
                     continue
                 shown += 1

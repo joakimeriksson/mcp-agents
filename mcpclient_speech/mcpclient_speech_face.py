@@ -30,7 +30,7 @@ from eyewindow import *
 from voice_input import VoiceInput, ContinuousListener, VoiceEventType, list_input_devices
 from voice_output import VoiceOutput
 from face_tracker import (
-    FaceTracker, FaceDatabase, EmotionDetector, FaceEventType,
+    FaceTracker, FaceDatabase, FaceEventType,
 )
 import cv2
 from config import load_config
@@ -609,8 +609,7 @@ async def main(args):
         ### Initialize the face_tracker here, with on_face_change as callback
         face_db = FaceDatabase()
         face_db.load()
-        emotion_detector = EmotionDetector()
-        tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector)
+        tracker = FaceTracker(db=face_db, emotion_detector=None)
 
         focus_state = {"track_id": None, "person_id": None}
 
@@ -665,8 +664,6 @@ async def main(args):
                             label += f" {pid}"
                         if is_focus:
                             label += " [FOCUS]"
-                        if face.emotion and face.emotion != "neutral":
-                            label += f" {face.emotion}"
                         cv2.rectangle(frame, (left, bottom), (right, bottom + 22), color[::-1], cv2.FILLED)
                         cv2.putText(frame, label, (left + 4, bottom + 16),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)

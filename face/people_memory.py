@@ -716,7 +716,13 @@ def _dedupe_person_facts(
 
 
 def _load_face_encodings_by_person(db_dir: str) -> dict:
-    """Load ``known_faces/faces.pkl`` and return {person_id: [encoding, ...]}."""
+    """Load ``known_faces/faces.pkl`` and return {person_id: [encoding, ...]}.
+
+    NOTE: this reads the legacy dlib db (``faces.pkl``, 128-d, Euclidean) used by
+    the offline ``dedupe``/``similar`` CLIs. The live recognition path now defaults
+    to the InsightFace backend, which writes ``faces_arcface.pkl`` (512-d, cosine);
+    those CLIs and the L2 thresholds in ``main()`` are not yet updated for it.
+    """
     path = os.path.join(db_dir, "faces.pkl")
     if not os.path.exists(path):
         return {}

@@ -32,7 +32,7 @@ from voice_output import VoiceOutput
 from face_tracker import (
     FaceTracker, FaceDatabase, FaceEventType,
 )
-from face_config import build_db_kwargs, build_tracker_kwargs
+from face_config import build_db_kwargs, build_tracker_kwargs, backend_metric
 import cv2
 from config import load_config
 from interaction_logger import InteractionLogger
@@ -140,8 +140,14 @@ def parse_args():
     # face/face_config.toml [tracker]; left unset, the config value (then the
     # face_tracker.py default) applies.
     tune = parser.add_argument_group('face tracker tuning')
+    tune.add_argument('--backend', choices=['insightface', 'dlib'], default=None,
+                      help='Face detection/embedding backend (default from config: insightface)')
+    tune.add_argument('--det-size', type=int, default=None,
+                      help='InsightFace detector input size (square); larger = better on distant faces, slower')
+    tune.add_argument('--det-thresh', type=float, default=None,
+                      help='InsightFace minimum detector confidence')
     tune.add_argument('--frame-scale', type=float, default=None,
-                      help='Detection downscale factor (higher = better on distant faces, more CPU)')
+                      help='dlib backend detection downscale factor (higher = better on distant faces, more CPU)')
     tune.add_argument('--recognition-tolerance', type=float, default=None,
                       help='Max embedding distance to accept a match (lower = stricter)')
     tune.add_argument('--recognition-k', type=int, default=None,
@@ -632,9 +638,16 @@ async def main(args):
             db_kwargs["tolerance"] = args.recognition_tolerance
         if args.recognition_k is not None:
             db_kwargs["recognition_k"] = args.recognition_k
+        if args.backend is not None:
+            # Keep the db's metric/file in step with a CLI backend override so
+            # load() opens the matching db (it runs before the tracker is built).
+            db_kwargs["metric"] = backend_metric(args.backend)
 
         tracker_kwargs = build_tracker_kwargs()
         for cli_val, kw in (
+            (args.backend, "backend"),
+            (args.det_size, "det_size"),
+            (args.det_thresh, "det_thresh"),
             (args.frame_scale, "frame_scale"),
             (args.max_missing_seconds, "max_missing_seconds"),
             (args.focus_min_area_frac, "focus_min_area_frac"),

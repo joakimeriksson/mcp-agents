@@ -50,9 +50,32 @@ All modules use events.py for publish/subscribe communication.
 ### Stable person IDs
 
 People are identified by a stable `person_id` (e.g. `p001`) that never changes,
-even on rename. The face database (`known_faces/faces.pkl`) stores person IDs,
+even on rename. The face database (`known_faces/faces_arcface.pkl` for the default
+InsightFace backend, `faces.pkl` for the legacy dlib backend) stores person IDs,
 not names. Display names live in `people/{person_id}.json` and are the single
 source of truth.
+
+### Face recognition backend
+
+Detection and embedding run through a pluggable backend, selected by
+`[tracker] backend` in `face_config.toml`:
+
+- **`insightface`** (default) -- SCRFD detector + ArcFace 512-d embedder on
+  onnxruntime, compared with cosine distance. Far more robust at distance and
+  off-angle. The `buffalo_l` model pack (~300 MB) downloads automatically to
+  `~/.insightface/models` on first run. Providers auto-select CUDA → CoreML →
+  CPU; for CUDA on Nvidia, install `onnxruntime-gpu` instead of `onnxruntime`.
+- **`dlib`** -- the legacy HOG detector + 128-d encoder, Euclidean distance.
+  Kept as a fallback / A-B comparison.
+
+The two embedding spaces are incompatible, so each backend keeps its own db file
+(`faces_arcface.pkl` vs `faces.pkl`) and they never clobber each other. To carry
+existing people over to the InsightFace backend without re-meeting anyone,
+re-embed the saved face crops:
+
+```
+uv run python migrate_db.py --db-dir known_faces
+```
 
 ### Single facts storage
 
@@ -202,7 +225,8 @@ pause / resume             Pause/resume speech listening
 
 ```
 known_faces/
-  faces.pkl              Face encodings keyed by person_id (schema v2)
+  faces_arcface.pkl      InsightFace/ArcFace 512-d encodings, cosine (schema v3, default)
+  faces.pkl              Legacy dlib 128-d encodings, Euclidean (schema v2, dlib backend)
   p001/                  Face images for person p001
     20260410_143022.jpg
   p002/

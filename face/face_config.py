@@ -34,7 +34,11 @@ _DB_KEYS = {
     "recognition_k": "recognition_k",
 }
 _TRACKER_KEYS = {
+    "backend": "backend",
     "frame_scale": "frame_scale",
+    "det_size": "det_size",
+    "det_thresh": "det_thresh",
+    "providers": "providers",
     "max_missing_seconds": "max_missing_seconds",
     "focus_min_area_frac": "focus_min_area_frac",
     "focus_dwell_seconds": "focus_dwell_seconds",
@@ -44,10 +48,26 @@ _TRACKER_KEYS = {
 }
 
 
+def backend_metric(backend: str) -> str:
+    """Embedding comparison metric implied by a backend name.
+
+    dlib's 128-d encodings compare under Euclidean distance; InsightFace's
+    L2-normalized ArcFace embeddings under cosine. The db file and schema version
+    follow from this, so it must be set on FaceDatabase before load().
+    """
+    return "euclidean" if backend == "dlib" else "cosine"
+
+
 def build_db_kwargs() -> dict:
-    """FaceDatabase kwargs from [tracker] config (present keys only)."""
+    """FaceDatabase kwargs from [tracker] config (present keys only).
+
+    The comparison metric is derived from the configured backend so the db opens
+    the matching file (faces.pkl vs faces_arcface.pkl) at load() time.
+    """
     tc = get_tracker_config()
-    return {kw: tc[key] for key, kw in _DB_KEYS.items() if key in tc}
+    kwargs = {kw: tc[key] for key, kw in _DB_KEYS.items() if key in tc}
+    kwargs["metric"] = backend_metric(tc.get("backend", "insightface"))
+    return kwargs
 
 
 def build_tracker_kwargs() -> dict:

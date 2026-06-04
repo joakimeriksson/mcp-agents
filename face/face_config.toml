@@ -52,9 +52,24 @@ enroll_min_face_px = 80
 enroll_min_sharpness = 40.0
 enroll_frontal_tolerance = 0.18
 
-# --- Engagement / "makes contact" focus gate (Group 3, no gaze yet) ---
+# --- Focus / "primary subject" gate ---
 # A face must cover at least this fraction of the frame (proximity) and be
 # held steady this many seconds before it can take focus -- filters people
 # passing by in the background. 0 = off (instant, any size).
 focus_min_area_frac = 0.04
 focus_dwell_seconds = 1.0
+
+# --- Engagement / "makes contact" gate (Group 3: looking at the camera) ---
+# Layered on focus: the focused face must point at the camera within these
+# head-pose limits (degrees; yaw = left/right, pitch = up/down) and hold it
+# for engage_dwell_seconds to emit FACE_ENGAGED; turning away emits
+# FACE_DISENGAGED. Requires the InsightFace backend (dlib has no head pose,
+# so every focused face reads as engaged). Widen the limits to loosen.
+engage_max_yaw = 25.0
+engage_max_pitch = 20.0
+engage_dwell_seconds = 0.3
+
+# Optional real-yaw frontal gate for auto-enrollment (degrees, 0 = off). When
+# set, only near-frontal faces (|yaw| <= this) are auto-enrolled, using the
+# backend's head pose instead of the dlib nose proxy (enroll_frontal_tolerance).
+enroll_max_yaw = 0.0

@@ -16,8 +16,12 @@ import numpy as np
 
 from face_tracker import (
     FaceDatabase,
+    FaceTracker,
+    FaceEventType,
+    TrackedFace,
     _embedding_distances,
     _pair_distance,
+    _pose_yaw_pitch,
 )
 
 
@@ -140,6 +144,110 @@ def test_ema_renormalization_math():
     print("ok: EMA renormalization keeps unit norm")
 
 
+def _engagement_tracker(d, **kw):
+    # dlib backend keeps construction model-free; we drive engagement directly by
+    # setting tracks + focus and calling _update_engagement().
+    db = FaceDatabase(db_dir=d, metric="euclidean")
+    opts = dict(engage_max_yaw=25.0, engage_max_pitch=20.0, engage_dwell_seconds=0.0)
+    opts.update(kw)
+    return FaceTracker(db=db, emotion_detector=None, backend="dlib", **opts)
+
+
+def _kinds(events):
+    return [e.type for e in events]
+
+
+def test_pose_helper():
+    # InsightFace pose is [pitch, yaw, roll]; helper returns (yaw, pitch).
+    assert _pose_yaw_pitch({"pose": [-21.8, -1.7, 14.6]}) == (-1.7, -21.8)
+    assert _pose_yaw_pitch({"pose": None}) == (0.0, 0.0)
+    assert _pose_yaw_pitch(None) == (0.0, 0.0)
+    print("ok: pose helper maps [pitch,yaw,roll] -> (yaw,pitch)")
+
+
+def test_engagement_engage_and_lookaway():
+    with tempfile.TemporaryDirectory() as d:
+        tr = _engagement_tracker(d)
+        face = TrackedFace(track_id=1, bbox=(0, 100, 100, 0), yaw=5.0, pitch=3.0)
+        tr._tracks = [face]
+        tr._focus_id = 1
+
+        # Facing the camera -> engages immediately (dwell 0).
+        ev = tr._update_engagement()
+        assert _kinds(ev) == [FaceEventType.FACE_ENGAGED], _kinds(ev)
+        assert tr.engaged_track_id == 1
+
+        # Small wobble past the limit but within hysteresis -> stays engaged, silent.
+        face.yaw = 28.0
+        assert tr._update_engagement() == []
+        assert tr.engaged_track_id == 1
+
+        # Clearly turned away -> disengages with reason looked_away.
+        face.yaw = 45.0
+        ev = tr._update_engagement()
+        assert _kinds(ev) == [FaceEventType.FACE_DISENGAGED]
+        assert ev[0].payload.reason == "looked_away"
+        assert tr.engaged_track_id is None
+        print("ok: engagement engages on contact, holds through wobble, releases on look-away")
+
+
+def test_engagement_never_engages_when_turned():
+    with tempfile.TemporaryDirectory() as d:
+        tr = _engagement_tracker(d)
+        face = TrackedFace(track_id=1, bbox=(0, 100, 100, 0), yaw=40.0, pitch=0.0)
+        tr._tracks = [face]
+        tr._focus_id = 1
+        assert tr._update_engagement() == []
+        assert tr.engaged_track_id is None
+        print("ok: a turned-away focused face never engages")
+
+
+def test_engagement_lost_focus_and_disappear():
+    with tempfile.TemporaryDirectory() as d:
+        # lost_focus: focus moves to another track.
+        tr = _engagement_tracker(d)
+        a = TrackedFace(track_id=1, bbox=(0, 100, 100, 0), yaw=0.0, pitch=0.0)
+        b = TrackedFace(track_id=2, bbox=(0, 100, 100, 0), yaw=0.0, pitch=0.0)
+        tr._tracks = [a, b]
+        tr._focus_id = 1
+        tr._update_engagement()
+        assert tr.engaged_track_id == 1
+        tr._focus_id = 2  # focus switched
+        ev = tr._update_engagement()
+        assert ev[0].type == FaceEventType.FACE_DISENGAGED
+        assert ev[0].payload.reason == "lost_focus" and ev[0].track_id == 1
+
+        # disappeared: the engaged+focused face goes occluded.
+        tr2 = _engagement_tracker(d)
+        f = TrackedFace(track_id=1, bbox=(0, 100, 100, 0), yaw=0.0, pitch=0.0)
+        tr2._tracks = [f]
+        tr2._focus_id = 1
+        tr2._update_engagement()
+        assert tr2.engaged_track_id == 1
+        f.frames_since_seen = 1  # no longer visible
+        ev = tr2._update_engagement()
+        assert ev[0].type == FaceEventType.FACE_DISENGAGED
+        assert ev[0].payload.reason == "disappeared"
+        print("ok: engagement releases on lost-focus and on disappearance")
+
+
+def test_engagement_dwell():
+    with tempfile.TemporaryDirectory() as d:
+        tr = _engagement_tracker(d, engage_dwell_seconds=0.5)
+        face = TrackedFace(track_id=1, bbox=(0, 100, 100, 0), yaw=2.0, pitch=2.0)
+        tr._tracks = [face]
+        tr._focus_id = 1
+        # First aligned frame: starts the dwell timer, no engagement yet.
+        assert tr._update_engagement() == []
+        assert tr.engaged_track_id is None
+        # Pretend the dwell window has elapsed.
+        tr._engage_candidate_since -= 1.0
+        ev = tr._update_engagement()
+        assert _kinds(ev) == [FaceEventType.FACE_ENGAGED]
+        assert tr.engaged_track_id == 1
+        print("ok: engagement requires the dwell window")
+
+
 if __name__ == "__main__":
     test_distance_helpers()
     test_cosine_mean_of_k()
@@ -147,4 +255,9 @@ if __name__ == "__main__":
     test_load_rejects_stale_schema()
     test_rename_person()
     test_ema_renormalization_math()
+    test_pose_helper()
+    test_engagement_engage_and_lookaway()
+    test_engagement_never_engages_when_turned()
+    test_engagement_lost_focus_and_disappear()
+    test_engagement_dwell()
     print("\nAll recognition logic tests passed.")

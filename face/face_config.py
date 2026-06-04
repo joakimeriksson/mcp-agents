@@ -42,9 +42,13 @@ _TRACKER_KEYS = {
     "max_missing_seconds": "max_missing_seconds",
     "focus_min_area_frac": "focus_min_area_frac",
     "focus_dwell_seconds": "focus_dwell_seconds",
+    "engage_max_yaw": "engage_max_yaw",
+    "engage_max_pitch": "engage_max_pitch",
+    "engage_dwell_seconds": "engage_dwell_seconds",
     "enroll_min_face_px": "enroll_min_face_px",
     "enroll_min_sharpness": "enroll_min_sharpness",
     "enroll_frontal_tolerance": "enroll_frontal_tolerance",
+    "enroll_max_yaw": "enroll_max_yaw",
 }
 
 

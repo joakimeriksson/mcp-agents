@@ -32,6 +32,7 @@ from voice_output import VoiceOutput
 from face_tracker import (
     FaceTracker, FaceDatabase, FaceEventType,
 )
+from face_config import build_db_kwargs, build_tracker_kwargs
 import cv2
 from config import load_config
 from interaction_logger import InteractionLogger
@@ -134,6 +135,24 @@ def parse_args():
     parser.add_argument('--mic', type=int, default=None, help='Microphone device index (default: system default)')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
     parser.add_argument('--config', default=None, help='Path to config TOML file (default: config.toml next to this script)')
+
+    # Face-tracker tuning. Each overrides the matching key in
+    # face/face_config.toml [tracker]; left unset, the config value (then the
+    # face_tracker.py default) applies.
+    tune = parser.add_argument_group('face tracker tuning')
+    tune.add_argument('--frame-scale', type=float, default=None,
+                      help='Detection downscale factor (higher = better on distant faces, more CPU)')
+    tune.add_argument('--recognition-tolerance', type=float, default=None,
+                      help='Max embedding distance to accept a match (lower = stricter)')
+    tune.add_argument('--recognition-k', type=int, default=None,
+                      help='Average the k nearest stored samples per person when matching')
+    tune.add_argument('--max-missing-seconds', type=float, default=None,
+                      help='Grace period before a missing face is dropped (survives look-aways)')
+    tune.add_argument('--focus-min-area-frac', type=float, default=None,
+                      help='Min fraction of frame a face must cover to take focus (0 = off)')
+    tune.add_argument('--focus-dwell-seconds', type=float, default=None,
+                      help='Seconds a candidate must be held before it takes focus (0 = off)')
+
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument('--log-file', default=None, help='Log every interaction event to this JSONL file (overwrites on each run)')
     log_group.add_argument('--log-dir', default=None, help='Log every interaction event to a new timestamped JSONL file in this directory')
@@ -607,9 +626,26 @@ async def main(args):
             return False
 
         ### Initialize the face_tracker here, with on_face_change as callback
-        face_db = FaceDatabase()
+        # Tuning comes from face/face_config.toml [tracker]; CLI flags override.
+        db_kwargs = build_db_kwargs()
+        if args.recognition_tolerance is not None:
+            db_kwargs["tolerance"] = args.recognition_tolerance
+        if args.recognition_k is not None:
+            db_kwargs["recognition_k"] = args.recognition_k
+
+        tracker_kwargs = build_tracker_kwargs()
+        for cli_val, kw in (
+            (args.frame_scale, "frame_scale"),
+            (args.max_missing_seconds, "max_missing_seconds"),
+            (args.focus_min_area_frac, "focus_min_area_frac"),
+            (args.focus_dwell_seconds, "focus_dwell_seconds"),
+        ):
+            if cli_val is not None:
+                tracker_kwargs[kw] = cli_val
+
+        face_db = FaceDatabase(**db_kwargs)
         face_db.load()
-        tracker = FaceTracker(db=face_db, emotion_detector=None)
+        tracker = FaceTracker(db=face_db, emotion_detector=None, **tracker_kwargs)
 
         focus_state = {"track_id": None, "person_id": None}
 

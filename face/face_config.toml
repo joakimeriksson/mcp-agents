@@ -1,5 +1,41 @@
 [tracker]
+# Shared face-tracker tuning, read by face/agent.py, the standalone
+# face_tracker.py, and mcpclient_speech/mcpclient_speech_face.py.
+# Any value left out here falls back to the constructor default in
+# face_tracker.py. CLI flags (where provided) override these.
+
+# --- Detection ---
+# Fraction the frame is downscaled before detection. Higher = more pixels
+# reach the encoder (better on small/distant faces) at higher CPU cost.
+frame_scale = 0.75
+
+# --- Recognition (Group 1: fewer confusions / misses) ---
+# Max embedding distance to accept a match. Lower = stricter (fewer
+# confusions), higher = looser (fewer misses). dlib's loose default is 0.6.
+recognition_tolerance = 0.5
+# Score each candidate person by the mean of their k nearest stored samples
+# instead of a single nearest encoding. k=1 = old behaviour.
+recognition_k = 3
+
+# --- Track persistence (Group 2: survive brief look-aways) ---
 # Grace period (seconds) before a missing face becomes FACE_DISAPPEARED.
 # Brief head-turns / occlusions within this window emit FACE_OCCLUDED /
-# FACE_RECOVERED instead.
-max_missing_seconds = 3.0
+# FACE_RECOVERED instead, and the face keeps its identity on return.
+max_missing_seconds = 8.0
+
+# --- Enrollment quality gate (Group 1: stop poisoning the DB) ---
+# Auto-enrollment only fires when the face passes all of these.
+# enroll_min_face_px:        min bbox side in full-frame pixels (0 = off)
+# enroll_min_sharpness:      min variance-of-Laplacian, rejects blur (0 = off)
+# enroll_frontal_tolerance:  max |nose-offset - 0.5| between the eyes;
+#                            lower = stricter frontal requirement (1.0 = off)
+enroll_min_face_px = 80
+enroll_min_sharpness = 40.0
+enroll_frontal_tolerance = 0.18
+
+# --- Engagement / "makes contact" focus gate (Group 3, no gaze yet) ---
+# A face must cover at least this fraction of the frame (proximity) and be
+# held steady this many seconds before it can take focus -- filters people
+# passing by in the background. 0 = off (instant, any size).
+focus_min_area_frac = 0.04
+focus_dwell_seconds = 1.0

@@ -172,6 +172,10 @@ class TrackedFace:
     emotion: str = "neutral"
     emotion_confidence: float = 0.0
     encoding: np.ndarray = field(default_factory=lambda: np.zeros(128))
+    # Most recent *raw* detection encoding (before the EMA blend in `encoding`).
+    # Used for enrollment so we store a clean single-frame embedding, never the
+    # smoothed-and-possibly-contaminated tracking encoding.
+    last_encoding: np.ndarray = field(default_factory=lambda: np.zeros(128))
     bbox: tuple = (0, 0, 0, 0)  # (top, right, bottom, left)
     first_seen: float = 0.0
     last_seen: float = 0.0
@@ -215,9 +219,14 @@ class FaceDatabase:
 
     SCHEMA_VERSION = 2
 
-    def __init__(self, db_dir: str = _KNOWN_FACES_DIR, tolerance: float = 0.6):
+    def __init__(self, db_dir: str = _KNOWN_FACES_DIR, tolerance: float = 0.6,
+                 recognition_k: int = 3):
         self.db_dir = db_dir
         self.tolerance = tolerance
+        # Number of nearest stored samples per person to average when matching.
+        # k=1 reproduces the old single-nearest behaviour; k>1 makes a single
+        # lucky-close (or poisoned) sample less able to win a false match.
+        self.recognition_k = max(1, recognition_k)
         self._db = {
             "encodings": [],
             "person_ids": [],
@@ -251,12 +260,22 @@ class FaceDatabase:
             if not self._db["encodings"]:
                 return (None, 0.0)
             distances = face_recognition.face_distance(self._db["encodings"], encoding)
-            best_idx = np.argmin(distances)
-            best_dist = distances[best_idx]
-            if best_dist < self.tolerance:
-                person_id = self._db["person_ids"][best_idx]
+            # Aggregate per person: score each candidate by the mean of their
+            # k nearest stored samples, then pick the closest person. This is
+            # steadier than a single nearest encoding -- one good sample can no
+            # longer pull a confusion across the line on its own.
+            by_pid: dict[str, list[float]] = {}
+            for dist, pid in zip(distances, self._db["person_ids"]):
+                by_pid.setdefault(pid, []).append(float(dist))
+            best_pid, best_dist = None, float("inf")
+            for pid, dists in by_pid.items():
+                dists.sort()
+                score = float(np.mean(dists[:self.recognition_k]))
+                if score < best_dist:
+                    best_dist, best_pid = score, pid
+            if best_pid is not None and best_dist < self.tolerance:
                 confidence = max(0.0, 1.0 - best_dist) * 100
-                return (person_id, confidence)
+                return (best_pid, confidence)
             return (None, 0.0)
 
     def add_face(self, person_id: str, encoding: np.ndarray,
@@ -384,9 +403,14 @@ class FaceTracker:
                  recognition_revoke_seconds: float = 0.25,
                  focus_switch_threshold: float = 0.1,
                  focus_switch_seconds: float = 0.5,
+                 focus_min_area_frac: float = 0.0,
+                 focus_dwell_seconds: float = 0.0,
                  emotion_debounce_seconds: float = 0.3,
                  auto_enroll: bool = True,
-                 enroll_min_frames: int = 10):
+                 enroll_min_frames: int = 10,
+                 enroll_min_face_px: int = 0,
+                 enroll_min_sharpness: float = 0.0,
+                 enroll_frontal_tolerance: float = 1.0):
         self.db = db
         self.emotion_detector = emotion_detector
         self.frame_scale = frame_scale
@@ -398,6 +422,10 @@ class FaceTracker:
         self._emotion_debounce_s = emotion_debounce_seconds
         self._auto_enroll = auto_enroll
         self._enroll_min_frames = enroll_min_frames
+        # Enrollment quality gate (0 / 1.0 = disabled, so defaults are a no-op).
+        self._enroll_min_face_px = enroll_min_face_px
+        self._enroll_min_sharpness = enroll_min_sharpness
+        self._enroll_frontal_tolerance = enroll_frontal_tolerance
 
         self._tracks: list[TrackedFace] = []
         self._identities: dict[int, Identity] = {}
@@ -410,6 +438,11 @@ class FaceTracker:
         self._focus_id: Optional[int] = None
         self._focus_switch_threshold = focus_switch_threshold
         self._focus_switch_s = focus_switch_seconds
+        # Engagement gate: a face must cover at least this fraction of the frame
+        # (proximity) and be held for this long before it can take focus. Both
+        # default to off, so background passers-by are filtered only when set.
+        self._focus_min_area_frac = focus_min_area_frac
+        self._focus_dwell_s = focus_dwell_seconds
         self._focus_challenger_id: Optional[int] = None
         self._focus_challenger_since: float = 0.0
 
@@ -643,7 +676,7 @@ class FaceTracker:
         face = self.get_face_by_id(track_id)
         if face is None:
             return False
-        self.db.add_face(person_id, face.encoding, frame, face.bbox)
+        self.db.add_face(person_id, face.last_encoding, frame, face.bbox)
         with self._lock:
             self._identities[track_id] = Identity(
                 person_id=person_id, confidence=100.0,
@@ -681,8 +714,11 @@ class FaceTracker:
             frame = self._last_frames.get(track.track_id)
             if frame is None:
                 continue
+            if not self._passes_enroll_quality(frame, track.bbox):
+                continue
             person_id = self._allocate_person_id()
-            self.db.add_face(person_id, track.encoding, frame, track.bbox)
+            # Enroll the clean raw encoding, not the EMA-smoothed tracking one.
+            self.db.add_face(person_id, track.last_encoding, frame, track.bbox)
             self._identities[track.track_id] = Identity(
                 person_id=person_id, confidence=100.0,
                 _matching_since=0.0, _confirmed=True,
@@ -692,6 +728,62 @@ class FaceTracker:
                 FaceEnrolledPayload(person_id=person_id, bbox=track.bbox),
             ))
         return events
+
+    def _passes_enroll_quality(self, frame, bbox) -> bool:
+        """Quality gate for auto-enrollment: size, sharpness, frontalness.
+
+        Each check is skipped when its threshold is at the disabled sentinel
+        (0 / 1.0), so the default configuration enrolls exactly as before.
+        Only runs on enrollment candidates (rare), so the landmark pass below
+        is not a per-frame cost.
+        """
+        top, right, bottom, left = bbox
+        w, h = right - left, bottom - top
+        if min(w, h) < self._enroll_min_face_px:
+            return False
+
+        if self._enroll_min_sharpness > 0.0:
+            roi = frame[max(0, top):max(0, bottom), max(0, left):max(0, right)]
+            if roi.size == 0:
+                return False
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            if cv2.Laplacian(gray, cv2.CV_64F).var() < self._enroll_min_sharpness:
+                return False
+
+        if self._enroll_frontal_tolerance < 1.0 and not self._is_frontal(frame, bbox):
+            return False
+
+        return True
+
+    def _is_frontal(self, frame, bbox) -> bool:
+        """Cheap yaw proxy: is the nose roughly centred between the eyes?
+
+        Uses dlib landmarks (via face_recognition) on the single enrollment
+        crop. Returns True on any landmark failure so we never *block* on a
+        detector hiccup -- the gate is meant to reject obvious profiles, not
+        to be a hard authority. A true head-pose estimator arrives in the
+        InsightFace phase.
+        """
+        top, right, bottom, left = bbox
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        try:
+            landmarks = face_recognition.face_landmarks(rgb, [(top, right, bottom, left)])
+        except Exception:
+            return True
+        if not landmarks:
+            return False
+        lm = landmarks[0]
+        left_eye, right_eye, nose = lm.get("left_eye"), lm.get("right_eye"), lm.get("nose_tip")
+        if not (left_eye and right_eye and nose):
+            return False
+        lx = np.mean([p[0] for p in left_eye])
+        rx = np.mean([p[0] for p in right_eye])
+        nx = np.mean([p[0] for p in nose])
+        span = rx - lx
+        if abs(span) < 1e-3:
+            return False
+        ratio = (nx - lx) / span  # ~0.5 looking straight ahead
+        return abs(ratio - 0.5) <= self._enroll_frontal_tolerance
 
     @property
     def active_tracks(self) -> list[TrackedFace]:
@@ -709,26 +801,41 @@ class FaceTracker:
             logger.info(f"[{e.type.name}] track={e.track_id} {e.payload}")
             self._dispatcher.dispatch(e)
 
+    def _focus_change_event(self, old_id, new_id, old_score, new_score, new_pid):
+        """Build a FOCUS_CHANGED event. new_id=None means focus was cleared
+        (payload.new_track_id reports 0, matching the historical contract)."""
+        return self._make_event(
+            FaceEventType.FOCUS_CHANGED, new_id,
+            FocusChangedPayload(
+                old_track_id=old_id,
+                new_track_id=new_id if new_id is not None else 0,
+                old_focus_score=old_score, new_focus_score=new_score,
+                new_person_id=new_pid,
+            )
+        )
+
     def _update_focus_scores(self, frame_w, frame_h) -> list[FaceEvent]:
-        """Compute focus scores and return any focus-change events."""
+        """Compute focus scores and return any focus-change events.
+
+        Focus only lands on a face that passes the proximity gate (covers at
+        least ``focus_min_area_frac`` of the frame) and is held for
+        ``focus_dwell_seconds`` -- so background passers-by never trigger it.
+        With both at their disabled defaults this reduces to the original
+        centrality+size selection with switch hysteresis.
+        """
         events = []
         now = time.time()
 
         if not self._tracks:
             if self._focus_id is not None:
-                events.append(self._make_event(
-                    FaceEventType.FOCUS_CHANGED, None,
-                    FocusChangedPayload(
-                        old_track_id=self._focus_id, new_track_id=0,
-                        old_focus_score=0, new_focus_score=0, new_person_id=None,
-                    )
-                ))
+                events.append(self._focus_change_event(self._focus_id, None, 0.0, 0.0, None))
             self._focus_id = None
             self._focus_challenger_id = None
             self._focus_challenger_since = 0.0
             return events
 
         cx, cy = frame_w / 2, frame_h / 2
+        frame_area = max(1, frame_w * frame_h)
         max_area = max(t.area for t in self._tracks) or 1
 
         for track in self._tracks:
@@ -741,37 +848,57 @@ class FaceTracker:
 
         visible = [t for t in self._tracks if t.is_visible]
         if not visible:
-            return events
+            return events  # keep the current focus as a ghost while occluded
 
-        best = max(visible, key=lambda f: f.focus_score)
+        cur = next((t for t in self._tracks if t.track_id == self._focus_id), None)
+        if cur is not None and not cur.is_visible:
+            return events  # focused face briefly occluded -> hold focus
 
-        current_exists = any(t.track_id == self._focus_id for t in self._tracks)
-        if self._focus_id is None or not current_exists:
-            old_id = self._focus_id
-            self._focus_id = best.track_id
+        # Proximity gate: only faces close enough to the camera are eligible.
+        eligible = [t for t in visible
+                    if t.area / frame_area >= self._focus_min_area_frac]
+        if not eligible:
+            # Only distant/background faces remain -> nobody is in focus.
+            if self._focus_id is not None:
+                old_score = cur.focus_score if cur else 0.0
+                events.append(self._focus_change_event(self._focus_id, None, old_score, 0.0, None))
+            self._focus_id = None
             self._focus_challenger_id = None
             self._focus_challenger_since = 0.0
-            if old_id != best.track_id:
-                events.append(self._make_event(
-                    FaceEventType.FOCUS_CHANGED, best.track_id,
-                    FocusChangedPayload(
-                        old_track_id=old_id, new_track_id=best.track_id,
-                        old_focus_score=0, new_focus_score=best.focus_score,
-                        new_person_id=self.get_person_id(best.track_id),
-                    )
-                ))
             return events
 
-        current_visible = any(t.track_id == self._focus_id and t.is_visible for t in self._tracks)
-        if not current_visible:
+        best = max(eligible, key=lambda f: f.focus_score)
+        cur_eligible = cur is not None and cur in eligible
+
+        # --- Acquisition: no valid current focus (none, gone, or now too far) ---
+        if not cur_eligible:
+            old_id = self._focus_id
+            if self._focus_dwell_s <= 0:
+                self._focus_id = best.track_id
+                self._focus_challenger_id = None
+                self._focus_challenger_since = 0.0
+                if old_id != best.track_id:
+                    events.append(self._focus_change_event(
+                        old_id, best.track_id, 0.0, best.focus_score,
+                        self.get_person_id(best.track_id)))
+                return events
+            # Require the candidate to dwell before we engage.
+            if best.track_id == self._focus_challenger_id:
+                if now - self._focus_challenger_since >= self._focus_dwell_s:
+                    self._focus_id = best.track_id
+                    self._focus_challenger_id = None
+                    self._focus_challenger_since = 0.0
+                    if old_id != best.track_id:
+                        events.append(self._focus_change_event(
+                            old_id, best.track_id, 0.0, best.focus_score,
+                            self.get_person_id(best.track_id)))
+            else:
+                self._focus_challenger_id = best.track_id
+                self._focus_challenger_since = now
             return events
 
-        current_score = 0.0
-        for t in visible:
-            if t.track_id == self._focus_id:
-                current_score = t.focus_score
-                break
-
+        # --- Switch hysteresis: a valid current focus exists ---
+        current_score = cur.focus_score if cur else 0.0
         if best.track_id != self._focus_id and \
            best.focus_score > current_score + self._focus_switch_threshold:
             if best.track_id == self._focus_challenger_id:
@@ -780,15 +907,9 @@ class FaceTracker:
                     self._focus_id = best.track_id
                     self._focus_challenger_id = None
                     self._focus_challenger_since = 0.0
-                    events.append(self._make_event(
-                        FaceEventType.FOCUS_CHANGED, best.track_id,
-                        FocusChangedPayload(
-                            old_track_id=old_id, new_track_id=best.track_id,
-                            old_focus_score=current_score,
-                            new_focus_score=best.focus_score,
-                            new_person_id=self.get_person_id(best.track_id),
-                        )
-                    ))
+                    events.append(self._focus_change_event(
+                        old_id, best.track_id, current_score, best.focus_score,
+                        self.get_person_id(best.track_id)))
             else:
                 self._focus_challenger_id = best.track_id
                 self._focus_challenger_since = now
@@ -863,6 +984,7 @@ class FaceTracker:
 
     def _update_track(self, track, encoding, bbox, frame):
         now = time.time()
+        track.last_encoding = encoding
         track.encoding = 0.3 * encoding + 0.7 * track.encoding
         track.bbox = bbox
         track.last_seen = now
@@ -885,7 +1007,8 @@ class FaceTracker:
     def _create_track(self, encoding, bbox, frame):
         now = time.time()
         track = TrackedFace(
-            track_id=self._next_id, encoding=encoding.copy(), bbox=bbox,
+            track_id=self._next_id, encoding=encoding.copy(),
+            last_encoding=encoding.copy(), bbox=bbox,
             first_seen=now, last_seen=now, frames_visible=1,
         )
         self._next_id += 1
@@ -1066,7 +1189,8 @@ def main():
     parser = argparse.ArgumentParser(description="Standalone face tracker")
     parser.add_argument("--db-dir", default="known_faces", help="Face database directory")
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
-    parser.add_argument("--scale", type=float, default=0.5, help="Detection scale factor")
+    parser.add_argument("--scale", type=float, default=None,
+                        help="Detection scale factor (overrides face_config.toml)")
     parser.add_argument("--fps", type=int, default=0, help="Max FPS (0 = unlimited)")
     parser.add_argument("--no-emotion", action="store_true", help="Disable emotion detection")
     parser.add_argument("--no-log-window", action="store_true", help="Disable log window")
@@ -1095,15 +1219,19 @@ def main():
             msg = str(p)[:60]
         log_lines.append((ts, event.type.name, msg))
 
-    face_db = FaceDatabase(db_dir=args.db_dir)
+    from face_config import build_db_kwargs, build_tracker_kwargs
+    face_db = FaceDatabase(db_dir=args.db_dir, **build_db_kwargs())
     face_db.load()
 
     emotion_detector = None
     if not args.no_emotion:
         emotion_detector = EmotionDetector()
 
+    tracker_kwargs = build_tracker_kwargs()
+    if args.scale is not None:
+        tracker_kwargs["frame_scale"] = args.scale
     tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector,
-                          frame_scale=args.scale)
+                          **tracker_kwargs)
     tracker.subscribe(on_event_display)
 
     cap = cv2.VideoCapture(args.camera)

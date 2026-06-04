@@ -89,6 +89,7 @@ curr_person = None
 curr_prompt = ""
 
 win: EyeWindow | None = None
+cam_win: CameraWindow | None = None
 voice_in: VoiceInput | None = None
 voice_out: VoiceOutput | None = None
 listener: ContinuousListener | None = None
@@ -219,6 +220,8 @@ def kp_save_recording(_event, _obj):
     logger.info("Save-next-recordings count is now %d", pending)
 
 def on_exit(state):
+    if state.get('newstate') == 'exit':
+        return
     logger.info("Exit event")
     _ilog("state_change", **{"from": state.get('currstate'), "to": "exit"})
     state['evtime'] = time.time()
@@ -477,6 +480,7 @@ async def main(args):
     global messages
     global tools
     global win
+    global cam_win
     global model
     global has_sysprompt
     global has_sysprompt_lang
@@ -554,6 +558,9 @@ async def main(args):
         win.keydict["m"] = (kp_toggle_mute, None)
         win.keydict[" "] = (kp_force_process, None)
         win.keydict["s"] = (kp_save_recording, None)
+        cam_win = CameraWindow(name + " - Camera", keydict=win.keydict)
+        cam_win.set_exit_callback(on_exit, state)
+        win.attach_camera_window(cam_win)
         win.check_events()
         print('Created the interaction window')
 
@@ -664,7 +671,9 @@ async def main(args):
                         cv2.putText(frame, label, (left + 4, bottom + 16),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    win.set_camera_frame(rgb)
+                    cam_win.set_camera_frame(rgb)
+            except Exception:
+                logger.exception("camera_loop crashed")
             finally:
                 cap.release()
 

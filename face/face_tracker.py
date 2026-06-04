@@ -1463,8 +1463,14 @@ def main():
     parser = argparse.ArgumentParser(description="Standalone face tracker")
     parser.add_argument("--db-dir", default="known_faces", help="Face database directory")
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
+    parser.add_argument("--backend", choices=["insightface", "dlib"], default=None,
+                        help="Detection/embedding backend (overrides face_config.toml)")
+    parser.add_argument("--det-size", type=int, default=None,
+                        help="InsightFace detector input size (square)")
+    parser.add_argument("--det-thresh", type=float, default=None,
+                        help="InsightFace minimum detector confidence")
     parser.add_argument("--scale", type=float, default=None,
-                        help="Detection scale factor (overrides face_config.toml)")
+                        help="dlib backend detection scale factor (overrides face_config.toml)")
     parser.add_argument("--fps", type=int, default=0, help="Max FPS (0 = unlimited)")
     parser.add_argument("--no-emotion", action="store_true", help="Disable emotion detection")
     parser.add_argument("--no-log-window", action="store_true", help="Disable log window")
@@ -1505,8 +1511,13 @@ def main():
             msg = str(p)[:60]
         log_lines.append((ts, event.type.name, msg))
 
-    from face_config import build_db_kwargs, build_tracker_kwargs
-    face_db = FaceDatabase(db_dir=args.db_dir, **build_db_kwargs())
+    from face_config import build_db_kwargs, build_tracker_kwargs, backend_metric
+    db_kwargs = build_db_kwargs()
+    if args.backend is not None:
+        # Keep the db's metric/file in step with a CLI backend override so
+        # load() opens the matching db (it runs before the tracker is built).
+        db_kwargs["metric"] = backend_metric(args.backend)
+    face_db = FaceDatabase(db_dir=args.db_dir, **db_kwargs)
     face_db.load()
 
     emotion_detector = None
@@ -1514,8 +1525,14 @@ def main():
         emotion_detector = EmotionDetector()
 
     tracker_kwargs = build_tracker_kwargs()
-    if args.scale is not None:
-        tracker_kwargs["frame_scale"] = args.scale
+    for cli_val, kw in (
+        (args.backend, "backend"),
+        (args.det_size, "det_size"),
+        (args.det_thresh, "det_thresh"),
+        (args.scale, "frame_scale"),
+    ):
+        if cli_val is not None:
+            tracker_kwargs[kw] = cli_val
     tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector,
                           **tracker_kwargs)
     tracker.subscribe(on_event_display)

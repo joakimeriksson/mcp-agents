@@ -137,39 +137,39 @@ class EyeWindow:
         self.keydict = {}
 
     def _make_debug_panel(self):
-        """Left-strip debug widgets: MIC/VAD/SIL meters + in/out scope."""
+        """Left-strip debug widgets: two scopes (mic in / TTS out) stacked
+        on top, MIC/VAD/SIL meters below."""
+
+        def scope(rect, color, label):
+            ax = self.win.fig.add_axes(rect, xticks=[], yticks=[])
+            ax.set_facecolor(gray(0.15))
+            for sp in ax.spines.values():
+                sp.set_color(gray(0.3))
+                sp.set_linewidth(0.8)
+            ax.set_xlim(0, self._scope_n - 1)
+            ax.set_ylim(-1.05, 1.05)
+            line = ax.plot(np.arange(self._scope_n),
+                           np.zeros(self._scope_n), color=color,
+                           linewidth=0.7)[0]
+            ax.text(0.02, 0.04, label, color=color, fontsize=7,
+                    transform=ax.transAxes)
+            return line
+
+        self._scope_n = 400
+        # Two separate oscilloscopes, each with its own scale and gain
+        # label: mic input (cyan) on top, TTS output (yellow) below.
+        self.scope_in = scope((0.025, 0.845, 0.19, 0.115),
+                              (0.15, 0.75, 0.9), f"in ×{self.SCOPE_GAIN_IN:g}")
+        self.scope_out = scope((0.025, 0.700, 0.19, 0.115),
+                               (0.95, 0.78, 0.15), f"out ×{self.SCOPE_GAIN_OUT:g}")
         # VU meters: mic level (peak + dB), VAD probability (threshold tick),
         # end-of-utterance silence countdown. Fed via set_audio_sources().
-        self.vu_mic = VUMeter(self.win.fig, (0.030, 0.16, 0.040, 0.56),
+        self.vu_mic = VUMeter(self.win.fig, (0.030, 0.13, 0.040, 0.50),
                               "MIC", self.bg)
-        self.vu_vad = VUMeter(self.win.fig, (0.085, 0.16, 0.040, 0.56),
+        self.vu_vad = VUMeter(self.win.fig, (0.085, 0.13, 0.040, 0.50),
                               "VAD", self.bg)
-        self.vu_sil = VUMeter(self.win.fig, (0.140, 0.16, 0.040, 0.56),
+        self.vu_sil = VUMeter(self.win.fig, (0.140, 0.13, 0.040, 0.50),
                               "SIL", self.bg)
-        # Oscilloscope: last ~1s of mic input (cyan) and TTS output
-        # (yellow), each normalized to its own recent peak.
-        self.scope_ax = self.win.fig.add_axes((0.025, 0.78, 0.19, 0.19),
-                                              xticks=[], yticks=[])
-        self.scope_ax.set_facecolor(gray(0.15))
-        for sp in self.scope_ax.spines.values():
-            sp.set_color(gray(0.3))
-            sp.set_linewidth(0.8)
-        self._scope_n = 400
-        self.scope_ax.set_xlim(0, self._scope_n - 1)
-        self.scope_ax.set_ylim(-1.05, 1.05)
-        x = np.arange(self._scope_n)
-        self.scope_out = self.scope_ax.plot(
-            x, np.zeros(self._scope_n), color=(0.95, 0.78, 0.15),
-            linewidth=0.7)[0]
-        self.scope_in = self.scope_ax.plot(
-            x, np.zeros(self._scope_n), color=(0.15, 0.75, 0.9),
-            linewidth=0.7)[0]
-        self.scope_ax.text(0.02, 0.03, f"in ×{self.SCOPE_GAIN_IN:g}",
-                           color=(0.15, 0.75, 0.9),
-                           fontsize=7, transform=self.scope_ax.transAxes)
-        self.scope_ax.text(0.30, 0.03, f"out ×{self.SCOPE_GAIN_OUT:g}",
-                           color=(0.95, 0.78, 0.15),
-                           fontsize=7, transform=self.scope_ax.transAxes)
         self._scope_last_t = time.time()
 
     def set_button_callbacks(self, func1, func2, obj):

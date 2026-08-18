@@ -642,7 +642,7 @@ async def main(args):
 
         # Debug panel in the eye window: VU meters (mic level, VAD
         # probability, silence countdown) + in/out oscilloscope
-        audio_monitor = AudioMonitor()
+        audio_monitor = AudioMonitor(device=args.mic)
         audio_monitor.start()
         win.set_audio_sources(audio_monitor, voice_in, voice_out)
 

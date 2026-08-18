@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start candytron_mcp (simulated) + mcpclient_speech_face.
-# The client has the SSE URL hardcoded to 127.0.0.1:7999,
-# so we must start the server on --port 7999.
+# The server is started on port 7999 and the client pointed at it
+# via --server.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -44,7 +44,7 @@ for i in {1..40}; do
 done
 
 echo "[start-demo] starting mcpclient_speech_face"
-(cd "$CLIENT_DIR" && uv run mcpclient_speech_face.py "$@") &
+(cd "$CLIENT_DIR" && uv run mcpclient_speech_face.py --server "http://127.0.0.1:$PORT/sse" "$@") &
 CLIENT_PID=$!
 
 # Foreground-wait so the EXIT/INT/TERM trap runs and kills the server.

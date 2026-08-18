@@ -336,8 +336,14 @@ class VoiceOutput:
         body = {"input": text, "response_format": "wav"}
         if server.get("voice"):
             body["voice"] = server["voice"]
+        # Advisory, not authoritative: the client's per-turn language
+        # detection is flaky (a Swedish turn mislabeled 'it' would make the
+        # server speak Swedish text through the Italian pipeline). The server
+        # detects the language from the reply text itself — lingua restricted
+        # to its allow-list, with this hint only breaking low-confidence ties
+        # (the machinery debugged in reachy_mini_conversation_app).
         if language:
-            body["language"] = language
+            body["language_hint"] = language
         resp = requests.post(server["url"], json=body, timeout=60)
         resp.raise_for_status()
         with wave.open(io.BytesIO(resp.content)) as wf:

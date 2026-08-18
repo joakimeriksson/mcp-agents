@@ -19,4 +19,7 @@ dependencies = [
     "opencv-python",
     "face-recognition",
     "onnxruntime",
+    "soundfile>=0.14.0",
+    "ollama>=0.6.2",
+    "requests>=2.34.2",
 ]

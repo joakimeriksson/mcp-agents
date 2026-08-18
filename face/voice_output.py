@@ -276,6 +276,12 @@ class VoiceOutput:
             return
 
         try:
+            # Normalize: no/unknown language means the default language —
+            # otherwise a caller passing None/False/"hi" silently bypasses
+            # the configured TTS server and lands on the default Piper voice.
+            if (not language or (language not in self._tts_servers
+                                 and language not in self._language_models)):
+                language = DEFAULT_LANGUAGE
             server = self._tts_servers.get(language)
             voice = None
             if server is None:

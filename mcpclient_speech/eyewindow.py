@@ -164,9 +164,11 @@ class EyeWindow:
         self.scope_in = self.scope_ax.plot(
             x, np.zeros(self._scope_n), color=(0.15, 0.75, 0.9),
             linewidth=0.7)[0]
-        self.scope_ax.text(0.02, 0.03, "in", color=(0.15, 0.75, 0.9),
+        self.scope_ax.text(0.02, 0.03, f"in ×{self.SCOPE_GAIN_IN:g}",
+                           color=(0.15, 0.75, 0.9),
                            fontsize=7, transform=self.scope_ax.transAxes)
-        self.scope_ax.text(0.10, 0.03, "out", color=(0.95, 0.78, 0.15),
+        self.scope_ax.text(0.30, 0.03, f"out ×{self.SCOPE_GAIN_OUT:g}",
+                           color=(0.95, 0.78, 0.15),
                            fontsize=7, transform=self.scope_ax.transAxes)
         self._scope_last_t = time.time()
 
@@ -242,7 +244,9 @@ class EyeWindow:
     # (that made quiet noise look huge and the scale jump around). The mic
     # signal is inherently small (speech RMS ~0.05-0.3) so it gets a fixed
     # boost; TTS output is near full-scale already. Clipped at the frame.
-    SCOPE_GAIN_IN = 5.0
+    # Kept moderate so the robot's own echo doesn't out-draw its source —
+    # the gains are printed on the scope so the scale difference is visible.
+    SCOPE_GAIN_IN = 2.5
     SCOPE_GAIN_OUT = 1.0
 
     @staticmethod

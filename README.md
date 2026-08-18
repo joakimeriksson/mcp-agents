@@ -43,11 +43,12 @@ This starts `candytron_mcp` on port 7999 with `--simulate-robot
 --simulate-camera` and then the speech-face client. Stop everything with
 Ctrl-C (or `./stop-demo.sh`).
 
-If the wrong camera opens, pick another with `FACE_CAMERA_INDEX=<n>`
-(the client defaults to index 4):
+If the wrong camera opens, pick another with `--camera <n>` (extra
+arguments are passed through to the client; `-l` lists cameras, and
+`[devices]` in `mcpclient_speech/config.toml` can set a default):
 
 ```bash
-FACE_CAMERA_INDEX=0 ./start-demo.sh
+./start-demo.sh --camera 1
 ```
 
 ### Run with the Face Agent

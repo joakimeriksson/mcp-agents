@@ -770,6 +770,16 @@ async def main(args):
         # When listening, sound triggers -> process (above)
         # Face out of focus -> wait
 
+        # Persistent UI pump: repaints the eye window (state changes, VU
+        # meters, camera thumbnail) whenever the main coroutine is awaiting —
+        # e.g. during LLM inference or MCP tool calls. Without it the
+        # 'Processing' state never gets painted before the blocking work.
+        async def _pump_ui():
+            while state.get('currstate') != 'exit':
+                win.check_events()
+                await asyncio.sleep(0.03)
+        pump_task = asyncio.ensure_future(_pump_ui())
+
         set_state(state, 'wait')
         newstate = False
         prompt_source = None
@@ -865,7 +875,10 @@ async def main(args):
                       messages_sent=msg,
                       tool_count=len(tools or []))
                 try:
-                    response = openai.chat.completions.create(
+                    # In a thread so the UI pump keeps the window alive during
+                    # inference (and 'Processing' actually shows).
+                    response = await asyncio.to_thread(
+                        openai.chat.completions.create,
                         model=model,
                         messages=msg,
                         tools=tools,
@@ -939,7 +952,8 @@ async def main(args):
                           messages_sent=msg,
                           tool_count=len(tools or []))
                     try:
-                        response = openai.chat.completions.create(
+                        response = await asyncio.to_thread(
+                            openai.chat.completions.create,
                             model=model,
                             messages=msg,
                             tools=tools,

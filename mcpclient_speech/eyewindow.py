@@ -127,7 +127,7 @@ class EyeWindow:
         # its own recent peak.
         self.scope_ax = self.win.fig.add_axes((0.02, 0.80, 0.22, 0.18),
                                               xticks=[], yticks=[])
-        self.scope_ax.set_facecolor(gray(0.42))
+        self.scope_ax.set_facecolor(gray(0.15))
         for s in self.scope_ax.spines.values():
             s.set_color(gray(0.3))
             s.set_linewidth(0.8)

@@ -48,6 +48,51 @@ EMOTION_LABELS = ["neutral", "happy", "surprise", "sad", "angry", "disgust", "fe
 
 
 # ---------------------------------------------------------------------------
+# Embedding distance helpers
+# ---------------------------------------------------------------------------
+
+def _embedding_distances(known, encoding, metric: str) -> np.ndarray:
+    """Distance from ``encoding`` to each row of ``known`` under ``metric``.
+
+    ``"euclidean"`` is the legacy dlib metric (L2 on 128-d vectors).
+    ``"cosine"`` (``1 - cos``) is correct for L2-normalized ArcFace embeddings;
+    for unit vectors the cosine similarity is just the dot product.
+    """
+    known = np.asarray(known, dtype=np.float64)
+    enc = np.asarray(encoding, dtype=np.float64)
+    if metric == "cosine":
+        return 1.0 - known @ enc
+    return np.linalg.norm(known - enc, axis=1)
+
+
+def _pair_distance(a, b, metric: str) -> float:
+    """Distance between two single embeddings under ``metric``."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if metric == "cosine":
+        return float(1.0 - np.dot(a, b))
+    return float(np.linalg.norm(a - b))
+
+
+def _select_providers(override=None) -> list:
+    """Pick onnxruntime execution providers, best-available first.
+
+    Preference CUDA (Nvidia) -> CoreML (Apple Silicon) -> CPU, intersected with
+    what this onnxruntime build actually exposes. ``override`` (from config) is
+    honoured but still filtered to available providers so a GPU-less machine
+    never fails to start.
+    """
+    available = set(ort.get_available_providers())
+    if override:
+        chosen = [p for p in override if p in available]
+        return chosen or ["CPUExecutionProvider"]
+    preferred = ["CUDAExecutionProvider", "CoreMLExecutionProvider",
+                 "CPUExecutionProvider"]
+    chosen = [p for p in preferred if p in available]
+    return chosen or ["CPUExecutionProvider"]
+
+
+# ---------------------------------------------------------------------------
 # Event types and payloads
 # ---------------------------------------------------------------------------
 
@@ -215,34 +260,73 @@ class Identity:
 # ---------------------------------------------------------------------------
 
 class FaceDatabase:
-    """Persistent face encoding database keyed by stable person_id."""
+    """Persistent face encoding database keyed by stable person_id.
 
-    SCHEMA_VERSION = 2
+    ``metric`` selects how stored embeddings are compared:
+    ``"euclidean"`` for the legacy dlib 128-d encodings (schema v2) and
+    ``"cosine"`` for the L2-normalized InsightFace/ArcFace 512-d embeddings
+    (schema v3). The two are not interchangeable, so each metric uses its own
+    db file (``faces.pkl`` for dlib/v2, ``faces_arcface.pkl`` for InsightFace/v3):
+    the backends coexist for A/B comparison and one never clobbers the other's
+    saved encodings. ``load()`` still refuses a file whose ``schema_version``
+    does not match, warning and starting empty rather than mixing dimensions.
+    """
+
+    # Per-metric db file and the schema version it must carry.
+    _DB_FILE = {"euclidean": "faces.pkl", "cosine": "faces_arcface.pkl"}
+    _SCHEMA = {"euclidean": 2, "cosine": 3}
 
     def __init__(self, db_dir: str = _KNOWN_FACES_DIR, tolerance: float = 0.6,
-                 recognition_k: int = 3):
+                 recognition_k: int = 3, metric: str = "cosine"):
         self.db_dir = db_dir
         self.tolerance = tolerance
+        self.metric = metric
         # Number of nearest stored samples per person to average when matching.
         # k=1 reproduces the old single-nearest behaviour; k>1 makes a single
         # lucky-close (or poisoned) sample less able to win a false match.
         self.recognition_k = max(1, recognition_k)
-        self._db = {
+        self._db = self._empty_db()
+        self._lock = threading.Lock()
+
+    @property
+    def schema_version(self) -> int:
+        return self._SCHEMA[self.metric]
+
+    @property
+    def db_file(self) -> str:
+        return os.path.join(self.db_dir, self._DB_FILE[self.metric])
+
+    def _empty_db(self) -> dict:
+        return {
             "encodings": [],
             "person_ids": [],
             "last_seen": {},
-            "schema_version": self.SCHEMA_VERSION,
+            "schema_version": self.schema_version,
         }
-        self._lock = threading.Lock()
 
     def load(self):
-        db_file = os.path.join(self.db_dir, "faces.pkl")
+        db_file = self.db_file
         if os.path.exists(db_file):
             with open(db_file, "rb") as f:
-                self._db = pickle.load(f)
-            self._db.setdefault("last_seen", {})
-            self._db.setdefault("person_ids", [])
-            self._db.setdefault("schema_version", self.SCHEMA_VERSION)
+                loaded = pickle.load(f)
+            version = loaded.get("schema_version", 2)
+            if version != self.schema_version:
+                # The file holds embeddings of the wrong dimension/metric for the
+                # active backend. Refuse to mix: warn and start empty so
+                # auto-enroll can repopulate. For the InsightFace backend, run
+                # migrate_db.py to re-embed the saved face crops without losing
+                # anyone.
+                logger.warning(
+                    "Ignoring face db at %s: schema v%s != expected v%s. "
+                    "Starting empty -- run migrate_db.py to re-embed known_faces/.",
+                    db_file, version, self.schema_version,
+                )
+                self._db = self._empty_db()
+            else:
+                self._db = loaded
+                self._db.setdefault("last_seen", {})
+                self._db.setdefault("person_ids", [])
+                self._db.setdefault("schema_version", self.schema_version)
         logger.info(
             f"Database loaded: {len(self.known_person_ids)} people, "
             f"{self.encoding_count} encodings"
@@ -250,16 +334,16 @@ class FaceDatabase:
 
     def save(self):
         os.makedirs(self.db_dir, exist_ok=True)
-        db_file = os.path.join(self.db_dir, "faces.pkl")
         with self._lock:
-            with open(db_file, "wb") as f:
+            with open(self.db_file, "wb") as f:
                 pickle.dump(self._db, f)
 
     def recognize(self, encoding: np.ndarray) -> tuple:
         with self._lock:
             if not self._db["encodings"]:
                 return (None, 0.0)
-            distances = face_recognition.face_distance(self._db["encodings"], encoding)
+            distances = _embedding_distances(
+                self._db["encodings"], encoding, self.metric)
             # Aggregate per person: score each candidate by the mean of their
             # k nearest stored samples, then pick the closest person. This is
             # steadier than a single nearest encoding -- one good sample can no
@@ -288,6 +372,16 @@ class FaceDatabase:
         self._save_face_image(person_id, frame, bbox)
         logger.info(f"Added face for {person_id!r} ({sample_count} samples)")
 
+    def add_encoding(self, person_id: str, encoding: np.ndarray):
+        """Append one encoding without persisting or saving a crop.
+
+        For bulk/migration use (e.g. migrate_db.py rebuilding the db from saved
+        face crops); call ``save()`` once after adding everything.
+        """
+        with self._lock:
+            self._db["encodings"].append(np.asarray(encoding, dtype=np.float64))
+            self._db["person_ids"].append(person_id)
+
     def update_last_seen(self, person_id: str):
         with self._lock:
             self._db["last_seen"][person_id] = datetime.now().timestamp()
@@ -297,12 +391,7 @@ class FaceDatabase:
 
     def clear(self):
         with self._lock:
-            self._db = {
-                "encodings": [],
-                "person_ids": [],
-                "last_seen": {},
-                "schema_version": self.SCHEMA_VERSION,
-            }
+            self._db = self._empty_db()
         self.save()
         logger.info("Database cleared")
 
@@ -325,6 +414,50 @@ class FaceDatabase:
             self.save()
             logger.info(f"Removed {removed} encodings for {person_id!r}")
         return removed
+
+    def rename_person(self, old_id: str, new_id: str) -> int:
+        """Reassign all of ``old_id``'s encodings and saved crops to ``new_id``.
+
+        Merges into ``new_id`` if it already exists. Returns the number of
+        encodings moved; a no-op (0) when the ids match or ``old_id`` is absent.
+        Used when a face that was auto-enrolled as ``pNNN`` is later given a name,
+        so the two never coexist as competing identities.
+        """
+        if old_id == new_id:
+            return 0
+        with self._lock:
+            moved = 0
+            for i, pid in enumerate(self._db["person_ids"]):
+                if pid == old_id:
+                    self._db["person_ids"][i] = new_id
+                    moved += 1
+            if old_id in self._db["last_seen"]:
+                ts = self._db["last_seen"].pop(old_id)
+                self._db["last_seen"][new_id] = max(
+                    self._db["last_seen"].get(new_id, 0.0), ts)
+        if moved:
+            self.save()
+            self._move_face_images(old_id, new_id)
+            logger.info(f"Renamed {old_id!r} -> {new_id!r} ({moved} encodings)")
+        return moved
+
+    def _move_face_images(self, old_id: str, new_id: str):
+        old_dir = os.path.join(self.db_dir, old_id)
+        if not os.path.isdir(old_dir):
+            return
+        new_dir = os.path.join(self.db_dir, new_id)
+        os.makedirs(new_dir, exist_ok=True)
+        for fname in os.listdir(old_dir):
+            src = os.path.join(old_dir, fname)
+            dst = os.path.join(new_dir, fname)
+            if os.path.exists(dst):  # avoid clobbering on merge
+                base, ext = os.path.splitext(fname)
+                dst = os.path.join(new_dir, f"{base}_{old_id}{ext}")
+            os.rename(src, dst)
+        try:
+            os.rmdir(old_dir)
+        except OSError:
+            pass
 
     @property
     def known_person_ids(self) -> set:
@@ -379,6 +512,89 @@ class EmotionDetector:
 
 
 # ---------------------------------------------------------------------------
+# Detection / embedding backends
+# ---------------------------------------------------------------------------
+
+class DlibBackend:
+    """Legacy backend: dlib HOG detector + 128-d encoder via face_recognition.
+
+    Faces are detected on a downscaled frame (``frame_scale``) for speed, then
+    the bboxes are scaled back to full-frame coordinates. Embeddings compare
+    under the Euclidean metric.
+    """
+
+    name = "dlib"
+    metric = "euclidean"
+
+    def __init__(self, frame_scale: float = 0.5):
+        self.frame_scale = frame_scale
+
+    def detect(self, frame):
+        s = self.frame_scale
+        small = cv2.resize(frame, (0, 0), fx=s, fy=s)
+        rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        locations = face_recognition.face_locations(rgb_small)
+        encodings = face_recognition.face_encodings(rgb_small, locations)
+        locations = [
+            (int(t / s), int(r / s), int(b / s), int(l / s))
+            for t, r, b, l in locations
+        ]
+        return locations, encodings
+
+
+class InsightFaceBackend:
+    """InsightFace backend: SCRFD detector + ArcFace 512-d embedder on onnxruntime.
+
+    One ``FaceAnalysis.get(frame)`` pass per frame yields bbox, det_score, 5-point
+    kps, head pose, and an L2-normalized 512-d embedding for every face. The model
+    takes BGR directly (no RGB conversion) and returns bboxes as ``[x1,y1,x2,y2]``,
+    which we map to the tracker's ``(top,right,bottom,left)`` convention.
+    Embeddings are unit-norm, so they compare under the cosine metric.
+
+    The ``buffalo_l`` pack (~300 MB) is downloaded by InsightFace on first use to
+    ``~/.insightface/models``; expect a one-time cold start.
+    """
+
+    name = "insightface"
+    metric = "cosine"
+
+    def __init__(self, det_size=640, det_thresh: float = 0.5, providers=None,
+                 model_name: str = "buffalo_l"):
+        from insightface.app import FaceAnalysis
+
+        if isinstance(det_size, (int, float)):
+            det_size = (int(det_size), int(det_size))
+        else:
+            det_size = (int(det_size[0]), int(det_size[1]))
+        providers = _select_providers(providers)
+        # ctx_id selects the CUDA device; -1 forces CPU. CoreML/CPU ignore it.
+        ctx_id = 0 if "CUDAExecutionProvider" in providers else -1
+        logger.info("InsightFace backend: model=%s providers=%s det_size=%s",
+                    model_name, providers, det_size)
+        self.app = FaceAnalysis(name=model_name, providers=providers)
+        self.app.prepare(ctx_id=ctx_id, det_size=det_size, det_thresh=det_thresh)
+        # Latest per-detection extras (kps/pose/det_score), aligned with the
+        # returned detection order. Stashed for the deferred head-pose engagement
+        # work; not consumed yet.
+        self.last_extras: list = []
+
+    def detect(self, frame):
+        faces = self.app.get(frame)
+        locations, encodings, extras = [], [], []
+        for f in faces:
+            x1, y1, x2, y2 = (int(v) for v in f.bbox)
+            locations.append((y1, x2, y2, x1))  # (top, right, bottom, left)
+            encodings.append(np.asarray(f.normed_embedding, dtype=np.float64))
+            extras.append({
+                "kps": getattr(f, "kps", None),
+                "pose": getattr(f, "pose", None),
+                "det_score": float(getattr(f, "det_score", 0.0)),
+            })
+        self.last_extras = extras
+        return locations, encodings
+
+
+# ---------------------------------------------------------------------------
 # FaceTracker
 # ---------------------------------------------------------------------------
 
@@ -395,8 +611,12 @@ class FaceTracker:
     def __init__(self,
                  db: FaceDatabase,
                  emotion_detector: EmotionDetector,
+                 backend: str = "insightface",
                  frame_scale: float = 0.5,
-                 track_encoding_threshold: float = 0.5,
+                 det_size=640,
+                 det_thresh: float = 0.5,
+                 providers=None,
+                 track_encoding_threshold: Optional[float] = None,
                  track_iou_threshold: float = 0.3,
                  max_missing_seconds: float = 2.0,
                  recognition_confirm_seconds: float = 0.15,
@@ -414,6 +634,35 @@ class FaceTracker:
         self.db = db
         self.emotion_detector = emotion_detector
         self.frame_scale = frame_scale
+
+        # Detection/embedding backend. dlib stays available as a fallback so the
+        # two can be A/B compared by flipping [tracker] backend in config.
+        if backend == "dlib":
+            self._backend = DlibBackend(frame_scale=frame_scale)
+        elif backend == "insightface":
+            self._backend = InsightFaceBackend(
+                det_size=det_size, det_thresh=det_thresh, providers=providers)
+        else:
+            raise ValueError(f"Unknown backend {backend!r} (expected 'insightface' or 'dlib')")
+        self._metric = self._backend.metric
+        # The db's metric must already match the backend: it picks the db file and
+        # schema version at load() time, which ran before this tracker was built.
+        # A mismatch means the wrong db file was loaded -- realign and warn rather
+        # than silently comparing embeddings across metrics.
+        if self.db.metric != self._metric:
+            logger.warning(
+                "FaceDatabase metric %r != backend %r metric %r; realigning. "
+                "Build FaceDatabase with metric=backend_metric(backend) so the "
+                "right db file is loaded.",
+                self.db.metric, self._backend.name, self._metric,
+            )
+            self.db.metric = self._metric
+
+        # Frame-to-frame association threshold. Same identity across adjacent
+        # frames sits very close in either metric; the sensible cutoff differs by
+        # metric, so resolve a default only when the caller did not set one.
+        if track_encoding_threshold is None:
+            track_encoding_threshold = 0.6 if self._metric == "cosine" else 0.5
         self._track_enc_thresh = track_encoding_threshold
         self._track_iou_thresh = track_iou_threshold
         self._max_missing_s = max_missing_seconds
@@ -429,6 +678,11 @@ class FaceTracker:
 
         self._tracks: list[TrackedFace] = []
         self._identities: dict[int, Identity] = {}
+        # Track ids that have already been enrolled or named, so they are never
+        # auto-enrolled a second time. A track keeps its physical identity; if
+        # recognition briefly drops (revoking the Identity), we must re-recognize
+        # it -- not mint a competing new pNNN, which causes id flip-flop.
+        self._enrolled_track_ids: set[int] = set()
         self._last_frames: dict[int, np.ndarray] = {}
         self._next_id = 1
         self._lock = threading.Lock()
@@ -559,6 +813,7 @@ class FaceTracker:
                 ident = self._identities.pop(track.track_id, None)
                 self._emotion_stable.pop(track.track_id, None)
                 self._last_frames.pop(track.track_id, None)
+                self._enrolled_track_ids.discard(track.track_id)
                 pending.append(self._make_event(
                     FaceEventType.FACE_DISAPPEARED, track.track_id,
                     FaceDisappearedPayload(
@@ -676,8 +931,25 @@ class FaceTracker:
         face = self.get_face_by_id(track_id)
         if face is None:
             return False
+        # If this track is already bound to another id (typically an auto-enrolled
+        # pNNN), rename that id to the new label rather than adding a second,
+        # competing identity for the same face -- otherwise recognition keeps
+        # flip-flopping between the two ids frame to frame.
+        with self._lock:
+            existing = self._identities.get(track_id)
+            old_pid = existing.person_id if existing else None
+        if old_pid and old_pid != person_id:
+            self.db.rename_person(old_pid, person_id)
+            with self._lock:
+                # Repoint any in-memory identities that referenced the old id.
+                for ident in self._identities.values():
+                    if ident.person_id == old_pid:
+                        ident.person_id = person_id
+                    if ident._candidate_person_id == old_pid:
+                        ident._candidate_person_id = person_id
         self.db.add_face(person_id, face.last_encoding, frame, face.bbox)
         with self._lock:
+            self._enrolled_track_ids.add(track_id)
             self._identities[track_id] = Identity(
                 person_id=person_id, confidence=100.0,
                 _matching_since=0.0, _confirmed=True,
@@ -707,6 +979,10 @@ class FaceTracker:
         for track in self._tracks:
             if track.track_id in self._identities:
                 continue
+            # Already enrolled/named once: never mint a competing id, even if its
+            # identity was just revoked by a momentary recognition miss.
+            if track.track_id in self._enrolled_track_ids:
+                continue
             if not track.is_visible:
                 continue
             if track.frames_visible < self._enroll_min_frames:
@@ -719,6 +995,7 @@ class FaceTracker:
             person_id = self._allocate_person_id()
             # Enroll the clean raw encoding, not the EMA-smoothed tracking one.
             self.db.add_face(person_id, track.last_encoding, frame, track.bbox)
+            self._enrolled_track_ids.add(track.track_id)
             self._identities[track.track_id] = Identity(
                 person_id=person_id, confidence=100.0,
                 _matching_since=0.0, _confirmed=True,
@@ -920,16 +1197,7 @@ class FaceTracker:
         return events
 
     def _detect_faces(self, frame):
-        small = cv2.resize(frame, (0, 0), fx=self.frame_scale, fy=self.frame_scale)
-        rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(rgb_small)
-        encodings = face_recognition.face_encodings(rgb_small, locations)
-        s = self.frame_scale
-        locations = [
-            (int(t / s), int(r / s), int(b / s), int(l / s))
-            for t, r, b, l in locations
-        ]
-        return locations, encodings
+        return self._backend.detect(frame)
 
     def _match(self, detections):
         if not detections or not self._tracks:
@@ -940,7 +1208,7 @@ class FaceTracker:
         costs = np.zeros((n_det, n_trk))
         for i, (bbox_d, enc_d) in enumerate(detections):
             for j, track in enumerate(self._tracks):
-                costs[i, j] = np.linalg.norm(enc_d - track.encoding)
+                costs[i, j] = _pair_distance(enc_d, track.encoding, self._metric)
 
         matches = []
         used_dets = set()
@@ -986,6 +1254,12 @@ class FaceTracker:
         now = time.time()
         track.last_encoding = encoding
         track.encoding = 0.3 * encoding + 0.7 * track.encoding
+        if self._metric == "cosine":
+            # The EMA blend of two unit vectors is no longer unit-norm; cosine
+            # distance assumes unit vectors, so re-normalize.
+            norm = np.linalg.norm(track.encoding)
+            if norm > 0:
+                track.encoding = track.encoding / norm
         track.bbox = bbox
         track.last_seen = now
         track.frames_visible += 1
@@ -1189,8 +1463,14 @@ def main():
     parser = argparse.ArgumentParser(description="Standalone face tracker")
     parser.add_argument("--db-dir", default="known_faces", help="Face database directory")
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
+    parser.add_argument("--backend", choices=["insightface", "dlib"], default=None,
+                        help="Detection/embedding backend (overrides face_config.toml)")
+    parser.add_argument("--det-size", type=int, default=None,
+                        help="InsightFace detector input size (square)")
+    parser.add_argument("--det-thresh", type=float, default=None,
+                        help="InsightFace minimum detector confidence")
     parser.add_argument("--scale", type=float, default=None,
-                        help="Detection scale factor (overrides face_config.toml)")
+                        help="dlib backend detection scale factor (overrides face_config.toml)")
     parser.add_argument("--fps", type=int, default=0, help="Max FPS (0 = unlimited)")
     parser.add_argument("--no-emotion", action="store_true", help="Disable emotion detection")
     parser.add_argument("--no-log-window", action="store_true", help="Disable log window")
@@ -1213,14 +1493,31 @@ def main():
             msg = f"{p.old_track_id} -> {p.new_track_id} ({p.new_person_id or '?'})"
         elif event.type == FaceEventType.IDENTITY_CONFIRMED:
             msg = f"track={event.track_id} -> {p.person_id} ({p.confidence:.0f}%)"
+        elif event.type == FaceEventType.IDENTITY_CHANGED:
+            msg = f"track={event.track_id} {p.old_person_id} -> {p.new_person_id} ({p.new_confidence:.0f}%)"
+        elif event.type == FaceEventType.IDENTITY_LOST:
+            msg = f"track={event.track_id} lost {p.previous_person_id}"
+        elif event.type == FaceEventType.FACE_LEARNED:
+            msg = f"track={event.track_id} learned as {p.person_id}"
+        elif event.type == FaceEventType.FACE_ENROLLED:
+            msg = f"track={event.track_id} enrolled as {p.person_id}"
+        elif event.type == FaceEventType.FACE_OCCLUDED:
+            msg = f"track={event.track_id} id={p.person_id or '?'}"
+        elif event.type == FaceEventType.FACE_RECOVERED:
+            msg = f"track={event.track_id} id={p.person_id or '?'} missing={p.seconds_missing:.1f}s"
         elif event.type == FaceEventType.EMOTION_CHANGED:
             msg = f"track={event.track_id} {p.old_emotion}->{p.new_emotion}"
         else:
             msg = str(p)[:60]
         log_lines.append((ts, event.type.name, msg))
 
-    from face_config import build_db_kwargs, build_tracker_kwargs
-    face_db = FaceDatabase(db_dir=args.db_dir, **build_db_kwargs())
+    from face_config import build_db_kwargs, build_tracker_kwargs, backend_metric
+    db_kwargs = build_db_kwargs()
+    if args.backend is not None:
+        # Keep the db's metric/file in step with a CLI backend override so
+        # load() opens the matching db (it runs before the tracker is built).
+        db_kwargs["metric"] = backend_metric(args.backend)
+    face_db = FaceDatabase(db_dir=args.db_dir, **db_kwargs)
     face_db.load()
 
     emotion_detector = None
@@ -1228,8 +1525,14 @@ def main():
         emotion_detector = EmotionDetector()
 
     tracker_kwargs = build_tracker_kwargs()
-    if args.scale is not None:
-        tracker_kwargs["frame_scale"] = args.scale
+    for cli_val, kw in (
+        (args.backend, "backend"),
+        (args.det_size, "det_size"),
+        (args.det_thresh, "det_thresh"),
+        (args.scale, "frame_scale"),
+    ):
+        if cli_val is not None:
+            tracker_kwargs[kw] = cli_val
     tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector,
                           **tracker_kwargs)
     tracker.subscribe(on_event_display)

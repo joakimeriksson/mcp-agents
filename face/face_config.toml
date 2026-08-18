@@ -4,15 +4,34 @@
 # Any value left out here falls back to the constructor default in
 # face_tracker.py. CLI flags (where provided) override these.
 
-# --- Detection ---
-# Fraction the frame is downscaled before detection. Higher = more pixels
-# reach the encoder (better on small/distant faces) at higher CPU cost.
+# --- Detection / embedding backend ---
+# "insightface" = SCRFD detector + ArcFace 512-d embedder on onnxruntime
+# (cosine metric, far better at distance/angle). "dlib" = legacy HOG + 128-d
+# encoder (Euclidean metric). The two embedding spaces are incompatible; the
+# face db (faces.pkl, schema v3 = InsightFace) is tied to the backend, so
+# switching to "dlib" needs a matching v2 db. Kept as a fallback / A-B switch.
+backend = "insightface"
+
+# InsightFace detector input size (square). Larger = better on small/distant
+# faces, slower. 640 is the model default. (Ignored by the dlib backend.)
+det_size = 640
+# Minimum detector confidence to keep a face.
+det_thresh = 0.5
+# Onnxruntime execution providers, best-available first. Leave unset to
+# auto-pick CUDA -> CoreML -> CPU. Set explicitly to pin, e.g.
+# providers = ["CPUExecutionProvider"]. Always filtered to what's installed.
+# providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+# Fraction the frame is downscaled before detection. dlib backend only;
+# InsightFace uses det_size instead.
 frame_scale = 0.75
 
 # --- Recognition (Group 1: fewer confusions / misses) ---
 # Max embedding distance to accept a match. Lower = stricter (fewer
-# confusions), higher = looser (fewer misses). dlib's loose default is 0.6.
-recognition_tolerance = 0.5
+# confusions), higher = looser (fewer misses). This is a COSINE distance for
+# the InsightFace backend (typical match < ~0.4); the dlib backend wants a
+# Euclidean value instead (~0.5). Tune empirically against the real room.
+recognition_tolerance = 0.4
 # Score each candidate person by the mean of their k nearest stored samples
 # instead of a single nearest encoding. k=1 = old behaviour.
 recognition_k = 3

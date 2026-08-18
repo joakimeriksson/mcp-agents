@@ -15,6 +15,14 @@ dependencies = [
     "opencv-python>=4.13.0,<5",
     "piper-tts",
     "faster-whisper",
+    # InsightFace (SCRFD + ArcFace) is the default face backend. It pulls the
+    # buffalo_l model pack (~300 MB) to ~/.insightface/models on first run --
+    # that download is fetched at runtime and is not covered by uv.lock hashes.
+    "insightface>=1.0.1,<2",
+    # CPU/CoreML onnxruntime. For CUDA on the Nvidia laptop, install
+    # onnxruntime-gpu INSTEAD of this (the two wheels conflict); the provider
+    # selector falls back to CPU/CoreML if CUDA is absent, so this default is
+    # safe on every machine.
     "onnxruntime>=1.23.2,<2",
     "torch",
     "torchaudio",
@@ -23,9 +31,6 @@ dependencies = [
     "livekit>=1.1.5,<2",
 ]
 
-[project.scripts]
-face-tracker = "face_tracker:main"
-
 # Run scripts with: uv run python <script>.py
 # e.g. uv run python agent.py --shell
-# Standalone tracker: uv run face-tracker
+# Standalone tracker: uv run python face_tracker.py

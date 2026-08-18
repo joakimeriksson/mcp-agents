@@ -33,7 +33,11 @@ from events import EventDispatcher
 logger = logging.getLogger("voice_input")
 
 # Default constants
-STT_BACKEND = "gemma4"        # "gemma4" (native audio) or "whisper"
+STT_BACKEND = "gemma4"        # "gemma4" (native audio), "whisper", or "raw"
+
+# Marker emitted instead of a transcription by the "raw" backend: the audio is
+# kept on VoiceInput.last_audio for a direct-audio consumer (see direct_llm.py).
+RAW_AUDIO_TEXT = "<<raw-audio>>"
 GEMMA_MODEL = "gemma4:latest"   # audio-capable variant; gemma4:26b is text-only
 GEMMA_HOST = "http://localhost:11434"
 SAMPLE_RATE = 16000
@@ -511,6 +515,7 @@ class VoiceInput:
         self._save_dir: str = "recordings"
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
+        self.last_audio: Optional[np.ndarray] = None  # last captured utterance
 
         self._dispatcher = EventDispatcher(owner="voice_input")
 
@@ -557,7 +562,9 @@ class VoiceInput:
         self._load_models()
 
     def _load_models(self):
-        if self._stt_backend == "gemma4":
+        if self._stt_backend == "raw":
+            self._load_raw()
+        elif self._stt_backend == "gemma4":
             self._load_gemma4()
         else:
             self._load_whisper()
@@ -591,6 +598,23 @@ class VoiceInput:
             self._load_error = (
                 f"Failed to init Gemma 4 STT {self._gemma_model!r} "
                 f"at {self._gemma_host}: {e}")
+
+    def _load_raw(self):
+        """No STT: VAD only. Every utterance 'transcribes' to RAW_AUDIO_TEXT
+        instantly and the waveform stays on ``self.last_audio`` — for the
+        direct-audio path where the conversation model hears the audio itself."""
+        from gemma_stt import Segment, TranscriptionInfo
+
+        class _RawPassthrough:
+            def transcribe(self, audio, beam_size=None):
+                duration = len(audio) / SAMPLE_RATE if len(audio) else 0.0
+                return ([Segment(text=RAW_AUDIO_TEXT, start=0.0, end=duration)],
+                        TranscriptionInfo(language="", language_probability=0.0))
+
+        self._transcriber = _RawPassthrough()
+        self._load_error = None
+        self._emit(VoiceEventType.MODEL_READY, ModelReadyPayload("raw", "vad-only"))
+        logger.info("Raw-audio mode: VAD only, no STT on the critical path.")
 
     def _load_whisper(self):
         self._emit(VoiceEventType.MODEL_LOADING, ModelLoadingPayload("whisper"))
@@ -812,6 +836,7 @@ class VoiceInput:
             except Exception as e:
                 logger.warning(f"Noise reduction failed: {e}")
 
+        self.last_audio = audio  # kept for direct-audio consumers (raw backend)
         self._emit(VoiceEventType.TRANSCRIPTION_STARTED,
                    TranscriptionStartedPayload(audio_duration_ms, noise_reduced))
 
@@ -864,6 +889,7 @@ class VoiceInput:
             except Exception as e:
                 logger.warning(f"Noise reduction failed: {e}")
 
+        self.last_audio = audio  # kept for direct-audio consumers (raw backend)
         self._emit(VoiceEventType.TRANSCRIPTION_STARTED,
                    TranscriptionStartedPayload(audio_duration_ms, noise_reduced))
 

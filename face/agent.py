@@ -146,12 +146,16 @@ class Agent:
                  min_frames_before_ask: int = 3,
                  auto_ask: bool = True,
                  auto_greet: bool = True,
-                 speak_mode: SpeakMode = SpeakMode.SIMPLE):
+                 speak_mode: SpeakMode = SpeakMode.SIMPLE,
+                 direct_llm=None):
         self.tracker = tracker
         self.voice_in = voice_input
         self.voice_out = voice_output
         self.memory = memory
         self.llm = llm
+        # Direct-audio mode (see direct_llm.py): speech goes straight into the
+        # multimodal LLM; voice_input must run the "raw" backend.
+        self.direct_llm = direct_llm
 
         self._greeting_cooldown = greeting_cooldown_s
         self._ask_cooldown = ask_name_cooldown_s
@@ -582,6 +586,11 @@ class Agent:
         if self._busy or not text:
             return
 
+        from voice_input import RAW_AUDIO_TEXT
+        if self.direct_llm and text == RAW_AUDIO_TEXT:
+            self._on_heard_audio()
+            return
+
         with self._busy_lock:
             if self._busy:
                 return
@@ -631,6 +640,72 @@ class Agent:
                 threading.Thread(target=self._extract_facts,
                                  args=(tid, text),
                                  daemon=True).start()
+
+        finally:
+            self._clear_busy()
+            self.state = "LISTENING"
+            self.resume_listening()
+
+    def _on_heard_audio(self):
+        """Direct-audio turn: the raw utterance goes straight into the
+        multimodal LLM (no STT on the critical path). Memory still gets a
+        transcript — produced in the background after the reply."""
+        audio = self.voice_in.last_audio
+        if audio is None or not len(audio):
+            return
+
+        with self._busy_lock:
+            if self._busy:
+                return
+            self._set_busy("heard_audio")
+
+        try:
+            self.pause_listening()
+
+            primary = self.tracker.get_primary_face()
+            tid = primary.track_id if primary else None
+            person = self.memory.get(tid) if tid else None
+            name = person.name if person else None
+            context = (self.memory.get_context_for_llm(tid, max_dialogues=5)
+                       if tid else "Unknown person.")
+            lang_hint = self.voice_in.detected_language or "en"
+
+            self.state = "THINKING"
+            response, lang = self.direct_llm.respond(
+                audio, context=context, language_hint=lang_hint)
+            # Keep downstream consumers (goodbyes, next hint) consistent
+            self.voice_in.detected_language = lang
+
+            self._emit(AgentEventType.RESPONDING, RespondingPayload(
+                track_id=tid, name=name, heard="[audio]",
+                response=response, language=lang,
+            ))
+
+            if tid:
+                self.memory.add_dialogue(tid, "system", response, language=lang)
+            self.state = "TALKING"
+            self.speak(response, language=lang)
+
+            # Off the critical path: transcribe for memory, then reuse the
+            # normal name-learning and fact-extraction flows on the text.
+            def _memorize(audio=audio, tid=tid, person=person, lang=lang):
+                try:
+                    segments, info = self.direct_llm.transcriber.transcribe(audio)
+                    text = "".join(s.text for s in segments).strip()
+                except Exception as e:
+                    logger.warning(f"background transcription failed: {e}")
+                    return
+                if not text:
+                    return
+                logger.info(f"[direct] background transcript: {text}")
+                if tid:
+                    self.memory.add_dialogue(tid, "person", text,
+                                             language=info.language or lang)
+                    if person and not person.is_identified:
+                        self._try_learn_name(tid, text)
+                    if person:
+                        self._extract_facts(tid, text)
+            threading.Thread(target=_memorize, daemon=True).start()
 
         finally:
             self._clear_busy()
@@ -860,6 +935,11 @@ def main():
                              "Default is canned templates — instant.")
     parser.add_argument("--shell", action="store_true",
                         help="Start an interactive debug shell alongside the agent")
+    parser.add_argument("--direct-audio", action="store_true",
+                        help="Experimental: send captured speech straight into the "
+                             "multimodal LLM (one call: hear+think+tools) instead of "
+                             "STT->text->LLM. Needs an audio-capable model (gemma4). "
+                             "Memory transcripts are produced in the background.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -874,7 +954,7 @@ def main():
     tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector,
                           **build_tracker_kwargs())
 
-    voice_in = VoiceInput()
+    voice_in = VoiceInput(stt_backend="raw" if args.direct_audio else "gemma4")
     voice_out = VoiceOutput(model_name=args.en_voice)
     print("Loading speech models...")
     voice_in.load_sync()
@@ -930,6 +1010,22 @@ def main():
         sys.exit(1)
     logger.info(f"LLM: {args.llm_model} via {args.ollama_url}")
 
+    direct_llm = None
+    if args.direct_audio:
+        from direct_llm import DirectAudioLLM
+        ollama_host = args.ollama_url.replace("/v1", "").rstrip("/")
+        direct_llm = DirectAudioLLM(
+            model=args.llm_model,
+            host=ollama_host,
+            agent_name=agent_name,
+            service_prompt=service_prompt,
+            augmentation_provider=service.fetch_augmentation if service else None,
+            tools_url=args.service_server,
+        )
+        direct_llm.transcriber.check()  # fail fast if the model can't hear
+        logger.info("Direct-audio mode: speech goes straight into "
+                    f"{args.llm_model} (background transcripts for memory)")
+
     monitor = AudioMonitor()
     monitor.start()
 
@@ -942,6 +1038,7 @@ def main():
         audio_monitor=monitor,
         auto_ask=not args.no_auto_ask,
         auto_greet=not args.no_auto_greet,
+        direct_llm=direct_llm,
     )
 
     # Log agent events

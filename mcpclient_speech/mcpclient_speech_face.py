@@ -579,7 +579,7 @@ async def main(args):
                  'listen':    ((0, 0.6, 0.8), "Listening", ""),
                  'greet':     ((0.9, 0.5, 0), "Contact", "Please wait"),
                  'process':   ((0.9, 0.5, 0), "Processing", "Please wait"),
-                 'talk':      ((0.95, 0.75, 0), "~~~", ""),
+                 'talk':      ((0.95, 0.75, 0), "Speaking", ""),
                  'muted':     ((0.4, 0.4, 0.4), "MUTED", "Press 'm' to unmute"),
                  }
         if has_name:

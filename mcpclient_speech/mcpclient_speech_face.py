@@ -168,6 +168,10 @@ def parse_args():
     tune.add_argument('--engage-dwell-seconds', type=float, default=None,
                       help='Seconds the focused face must face the camera before FACE_ENGAGED')
 
+    parser.add_argument('--debug-audio', action='store_true', default=None,
+                        help='Show the audio debug panel (VU meters + oscilloscope) '
+                             'in the eye window (default from config [debug] audio_panel)')
+
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument('--log-file', default=None, help='Log every interaction event to this JSONL file (overwrites on each run)')
     log_group.add_argument('--log-dir', default=None, help='Log every interaction event to a new timestamped JSONL file in this directory')
@@ -587,7 +591,7 @@ async def main(args):
             name = tmp[0].text
         else:
             name = "MCP Speech Client"
-        win = EyeWindow(name, sdict, 'ready')
+        win = EyeWindow(name, sdict, 'ready', debug=args.debug_audio)
         win.set_exit_callback(on_exit, state)
         win.keydict["m"] = (kp_toggle_mute, None)
         win.keydict[" "] = (kp_force_process, None)
@@ -642,9 +646,10 @@ async def main(args):
 
         # Debug panel in the eye window: VU meters (mic level, VAD
         # probability, silence countdown) + in/out oscilloscope
-        audio_monitor = AudioMonitor(device=args.mic)
-        audio_monitor.start()
-        win.set_audio_sources(audio_monitor, voice_in, voice_out)
+        if args.debug_audio:
+            audio_monitor = AudioMonitor(device=args.mic)
+            audio_monitor.start()
+            win.set_audio_sources(audio_monitor, voice_in, voice_out)
 
         ### Initialize the face_tracker here, with on_face_change as callback
         # Tuning comes from face/face_config.toml [tracker]; CLI flags override.
@@ -1064,6 +1069,8 @@ def run():
         args.mic = cfg["devices"].get("microphone")
 
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
+    if args.debug_audio is None:
+        args.debug_audio = cfg["debug"].get("audio_panel", False)
 
     # Resolve camera index (auto-detect if still None after config)
     if args.camera is None:

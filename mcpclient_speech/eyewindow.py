@@ -100,37 +100,60 @@ class VUMeter:
 
 
 class EyeWindow:
-    def __init__(self, name, sdict, istate):
-        self.width = 900
+    def __init__(self, name, sdict, istate, debug=False):
+        # With the debug audio panel on, a strip on the left is reserved for
+        # the VU meters and oscilloscope: the window grows wider and the eye
+        # shifts right so nothing overlaps the circle.
+        self.debug = debug
+        self.width = 1080 if debug else 900
         self.height = 800
         self.statedict = sdict
         self.win = WindowMgr(name, self.width, self.height, 1, 1)
         self.bg = gray(0.5)
-        self.eye = ColorEye(self.win.fig, (0.1, 0.05, 0.8, 0.8), self.bg)
-        self.txt0 = CCText(self.win.fig, (0.5, 0.9), name, 1.0/20)
-        self.txt1 = CCText(self.win.fig, (0.5, 0.45), "", 1.0/20)
-        self.txt2 = CCText(self.win.fig, (0.5, 0.38), "", 1.0/40)
-        self.txt_indicator = CCText(self.win.fig, (0.05, 0.95), "", 1.0/40)
+        eye_rect = (0.24, 0.05, 0.72, 0.8) if debug else (0.1, 0.05, 0.8, 0.8)
+        cx = eye_rect[0] + eye_rect[2] / 2   # eye center x, for the texts
+        self.eye = ColorEye(self.win.fig, eye_rect, self.bg)
+        self.txt0 = CCText(self.win.fig, (cx, 0.9), name, 1.0/20)
+        self.txt1 = CCText(self.win.fig, (cx, 0.45), "", 1.0/20)
+        self.txt2 = CCText(self.win.fig, (cx, 0.38), "", 1.0/40)
+        self.txt_indicator = CCText(self.win.fig,
+                                    (0.30, 0.95) if debug else (0.05, 0.95),
+                                    "", 1.0/40)
         self.camwin = None
-        # VU meters on the left edge: mic level (with peak + dB) and VAD
-        # probability (with threshold tick). Fed via set_audio_sources().
-        self.vu_mic = VUMeter(self.win.fig, (0.025, 0.18, 0.030, 0.55),
+        self._audio_monitor = None
+        self._voice_input = None
+        self._voice_output = None
+        if debug:
+            self._make_debug_panel()
+        self.win.set_background(self.bg)
+        self.win.register_target(
+            (0.28, 0.1, 0.64, 0.7) if debug else (0.15, 0.1, 0.7, 0.7), self)
+        self.win.add_resize_callback(self.resize)
+        self.win.add_close_callback(self.exit_event)
+        self.set_state(istate)
+        self.func1 = None
+        self.func2 = None
+        self.obj = None
+        self.keydict = {}
+
+    def _make_debug_panel(self):
+        """Left-strip debug widgets: MIC/VAD/SIL meters + in/out scope."""
+        # VU meters: mic level (peak + dB), VAD probability (threshold tick),
+        # end-of-utterance silence countdown. Fed via set_audio_sources().
+        self.vu_mic = VUMeter(self.win.fig, (0.030, 0.16, 0.040, 0.56),
                               "MIC", self.bg)
-        self.vu_vad = VUMeter(self.win.fig, (0.070, 0.18, 0.030, 0.55),
+        self.vu_vad = VUMeter(self.win.fig, (0.085, 0.16, 0.040, 0.56),
                               "VAD", self.bg)
-        # End-of-utterance countdown: fills while you are silent; at the top
-        # the robot stops listening and starts processing. Blips pause it.
-        self.vu_sil = VUMeter(self.win.fig, (0.115, 0.18, 0.030, 0.55),
+        self.vu_sil = VUMeter(self.win.fig, (0.140, 0.16, 0.040, 0.56),
                               "SIL", self.bg)
-        # Oscilloscope (top-left, mirroring the camera thumbnail): last ~1s
-        # of mic input (cyan) and TTS output (yellow), each normalized to
-        # its own recent peak.
-        self.scope_ax = self.win.fig.add_axes((0.02, 0.80, 0.22, 0.18),
+        # Oscilloscope: last ~1s of mic input (cyan) and TTS output
+        # (yellow), each normalized to its own recent peak.
+        self.scope_ax = self.win.fig.add_axes((0.025, 0.78, 0.19, 0.19),
                                               xticks=[], yticks=[])
         self.scope_ax.set_facecolor(gray(0.15))
-        for s in self.scope_ax.spines.values():
-            s.set_color(gray(0.3))
-            s.set_linewidth(0.8)
+        for sp in self.scope_ax.spines.values():
+            sp.set_color(gray(0.3))
+            sp.set_linewidth(0.8)
         self._scope_n = 400
         self.scope_ax.set_xlim(0, self._scope_n - 1)
         self.scope_ax.set_ylim(-1.05, 1.05)
@@ -145,19 +168,7 @@ class EyeWindow:
                            fontsize=7, transform=self.scope_ax.transAxes)
         self.scope_ax.text(0.10, 0.03, "out", color=(0.95, 0.78, 0.15),
                            fontsize=7, transform=self.scope_ax.transAxes)
-        self._audio_monitor = None
-        self._voice_input = None
-        self._voice_output = None
         self._scope_last_t = time.time()
-        self.win.set_background(self.bg)
-        self.win.register_target((0.15, 0.1, 0.7, 0.7), self)
-        self.win.add_resize_callback(self.resize)
-        self.win.add_close_callback(self.exit_event)
-        self.set_state(istate)
-        self.func1 = None
-        self.func2 = None
-        self.obj = None
-        self.keydict = {}
 
     def set_button_callbacks(self, func1, func2, obj):
         self.func1 = func1
@@ -227,17 +238,25 @@ class EyeWindow:
         if voice_input is not None:
             self.vu_vad.set_threshold(voice_input.vad_threshold)
 
+    # Fixed scope gains: constant scale, no per-frame auto-normalization
+    # (that made quiet noise look huge and the scale jump around). The mic
+    # signal is inherently small (speech RMS ~0.05-0.3) so it gets a fixed
+    # boost; TTS output is near full-scale already. Clipped at the frame.
+    SCOPE_GAIN_IN = 5.0
+    SCOPE_GAIN_OUT = 1.0
+
     @staticmethod
-    def _scope_trace(waveform, npoints):
-        """Downsample a waveform to npoints and normalize to its own peak."""
+    def _scope_trace(waveform, npoints, gain=1.0):
+        """Downsample a waveform to npoints at a fixed gain (clipped)."""
         step = max(1, len(waveform) // npoints)
         y = waveform[::step][:npoints]
         if len(y) < npoints:
             y = np.pad(y, (npoints - len(y), 0))
-        peak = float(np.max(np.abs(y)))
-        return y / peak if peak > 0.02 else y
+        return np.clip(y * gain, -1.0, 1.0)
 
     def _update_meters(self):
+        if not self.debug:
+            return
         m = self._audio_monitor
         if m is not None:
             ref = max(m.max_seen, 0.001)
@@ -264,7 +283,9 @@ class EyeWindow:
                                text=f"{remaining:.1f}" if sp > 0 else "")
         m = self._audio_monitor
         if m is not None and hasattr(m, "waveform"):
-            self.scope_in.set_ydata(self._scope_trace(m.waveform, self._scope_n))
+            self.scope_in.set_ydata(
+                self._scope_trace(m.waveform, self._scope_n,
+                                  self.SCOPE_GAIN_IN))
         vo = self._voice_output
         now = time.time()
         dt, self._scope_last_t = now - self._scope_last_t, now
@@ -278,7 +299,8 @@ class EyeWindow:
                     vo.out_waveform = np.roll(vo.out_waveform, -n)
                     vo.out_waveform[-n:] = 0.0
             self.scope_out.set_ydata(
-                self._scope_trace(vo.out_waveform, self._scope_n))
+                self._scope_trace(vo.out_waveform, self._scope_n,
+                                  self.SCOPE_GAIN_OUT))
 
     def check_events(self):
         if self.camwin is not None:

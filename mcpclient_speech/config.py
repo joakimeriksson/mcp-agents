@@ -15,6 +15,11 @@ _DEFAULTS: dict = {
         "microphone": None,
         "camera": None,
     },
+    "debug": {
+        # Audio debug panel in the eye window: VU meters (mic/VAD/silence
+        # countdown) + in/out oscilloscope. Widens the window slightly.
+        "audio_panel": False,
+    },
 }
 
 

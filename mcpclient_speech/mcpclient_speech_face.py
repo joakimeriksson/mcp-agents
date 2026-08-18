@@ -27,7 +27,10 @@ if _FACE_DIR not in sys.path:
 
 from readnb import *
 from eyewindow import *
-from voice_input import VoiceInput, ContinuousListener, VoiceEventType, list_input_devices
+from voice_input import (
+    VoiceInput, ContinuousListener, VoiceEventType, AudioMonitor,
+    list_input_devices,
+)
 from voice_output import VoiceOutput
 from face_tracker import (
     FaceTracker, FaceDatabase, FaceEventType,
@@ -628,6 +631,11 @@ async def main(args):
         listener.start()
         listener.paused = True
         print('Continuous listener started')
+
+        # VU meters in the eye window: mic level + VAD probability
+        audio_monitor = AudioMonitor()
+        audio_monitor.start()
+        win.set_audio_sources(audio_monitor, voice_in)
 
         ### Initialize voice_output (piper TTS)
         voice_out = VoiceOutput()

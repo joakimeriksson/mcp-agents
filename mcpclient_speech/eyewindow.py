@@ -53,6 +53,51 @@ class ColorEye(CCWidget):
         #self.txt.set_fontsize(self.size/7*self.get_pixpt())
 
 
+class VUMeter:
+    """Vertical level bar: colored fill, optional peak line and threshold
+    tick, a label below and a small value text above. Same information as
+    the face UI's draw_audio_meter, in matplotlib form."""
+
+    def __init__(self, fig, rect, label, bg):
+        self.ax = fig.add_axes(rect, xticks=[], yticks=[])
+        self.ax.set_xlim(0, 1)
+        self.ax.set_ylim(0, 1)
+        self.ax.set_facecolor(gray(0.42))
+        for s in self.ax.spines.values():
+            s.set_color(gray(0.3))
+            s.set_linewidth(0.8)
+        self.fill = mpl.patches.Rectangle((0.1, 0), 0.8, 0.0, linewidth=0,
+                                          facecolor=(0.1, 0.8, 0.1))
+        self.ax.add_patch(self.fill)
+        self.peak = self.ax.plot([0.1, 0.9], [0, 0], color="white",
+                                 linewidth=1.2)[0]
+        self.peak.set_visible(False)
+        self.thresh = self.ax.plot([0, 1], [0, 0], color=gray(0.15),
+                                   linewidth=0.8, linestyle=":")[0]
+        self.thresh.set_visible(False)
+        self.label = self.ax.text(0.5, -0.03, label, ha="center", va="top",
+                                  fontsize=8, color=gray(0.25),
+                                  transform=self.ax.transAxes)
+        self.value = self.ax.text(0.5, 1.02, "", ha="center", va="bottom",
+                                  fontsize=7, color=gray(0.25),
+                                  transform=self.ax.transAxes)
+
+    def set_threshold(self, level):
+        self.thresh.set_ydata([level, level])
+        self.thresh.set_visible(True)
+
+    def update(self, level, color, peak=None, text=None):
+        self.fill.set_height(max(0.0, min(1.0, level)))
+        self.fill.set_facecolor(color)
+        if peak is not None and peak > 0.02:
+            self.peak.set_ydata([peak, peak])
+            self.peak.set_visible(True)
+        else:
+            self.peak.set_visible(False)
+        if text is not None:
+            self.value.set_text(text)
+
+
 class EyeWindow:
     def __init__(self, name, sdict, istate):
         self.width = 900
@@ -66,6 +111,14 @@ class EyeWindow:
         self.txt2 = CCText(self.win.fig, (0.5, 0.38), "", 1.0/40)
         self.txt_indicator = CCText(self.win.fig, (0.05, 0.95), "", 1.0/40)
         self.camwin = None
+        # VU meters on the left edge: mic level (with peak + dB) and VAD
+        # probability (with threshold tick). Fed via set_audio_sources().
+        self.vu_mic = VUMeter(self.win.fig, (0.025, 0.18, 0.030, 0.55),
+                              "MIC", self.bg)
+        self.vu_vad = VUMeter(self.win.fig, (0.070, 0.18, 0.030, 0.55),
+                              "VAD", self.bg)
+        self._audio_monitor = None
+        self._voice_input = None
         self.win.set_background(self.bg)
         self.win.register_target((0.15, 0.1, 0.7, 0.7), self)
         self.win.add_resize_callback(self.resize)
@@ -132,9 +185,39 @@ class EyeWindow:
         if self.func2:
             self.func2(event, self.obj)
 
+    def set_audio_sources(self, audio_monitor=None, voice_input=None):
+        """Attach the level sources for the VU meters: an AudioMonitor
+        (rms/peak) and/or a VoiceInput (vad_prob/vad_threshold)."""
+        self._audio_monitor = audio_monitor
+        self._voice_input = voice_input
+        if voice_input is not None:
+            self.vu_vad.set_threshold(voice_input.vad_threshold)
+
+    def _update_meters(self):
+        m = self._audio_monitor
+        if m is not None:
+            ref = max(m.max_seen, 0.001)
+            level = min(1.0, m.rms / ref)
+            peak = min(1.0, m.peak / ref)
+            if level > 0.85:
+                color = (0.9, 0.15, 0.15)
+            elif level > 0.6:
+                color = (0.9, 0.8, 0.1)
+            else:
+                color = (0.1, 0.8, 0.1)
+            db = 20 * np.log10(m.rms + 1e-10)
+            self.vu_mic.update(level, color, peak=peak, text=f"{db:.0f}")
+        v = self._voice_input
+        if v is not None:
+            p = v.vad_prob
+            active = p >= v.vad_threshold
+            color = (0.1, 0.75, 0.9) if active else (0.7, 0.45, 0.1)
+            self.vu_vad.update(p, color)
+
     def check_events(self):
         if self.camwin is not None:
             self.camwin.check_events()
+        self._update_meters()
         self.win.fig.canvas.flush_events()
 
 

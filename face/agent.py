@@ -861,13 +861,12 @@ def main():
                         datefmt="%H:%M:%S")
 
     # Initialize all components
-    face_db = FaceDatabase(db_dir=args.db_dir)
+    from face_config import build_db_kwargs, build_tracker_kwargs
+    face_db = FaceDatabase(db_dir=args.db_dir, **build_db_kwargs())
     face_db.load()
     emotion_detector = EmotionDetector()
-    from face_config import get_tracker_config
-    _tc = get_tracker_config()
     tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector,
-                          max_missing_seconds=_tc.get("max_missing_seconds", 3.0))
+                          **build_tracker_kwargs())
 
     voice_in = VoiceInput()
     voice_out = VoiceOutput(model_name=args.en_voice)

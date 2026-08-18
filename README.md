@@ -11,8 +11,8 @@ that calls the robot's MCP tools.
 ### Prerequisites
 
 ```bash
-# 1. Ollama with a tool-calling model — we use gemma4 (set it in
-#    ollama_config in mcpclient_speech/mcpclient_speech_face.py)
+# 1. Ollama with a tool-calling model — we use gemma4 (set in
+#    mcpclient_speech/config.toml [llm], or per-run with --llm-model)
 ollama pull gemma4
 
 # 2. Piper TTS voices (downloads into face/piper_models/)
@@ -50,6 +50,11 @@ arguments are passed through to the client; `-l` lists cameras, and
 ```bash
 ./start-demo.sh --camera 1
 ```
+
+The eye window can show an audio debug panel — VU meters (mic level, VAD
+probability, end-of-utterance countdown) and separate in/out oscilloscopes.
+Toggle it with `[debug] audio_panel` in `mcpclient_speech/config.toml` or
+force it on with `--debug-audio`.
 
 ### Run with the Face Agent
 

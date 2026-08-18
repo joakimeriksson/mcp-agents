@@ -158,6 +158,12 @@ def parse_args():
                       help='Min fraction of frame a face must cover to take focus (0 = off)')
     tune.add_argument('--focus-dwell-seconds', type=float, default=None,
                       help='Seconds a candidate must be held before it takes focus (0 = off)')
+    tune.add_argument('--engage-max-yaw', type=float, default=None,
+                      help='Max |yaw| degrees for the focused face to count as engaged (FACE_ENGAGED)')
+    tune.add_argument('--engage-max-pitch', type=float, default=None,
+                      help='Max |pitch| degrees for the focused face to count as engaged')
+    tune.add_argument('--engage-dwell-seconds', type=float, default=None,
+                      help='Seconds the focused face must face the camera before FACE_ENGAGED')
 
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument('--log-file', default=None, help='Log every interaction event to this JSONL file (overwrites on each run)')
@@ -652,6 +658,9 @@ async def main(args):
             (args.max_missing_seconds, "max_missing_seconds"),
             (args.focus_min_area_frac, "focus_min_area_frac"),
             (args.focus_dwell_seconds, "focus_dwell_seconds"),
+            (args.engage_max_yaw, "engage_max_yaw"),
+            (args.engage_max_pitch, "engage_max_pitch"),
+            (args.engage_dwell_seconds, "engage_dwell_seconds"),
         ):
             if cli_val is not None:
                 tracker_kwargs[kw] = cli_val

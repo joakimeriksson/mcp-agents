@@ -74,6 +74,23 @@ def _pair_distance(a, b, metric: str) -> float:
     return float(np.linalg.norm(a - b))
 
 
+def _pose_yaw_pitch(extra) -> tuple:
+    """Extract (yaw, pitch) in degrees from a detection extra, or (0.0, 0.0).
+
+    InsightFace reports pose as ``[pitch, yaw, roll]``; backends without pose
+    (dlib) pass ``None``, leaving the face treated as facing the camera.
+    """
+    if not extra:
+        return 0.0, 0.0
+    pose = extra.get("pose")
+    if pose is None:
+        return 0.0, 0.0
+    pose = np.asarray(pose, dtype=float).ravel()
+    if pose.size >= 2:
+        return float(pose[1]), float(pose[0])  # yaw, pitch
+    return 0.0, 0.0
+
+
 def _select_providers(override=None) -> list:
     """Pick onnxruntime execution providers, best-available first.
 
@@ -107,6 +124,8 @@ class FaceEventType(Enum):
     FACE_LEARNED = auto()         # learn_face() called
     FACE_ENROLLED = auto()        # new unknown face auto-saved with fresh person_id
     FOCUS_CHANGED = auto()        # primary focus switched
+    FACE_ENGAGED = auto()         # focused face is looking at the camera ("makes contact")
+    FACE_DISENGAGED = auto()      # engaged face looked away / lost focus
     EMOTION_CHANGED = auto()      # emotion label changed
 
 
@@ -180,6 +199,20 @@ class FocusChangedPayload:
 
 
 @dataclass(frozen=True)
+class FaceEngagedPayload:
+    person_id: Optional[str]
+    yaw: float
+    pitch: float
+    focus_score: float
+
+
+@dataclass(frozen=True)
+class FaceDisengagedPayload:
+    person_id: Optional[str]
+    reason: str  # "looked_away" | "lost_focus" | "disappeared"
+
+
+@dataclass(frozen=True)
 class EmotionChangedPayload:
     old_emotion: str
     new_emotion: str
@@ -191,7 +224,8 @@ FaceEventPayload = Union[
     FaceAppearedPayload, FaceDisappearedPayload, FaceOccludedPayload,
     FaceRecoveredPayload, IdentityConfirmedPayload, IdentityLostPayload,
     IdentityChangedPayload, FaceLearnedPayload, FaceEnrolledPayload,
-    FocusChangedPayload, EmotionChangedPayload,
+    FocusChangedPayload, FaceEngagedPayload, FaceDisengagedPayload,
+    EmotionChangedPayload,
 ]
 
 
@@ -227,6 +261,11 @@ class TrackedFace:
     frames_visible: int = 0
     frames_since_seen: int = 0
     focus_score: float = 0.0
+    # Head pose in degrees from the detector (0 when the backend has no pose,
+    # e.g. dlib). yaw ~ left/right turn, pitch ~ up/down; ~0 means facing the
+    # camera. Drives the engagement ("makes contact") gate.
+    yaw: float = 0.0
+    pitch: float = 0.0
 
     @property
     def center(self) -> tuple:
@@ -539,7 +578,8 @@ class DlibBackend:
             (int(t / s), int(r / s), int(b / s), int(l / s))
             for t, r, b, l in locations
         ]
-        return locations, encodings
+        # dlib carries no head pose; extras are None so downstream yaw/pitch = 0.
+        return locations, encodings, [None] * len(locations)
 
 
 class InsightFaceBackend:
@@ -573,10 +613,6 @@ class InsightFaceBackend:
                     model_name, providers, det_size)
         self.app = FaceAnalysis(name=model_name, providers=providers)
         self.app.prepare(ctx_id=ctx_id, det_size=det_size, det_thresh=det_thresh)
-        # Latest per-detection extras (kps/pose/det_score), aligned with the
-        # returned detection order. Stashed for the deferred head-pose engagement
-        # work; not consumed yet.
-        self.last_extras: list = []
 
     def detect(self, frame):
         faces = self.app.get(frame)
@@ -585,13 +621,13 @@ class InsightFaceBackend:
             x1, y1, x2, y2 = (int(v) for v in f.bbox)
             locations.append((y1, x2, y2, x1))  # (top, right, bottom, left)
             encodings.append(np.asarray(f.normed_embedding, dtype=np.float64))
+            # pose is [pitch, yaw, roll] in degrees; kps/det_score kept for future use.
             extras.append({
                 "kps": getattr(f, "kps", None),
                 "pose": getattr(f, "pose", None),
                 "det_score": float(getattr(f, "det_score", 0.0)),
             })
-        self.last_extras = extras
-        return locations, encodings
+        return locations, encodings, extras
 
 
 # ---------------------------------------------------------------------------
@@ -625,12 +661,16 @@ class FaceTracker:
                  focus_switch_seconds: float = 0.5,
                  focus_min_area_frac: float = 0.0,
                  focus_dwell_seconds: float = 0.0,
+                 engage_max_yaw: float = 25.0,
+                 engage_max_pitch: float = 20.0,
+                 engage_dwell_seconds: float = 0.3,
                  emotion_debounce_seconds: float = 0.3,
                  auto_enroll: bool = True,
                  enroll_min_frames: int = 10,
                  enroll_min_face_px: int = 0,
                  enroll_min_sharpness: float = 0.0,
-                 enroll_frontal_tolerance: float = 1.0):
+                 enroll_frontal_tolerance: float = 1.0,
+                 enroll_max_yaw: float = 0.0):
         self.db = db
         self.emotion_detector = emotion_detector
         self.frame_scale = frame_scale
@@ -675,6 +715,10 @@ class FaceTracker:
         self._enroll_min_face_px = enroll_min_face_px
         self._enroll_min_sharpness = enroll_min_sharpness
         self._enroll_frontal_tolerance = enroll_frontal_tolerance
+        # Real-yaw frontal gate for enrollment (degrees, 0 = off). Uses the
+        # backend's head pose; preferred over the dlib nose-centering proxy when
+        # the backend supplies pose (InsightFace).
+        self._enroll_max_yaw = enroll_max_yaw
 
         self._tracks: list[TrackedFace] = []
         self._identities: dict[int, Identity] = {}
@@ -699,6 +743,17 @@ class FaceTracker:
         self._focus_dwell_s = focus_dwell_seconds
         self._focus_challenger_id: Optional[int] = None
         self._focus_challenger_since: float = 0.0
+
+        # Engagement ("makes contact") gate, layered on top of focus: the focused
+        # face must point at the camera within these pose limits, held for the
+        # dwell, to count as engaged. Distinct from focus (which is who, not
+        # whether they're looking). Requires a backend with head pose (InsightFace).
+        self._engage_max_yaw = engage_max_yaw
+        self._engage_max_pitch = engage_max_pitch
+        self._engage_dwell_s = engage_dwell_seconds
+        self._engaged_id: Optional[int] = None
+        self._engage_candidate_id: Optional[int] = None
+        self._engage_candidate_since: float = 0.0
 
         # Emotion debounce: track_id -> (emotion, since_timestamp)
         self._emotion_stable: dict[int, tuple[str, float]] = {}
@@ -734,11 +789,12 @@ class FaceTracker:
             with self._lock:
                 focus_events = self._update_focus_scores(frame_w, frame_h)
                 pending.extend(focus_events)
+                pending.extend(self._update_engagement())
                 result = sorted(self._tracks, key=lambda f: f.focus_score, reverse=True)
             self._dispatch_all(pending)
             return result
 
-        locations, encodings = self._detect_faces(frame)
+        locations, encodings, extras = self._detect_faces(frame)
         detections = list(zip(locations, encodings))
         now = time.time()
 
@@ -755,7 +811,7 @@ class FaceTracker:
                 old_pid = prev_ident.person_id if prev_ident else None
                 old_emotion = track.emotion
 
-                self._update_track(track, enc, bbox, frame)
+                self._update_track(track, enc, bbox, frame, extras[det_idx])
 
                 # Recovery event
                 if was_occluded:
@@ -830,7 +886,7 @@ class FaceTracker:
             # --- New tracks ---
             for det_idx in unmatched_dets:
                 bbox, enc = detections[det_idx]
-                track = self._create_track(enc, bbox, frame)
+                track = self._create_track(enc, bbox, frame, extras[det_idx])
                 self._tracks.append(track)
                 ident = self._identities.get(track.track_id)
                 pending.append(self._make_event(
@@ -871,9 +927,10 @@ class FaceTracker:
                         )
                     ))
 
-            # --- Focus ---
+            # --- Focus & engagement ---
             focus_events = self._update_focus_scores(frame_w, frame_h)
             pending.extend(focus_events)
+            pending.extend(self._update_engagement())
 
             result = sorted(self._tracks, key=lambda f: f.focus_score, reverse=True)
 
@@ -884,6 +941,15 @@ class FaceTracker:
     @property
     def focus_track_id(self) -> Optional[int]:
         return self._focus_id
+
+    @property
+    def engaged_track_id(self) -> Optional[int]:
+        """Track id of the face currently making contact (looking at the camera),
+        or None. A subset of the focused face -- see FACE_ENGAGED."""
+        return self._engaged_id
+
+    def is_engaged(self, track_id: int) -> bool:
+        return self._engaged_id == track_id
 
     def get_identity(self, track_id: int) -> Optional[Identity]:
         with self._lock:
@@ -990,7 +1056,7 @@ class FaceTracker:
             frame = self._last_frames.get(track.track_id)
             if frame is None:
                 continue
-            if not self._passes_enroll_quality(frame, track.bbox):
+            if not self._passes_enroll_quality(frame, track.bbox, track.yaw):
                 continue
             person_id = self._allocate_person_id()
             # Enroll the clean raw encoding, not the EMA-smoothed tracking one.
@@ -1006,7 +1072,7 @@ class FaceTracker:
             ))
         return events
 
-    def _passes_enroll_quality(self, frame, bbox) -> bool:
+    def _passes_enroll_quality(self, frame, bbox, yaw=0.0) -> bool:
         """Quality gate for auto-enrollment: size, sharpness, frontalness.
 
         Each check is skipped when its threshold is at the disabled sentinel
@@ -1027,7 +1093,12 @@ class FaceTracker:
             if cv2.Laplacian(gray, cv2.CV_64F).var() < self._enroll_min_sharpness:
                 return False
 
-        if self._enroll_frontal_tolerance < 1.0 and not self._is_frontal(frame, bbox):
+        # Frontal gate: prefer the backend's real head pose (InsightFace) when
+        # enabled; otherwise fall back to the dlib nose-centering proxy.
+        if self._enroll_max_yaw > 0.0:
+            if abs(yaw) > self._enroll_max_yaw:
+                return False
+        elif self._enroll_frontal_tolerance < 1.0 and not self._is_frontal(frame, bbox):
             return False
 
         return True
@@ -1196,6 +1267,75 @@ class FaceTracker:
 
         return events
 
+    # Extra yaw/pitch slack before an engaged face is declared disengaged, so a
+    # small wobble at the threshold does not flicker FACE_ENGAGED/DISENGAGED.
+    _ENGAGE_HYSTERESIS_DEG = 8.0
+
+    def _disengage_event(self, track_id, reason):
+        return self._make_event(
+            FaceEventType.FACE_DISENGAGED, track_id,
+            FaceDisengagedPayload(person_id=self.get_person_id(track_id), reason=reason),
+        )
+
+    def _update_engagement(self) -> list[FaceEvent]:
+        """Track whether the focused face is looking at the camera.
+
+        Engagement is layered on focus: the focused face must point at the camera
+        within ``engage_max_yaw`` / ``engage_max_pitch`` and hold it for
+        ``engage_dwell_seconds`` to emit FACE_ENGAGED; turning away (past a
+        hysteresis margin), losing focus, or disappearing emits FACE_DISENGAGED.
+        Caller must hold ``self._lock``.
+        """
+        events: list[FaceEvent] = []
+        now = time.time()
+
+        focus = next((t for t in self._tracks if t.track_id == self._focus_id), None)
+        if focus is None or not focus.is_visible:
+            if self._engaged_id is not None:
+                reason = "disappeared" if focus is not None else "lost_focus"
+                events.append(self._disengage_event(self._engaged_id, reason))
+                self._engaged_id = None
+            self._engage_candidate_id = None
+            self._engage_candidate_since = 0.0
+            return events
+
+        if self._engaged_id is not None:
+            if self._engaged_id != focus.track_id:
+                # Focus moved to a different face -> the old one disengages.
+                events.append(self._disengage_event(self._engaged_id, "lost_focus"))
+                self._engaged_id = None
+            elif (abs(focus.yaw) > self._engage_max_yaw + self._ENGAGE_HYSTERESIS_DEG or
+                  abs(focus.pitch) > self._engage_max_pitch + self._ENGAGE_HYSTERESIS_DEG):
+                events.append(self._disengage_event(self._engaged_id, "looked_away"))
+                self._engaged_id = None
+            else:
+                return events  # still engaged
+
+        # Not (or no longer) engaged: require the focused face to face the camera
+        # for the dwell window before declaring engagement.
+        aligned = (abs(focus.yaw) <= self._engage_max_yaw and
+                   abs(focus.pitch) <= self._engage_max_pitch)
+        if aligned:
+            if self._engage_candidate_id != focus.track_id:
+                self._engage_candidate_id = focus.track_id
+                self._engage_candidate_since = now
+            # Same pass handles dwell=0 (engage immediately) and dwell>0 (wait).
+            if now - self._engage_candidate_since >= self._engage_dwell_s:
+                self._engaged_id = focus.track_id
+                self._engage_candidate_id = None
+                self._engage_candidate_since = 0.0
+                events.append(self._make_event(
+                    FaceEventType.FACE_ENGAGED, focus.track_id,
+                    FaceEngagedPayload(
+                        person_id=self.get_person_id(focus.track_id),
+                        yaw=focus.yaw, pitch=focus.pitch,
+                        focus_score=focus.focus_score),
+                ))
+        else:
+            self._engage_candidate_id = None
+            self._engage_candidate_since = 0.0
+        return events
+
     def _detect_faces(self, frame):
         return self._backend.detect(frame)
 
@@ -1250,7 +1390,7 @@ class FaceTracker:
         union = (b1 - t1) * (r1 - l1) + (b2 - t2) * (r2 - l2) - inter
         return inter / union if union > 0 else 0.0
 
-    def _update_track(self, track, encoding, bbox, frame):
+    def _update_track(self, track, encoding, bbox, frame, extra=None):
         now = time.time()
         track.last_encoding = encoding
         track.encoding = 0.3 * encoding + 0.7 * track.encoding
@@ -1260,6 +1400,7 @@ class FaceTracker:
             norm = np.linalg.norm(track.encoding)
             if norm > 0:
                 track.encoding = track.encoding / norm
+        track.yaw, track.pitch = _pose_yaw_pitch(extra)
         track.bbox = bbox
         track.last_seen = now
         track.frames_visible += 1
@@ -1278,12 +1419,14 @@ class FaceTracker:
 
         self._recognize_and_stabilize(track)
 
-    def _create_track(self, encoding, bbox, frame):
+    def _create_track(self, encoding, bbox, frame, extra=None):
         now = time.time()
+        yaw, pitch = _pose_yaw_pitch(extra)
         track = TrackedFace(
             track_id=self._next_id, encoding=encoding.copy(),
             last_encoding=encoding.copy(), bbox=bbox,
             first_seen=now, last_seen=now, frames_visible=1,
+            yaw=yaw, pitch=pitch,
         )
         self._next_id += 1
         self._last_frames[track.track_id] = frame
@@ -1392,6 +1535,8 @@ _EVENT_SHORT_NAMES = {
     "FACE_LEARNED": "LEARNED",
     "FACE_ENROLLED": "ENROLLED",
     "FOCUS_CHANGED": "FOCUS",
+    "FACE_ENGAGED": "ENGAGED",
+    "FACE_DISENGAGED": "DISENGAGED",
     "EMOTION_CHANGED": "EMOTION",
 }
 
@@ -1406,6 +1551,8 @@ _EVENT_COLORS = {
     "FACE_LEARNED": (255, 255, 120),
     "FACE_ENROLLED": (255, 200, 255),
     "FOCUS_CHANGED": (120, 220, 255),
+    "FACE_ENGAGED": (100, 255, 100),
+    "FACE_DISENGAGED": (120, 160, 220),
     "EMOTION_CHANGED": (220, 140, 255),
 }
 
@@ -1471,6 +1618,12 @@ def main():
                         help="InsightFace minimum detector confidence")
     parser.add_argument("--scale", type=float, default=None,
                         help="dlib backend detection scale factor (overrides face_config.toml)")
+    parser.add_argument("--engage-max-yaw", type=float, default=None,
+                        help="Max |yaw| degrees for the focused face to count as engaged")
+    parser.add_argument("--engage-max-pitch", type=float, default=None,
+                        help="Max |pitch| degrees for the focused face to count as engaged")
+    parser.add_argument("--engage-dwell-seconds", type=float, default=None,
+                        help="Seconds the focused face must face the camera before FACE_ENGAGED")
     parser.add_argument("--fps", type=int, default=0, help="Max FPS (0 = unlimited)")
     parser.add_argument("--no-emotion", action="store_true", help="Disable emotion detection")
     parser.add_argument("--no-log-window", action="store_true", help="Disable log window")
@@ -1505,6 +1658,10 @@ def main():
             msg = f"track={event.track_id} id={p.person_id or '?'}"
         elif event.type == FaceEventType.FACE_RECOVERED:
             msg = f"track={event.track_id} id={p.person_id or '?'} missing={p.seconds_missing:.1f}s"
+        elif event.type == FaceEventType.FACE_ENGAGED:
+            msg = f"track={event.track_id} id={p.person_id or '?'} yaw={p.yaw:.0f} pitch={p.pitch:.0f}"
+        elif event.type == FaceEventType.FACE_DISENGAGED:
+            msg = f"track={event.track_id} id={p.person_id or '?'} ({p.reason})"
         elif event.type == FaceEventType.EMOTION_CHANGED:
             msg = f"track={event.track_id} {p.old_emotion}->{p.new_emotion}"
         else:
@@ -1530,6 +1687,9 @@ def main():
         (args.det_size, "det_size"),
         (args.det_thresh, "det_thresh"),
         (args.scale, "frame_scale"),
+        (args.engage_max_yaw, "engage_max_yaw"),
+        (args.engage_max_pitch, "engage_max_pitch"),
+        (args.engage_dwell_seconds, "engage_dwell_seconds"),
     ):
         if cli_val is not None:
             tracker_kwargs[kw] = cli_val
@@ -1563,6 +1723,7 @@ def main():
         "faces": [],           # list[TrackedFace] snapshot (copies, safe to read)
         "identities": {},      # track_id -> (person_id, confidence)
         "focus_id": None,
+        "engaged_id": None,
         "result_id": 0,
         "process_ms": 0.0,
         "result_time": 0.0,
@@ -1597,11 +1758,13 @@ def main():
                 if pid is not None:
                     idents[f.track_id] = (pid, tracker.get_confidence(f.track_id))
             focus_id_local = tracker.focus_track_id
+            engaged_id_local = tracker.engaged_track_id
             local_result_id += 1
             with state_lock:
                 latest["faces"] = faces_snap
                 latest["identities"] = idents
                 latest["focus_id"] = focus_id_local
+                latest["engaged_id"] = engaged_id_local
                 latest["result_id"] = local_result_id
                 latest["process_ms"] = elapsed_ms
                 latest["result_time"] = time.time()
@@ -1652,6 +1815,7 @@ def main():
             faces_snap = latest["faces"]
             idents_snap = latest["identities"]
             focus_id = latest["focus_id"]
+            engaged_id = latest["engaged_id"]
             result_id = latest["result_id"]
             process_ms = latest["process_ms"]
             result_time = latest["result_time"]
@@ -1694,6 +1858,7 @@ def main():
 
         for rank, face in enumerate(visible):
             is_focus = (face.track_id == focus_id)
+            is_engaged = (face.track_id == engaged_id)
             is_selected = (face.track_id == selected_track_id)
             pid_conf = idents_snap.get(face.track_id)
             pid = pid_conf[0] if pid_conf else None
@@ -1740,13 +1905,20 @@ def main():
                               (0, 255, 100), cv2.FILLED)
                 cv2.putText(frame, "FOCUS", (left + 6, top - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+                if is_engaged:
+                    cv2.rectangle(frame, (left + badge_w + 4, top - 28),
+                                  (left + badge_w + 4 + 110, top - 4),
+                                  (60, 255, 60), cv2.FILLED)
+                    cv2.putText(frame, "ENGAGED", (left + badge_w + 10, top - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
             emo_y = top - 32 if is_focus else top - 10
             if face.emotion and face.emotion != "neutral":
                 cv2.putText(frame, f"{face.emotion} ({face.emotion_confidence:.0%})",
                             (left, emo_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-            info = f"focus:{face.focus_score:.2f} vis:{face.frames_visible}"
+            info = (f"focus:{face.focus_score:.2f} vis:{face.frames_visible} "
+                    f"yaw:{face.yaw:.0f} pitch:{face.pitch:.0f}")
             cv2.putText(frame, info, (left + 6, bottom + 48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
 

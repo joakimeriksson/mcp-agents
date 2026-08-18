@@ -42,7 +42,7 @@ def _embed_crop(backend: InsightFaceBackend, img: np.ndarray):
             h, w = img.shape[:2]
             m = int(round(max(h, w) * pad))
             frame = cv2.copyMakeBorder(img, m, m, m, m, cv2.BORDER_REFLECT)
-        locations, encodings = backend.detect(frame)
+        locations, encodings, _extras = backend.detect(frame)
         if encodings:
             # Pick the largest detected face (top, right, bottom, left).
             def _area(loc):

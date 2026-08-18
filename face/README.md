@@ -111,6 +111,11 @@ The agent is event-driven. Two inputs trigger decisions:
 - **FACE_DISAPPEARED** (known person) -- say goodbye (skipped if TTS is busy)
 - **IDENTITY_CONFIRMED** (recognized face) -- greet if cooldown expired
 - **FACE_APPEARED** (new track) -- if known: greet; if unknown: ask name later
+- **FACE_ENGAGED** / **FACE_DISENGAGED** -- the focused face started / stopped
+  looking at the camera ("makes contact"). Driven by head pose
+  (`engage_max_yaw` / `engage_max_pitch`, held for `engage_dwell_seconds`);
+  requires the InsightFace backend. Use FACE_ENGAGED to start an interaction
+  only when someone actually faces the camera, not merely walks past.
 
 ### Speech events (from ContinuousListener)
 

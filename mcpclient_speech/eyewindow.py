@@ -65,12 +65,7 @@ class EyeWindow:
         self.txt1 = CCText(self.win.fig, (0.5, 0.45), "", 1.0/20)
         self.txt2 = CCText(self.win.fig, (0.5, 0.38), "", 1.0/40)
         self.txt_indicator = CCText(self.win.fig, (0.05, 0.95), "", 1.0/40)
-        self.cam_ax = self.win.fig.add_axes((0.78, 0.80, 0.20, 0.18))
-        self.cam_ax.set_xticks([]); self.cam_ax.set_yticks([])
-        for s in self.cam_ax.spines.values():
-            s.set_visible(False)
-        self.cam_im = self.cam_ax.imshow(np.zeros((2, 2, 3), dtype=np.uint8))
-        self._pending_frame = None
+        self.camwin = None
         self.win.set_background(self.bg)
         self.win.register_target((0.15, 0.1, 0.7, 0.7), self)
         self.win.add_resize_callback(self.resize)
@@ -111,6 +106,9 @@ class EyeWindow:
     def set_indicator(self, text):
         self.txt_indicator.text.set_text(text or "")
 
+    def attach_camera_window(self, camwin):
+        self.camwin = camwin
+
     def key_press_event(self, event):
         if event.key == "control":
             if self.func1:
@@ -134,6 +132,67 @@ class EyeWindow:
         if self.func2:
             self.func2(event, self.obj)
 
+    def check_events(self):
+        if self.camwin is not None:
+            self.camwin.check_events()
+        self.win.fig.canvas.flush_events()
+
+
+class CameraWindow:
+    """A standalone window showing the annotated camera/face image.
+
+    Mirrors the parts of EyeWindow that WindowMgr dispatches events to
+    (key_press_event / key_release_event / exit_event) so keyboard shortcuts
+    and close-to-quit behave the same regardless of which window has focus.
+    The keydict is shared (same object) with the EyeWindow.
+    """
+
+    def __init__(self, name, width=640, height=480, keydict=None):
+        self.width = width
+        self.height = height
+        self.win = WindowMgr(name, width, height, 1, 1)
+        self.bg = gray(0.5)
+        self.win.set_background(self.bg)
+        self.cam_ax = self.win.fig.add_axes((0.0, 0.0, 1.0, 1.0))
+        self.cam_ax.set_xticks([]); self.cam_ax.set_yticks([])
+        for s in self.cam_ax.spines.values():
+            s.set_visible(False)
+        self.cam_im = self.cam_ax.imshow(np.zeros((2, 2, 3), dtype=np.uint8))
+        self._pending_frame = None
+        self._frame_shape = None
+        self._sized = False
+        self.keydict = keydict if keydict is not None else {}
+        self.func1 = None
+        self.func2 = None
+        self.obj = None
+        self.exitfunc = None
+        self.exitobj = None
+        self.win.register_target((0.0, 0.0, 1.0, 1.0), self)
+        self.win.add_close_callback(self.exit_event)
+        self.win.fig.canvas.draw()
+
+    def set_exit_callback(self, func, obj):
+        self.exitfunc = func
+        self.exitobj = obj
+
+    def exit_event(self, ev):
+        if self.exitfunc:
+            self.exitfunc(self.exitobj)
+
+    def key_press_event(self, event):
+        if event.key == "control":
+            if self.func1:
+                self.func1(event, self.obj)
+        elif event.key in self.keydict and self.keydict[event.key]:
+            self.keydict[event.key][0](event, self.keydict[event.key][1])
+        else:
+            print("Press", event.key)
+
+    def key_release_event(self, event):
+        if event.key == "control":
+            if self.func2:
+                self.func2(event, self.obj)
+
     def set_camera_frame(self, frame_rgb):
         self._pending_frame = frame_rgb
 
@@ -141,11 +200,23 @@ class EyeWindow:
         frame = self._pending_frame
         if frame is not None:
             self._pending_frame = None
+            shape = frame.shape[:2]
+            if shape != self._frame_shape:
+                self._frame_shape = shape
+                # set_extent updates the image's drawn region in data coords
+                # AND set_xlim/set_ylim accordingly; set_data alone does not
+                # touch the extent stored at imshow() time, so the new frame
+                # would be rendered into the old 2-pixel placeholder region.
+                self.cam_im.set_extent((-0.5, frame.shape[1] - 0.5,
+                                        frame.shape[0] - 0.5, -0.5))
+                if not self._sized:
+                    self._sized = True
+                    h, w = shape
+                    scale = 640.0 / max(w, h)
+                    dpi = self.win.fig.dpi
+                    self.win.fig.set_size_inches((w * scale / dpi,
+                                                  h * scale / dpi))
             self.cam_im.set_data(frame)
-            if frame.shape[:2] != self.cam_im.get_array().shape[:2]:
-                self.cam_ax.set_xlim(-0.5, frame.shape[1] - 0.5)
-                self.cam_ax.set_ylim(frame.shape[0] - 0.5, -0.5)
-            self.cam_ax.draw_artist(self.cam_im)
-            self.win.fig.canvas.blit(self.cam_ax.bbox)
+            self.win.fig.canvas.draw()
         self.win.fig.canvas.flush_events()
 

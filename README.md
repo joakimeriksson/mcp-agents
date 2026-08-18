@@ -19,10 +19,12 @@ ollama pull gemma4
 cd face && uv run download_models.py && cd ..
 ```
 
-Optional, for the Swedish Kokoro voices (Stina & friends): start a
+Optional, for the Kokoro voices: start a
 [kokoro-voice-server](https://github.com/joakimeriksson/kokoro-voice-server)
-on `:8880` — Swedish TTS then goes through it, with automatic fallback to
-Piper if it isn't running. Configured in `face/languages.toml`.
+on `:8880` — TTS for every Kokoro-supported language (Swedish with Stina &
+friends, plus en/fr/es/it) then goes through it, with automatic fallback to
+Piper if it isn't running. German has no Kokoro voice and always uses Piper.
+Configured in `face/languages.toml`.
 
 ```bash
 git clone https://github.com/joakimeriksson/kokoro-voice-server

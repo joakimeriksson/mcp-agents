@@ -19,7 +19,9 @@ default = "en"
 # ── English ──────────────────────────────────────────────────────────
 
 [languages.en]
-tts_model = "en_US-lessac-medium"
+tts_model = "en_US-lessac-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "af_heart"
 
 greetings = [
     "Hello, {name}!",
@@ -151,7 +153,9 @@ favourite_music = [
 # ── French ───────────────────────────────────────────────────────────
 
 [languages.fr]
-tts_model = "fr_FR-siwis-medium"
+tts_model = "fr_FR-siwis-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "ff_siwis"
 
 greetings = [
     "Bonjour {name} !",
@@ -203,7 +207,9 @@ favourite_music = [
 # ── Spanish ──────────────────────────────────────────────────────────
 
 [languages.es]
-tts_model = "es_ES-davefx-medium"
+tts_model = "es_ES-davefx-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "ef_dora"
 
 greetings = [
     "¡Hola {name}!",
@@ -307,7 +313,9 @@ favourite_music = [
 # ── Italian ─────────────────────────────────────────────────────────
 
 [languages.it]
-tts_model = "it_IT-paola-medium"
+tts_model = "it_IT-paola-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "if_sara"
 
 greetings = [
     "Ciao {name}!",

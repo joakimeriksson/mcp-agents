@@ -30,7 +30,7 @@ from voice_input import VoiceInput, AudioMonitor, ContinuousListener, EchoDetect
 from voice_output import VoiceOutput
 from people_memory import PeopleMemory
 from llm import ConversationLLM
-from languages_config import get_goodbye
+from languages_config import get_goodbye, get_default_language
 
 logger = logging.getLogger("agent")
 
@@ -835,7 +835,8 @@ def main():
     parser = argparse.ArgumentParser(description="Standalone agent")
     parser.add_argument("--db-dir", default=os.path.join(_SOURCE_DIR, "known_faces"))
     parser.add_argument("--people-dir", default=os.path.join(_SOURCE_DIR, "people"))
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=-1,
+                        help="Camera index; -1 (default) auto-picks the first that delivers video")
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--no-auto-ask", action="store_true")
     parser.add_argument("--no-auto-greet", action="store_true")
@@ -847,6 +848,11 @@ def main():
                         help="Path to MCP servers JSON config (default: mcp_servers.json)")
     parser.add_argument("--mcp-server", action="append", default=[],
                         help="MCP server SSE URL (can be repeated)")
+    parser.add_argument("--service-server", default=None,
+                        help="SSE URL of a service MCP server (e.g. candytron_mcp): "
+                             "its tools are added like --mcp-server, and its "
+                             "persona prompt, name, and init/exit lifecycle are "
+                             "adopted (see ServiceHost in mcp_client.py)")
     parser.add_argument("--agent-name", default="Face Agent",
                         help="Name the agent uses to describe itself")
     parser.add_argument("--smart-greeting", action="store_true",
@@ -883,17 +889,39 @@ def main():
     memory = PeopleMemory(storage_dir=args.people_dir)
     memory.load()
 
-    from mcp_client import load_servers
+    from mcp_client import load_servers, ServiceHost
+    server_urls = list(args.mcp_server)
+    if args.service_server:
+        server_urls.append(args.service_server)
     mcp_servers, mcp_descriptions = load_servers(
-        config_path=args.mcp_config, server_urls=args.mcp_server)
+        config_path=args.mcp_config, server_urls=server_urls)
+
+    # A service server (candytron_mcp etc.) also provides a persona, a
+    # display name, and init/exit lifecycle — adopt what it offers.
+    service = ServiceHost(args.service_server) if args.service_server else None
+    agent_name = args.agent_name
+    service_prompt = None
+    if service:
+        if not service.init():
+            print(f"ERROR: service_init failed at {args.service_server}",
+                  file=sys.stderr)
+            sys.exit(1)
+        name = service.fetch_name()
+        if name and args.agent_name == "Face Agent":  # not overridden by CLI
+            agent_name = name
+        service_prompt = service.fetch_prompt(get_default_language())
+        logger.info(f"Service: name={name!r}, "
+                    f"persona={'yes' if service_prompt else 'no'}")
 
     llm = ConversationLLM(
         model_name=args.llm_model,
         ollama_url=args.ollama_url,
         mcp_servers=mcp_servers,
         mcp_descriptions=mcp_descriptions,
-        agent_name=args.agent_name,
+        agent_name=agent_name,
         smart_greetings=args.smart_greeting,
+        service_prompt=service_prompt,
+        augmentation_provider=service.fetch_augmentation if service else None,
     )
     try:
         llm.validate()
@@ -936,6 +964,10 @@ def main():
 
     agent.subscribe(on_agent_event)
 
+    # Per-turn voice latency: speech-end -> assistant-audio-start (STT/LLM/TTS).
+    from latency import LatencyTracker
+    LatencyTracker(voice_in, voice_out)
+
     print("Models loaded. Starting agent.\n")
 
     agent.start()
@@ -948,9 +980,10 @@ def main():
         ).start()
 
     import cv2
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        logger.error(f"Could not open camera {args.camera}")
+    from camera_utils import open_camera
+    cap, cam_idx = open_camera(args.camera)
+    if cap is None:
+        logger.error("Could not open a working camera (all black/unavailable)")
         return
 
     cv2.namedWindow("Agent", cv2.WINDOW_NORMAL)
@@ -1042,6 +1075,8 @@ def main():
 
     print("\nShutting down...")
     try:
+        if service:
+            service.exit()
         agent.stop()
         monitor.stop()
         cap.release()

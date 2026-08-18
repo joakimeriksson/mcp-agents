@@ -2,6 +2,9 @@
 #
 # Each [languages.<code>] section defines a supported language:
 #   tts_model  — Piper voice model name (downloaded automatically)
+#   tts_server — optional: OpenAI-compatible /v1/audio/speech URL; when set,
+#                TTS goes over HTTP (kokoro-voice-server) with tts_voice as
+#                the voice name, and tts_model becomes the offline fallback
 #   greetings  — Plain greetings ({name} is replaced)
 #   goodbyes   — Farewell phrases ({name} is replaced)
 #   ask_name   — Prompts for asking an unknown person's name
@@ -78,7 +81,11 @@ favourite_music = [
 # ── Swedish ──────────────────────────────────────────────────────────
 
 [languages.sv]
-tts_model = "sv_SE-lisa-medium"
+tts_model = "sv_SE-lisa-medium"    # Piper fallback if the server is down
+# Swedish Kokoro voices via kokoro-voice-server (start it on :8880).
+# Voices: Stina, Alice, Ebba, Elsa, Greta, Anton, Björn, Lars, Nils, Oskar
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "Stina"
 
 greetings = [
     "Hej {name}!",

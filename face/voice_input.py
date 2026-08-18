@@ -3,14 +3,15 @@ Voice input module: microphone monitoring, VAD, recording, and transcription.
 
 Provides:
 - AudioMonitor: real-time mic level (RMS, peak, dB)
-- VoiceInput: VAD-based speech detection + whisper transcription
+- VoiceInput: VAD-based speech detection + transcription (Gemma 4 native audio
+  by default, faster-whisper optional via stt_backend="whisper")
 - ContinuousListener: always-on background listening
 - Typed event system with subscribe/unsubscribe
 
 Does NOT handle TTS (text-to-speech) or conversation logic.
 
 Can be run standalone:
-    python voice_input.py [--whisper-model base] [--vad-threshold 0.7]
+    python voice_input.py [--backend gemma4|whisper] [--vad-threshold 0.7]
 """
 
 import numpy as np
@@ -26,13 +27,15 @@ from datetime import datetime
 from typing import Optional, Callable, Union
 
 import sounddevice as sd
-from faster_whisper import WhisperModel
 
 from events import EventDispatcher
 
 logger = logging.getLogger("voice_input")
 
 # Default constants
+STT_BACKEND = "gemma4"        # "gemma4" (native audio) or "whisper"
+GEMMA_MODEL = "gemma4:latest"   # audio-capable variant; gemma4:26b is text-only
+GEMMA_HOST = "http://localhost:11434"
 SAMPLE_RATE = 16000
 RECORD_SECONDS = 4
 VAD_THRESHOLD = 0.7
@@ -462,6 +465,10 @@ class VoiceInput:
     """
 
     def __init__(self, *,
+                 stt_backend: str = STT_BACKEND,
+                 gemma_model: str = GEMMA_MODEL,
+                 gemma_host: str = GEMMA_HOST,
+                 stt_fallback: bool = True,
                  whisper_model_size: str = "medium",
                  whisper_compute_type: str = "float16",
                  sample_rate: int = SAMPLE_RATE,
@@ -472,6 +479,10 @@ class VoiceInput:
                  noise_reduce: bool = NOISE_REDUCE,
                  record_seconds: int = RECORD_SECONDS,
                  device: int | None = None):
+        self._stt_backend = stt_backend
+        self._gemma_model = gemma_model
+        self._gemma_host = gemma_host
+        self._stt_fallback = stt_fallback
         self._whisper_size = whisper_model_size
         self._whisper_compute = whisper_compute_type
         self._sample_rate = sample_rate
@@ -484,6 +495,7 @@ class VoiceInput:
         self._record_seconds = record_seconds
 
         self._whisper_model = None
+        self._transcriber = None   # active STT engine (whisper or gemma4)
         self._vad_model = None
         self._loading = False
         self._ready = False
@@ -545,15 +557,54 @@ class VoiceInput:
         self._load_models()
 
     def _load_models(self):
+        if self._stt_backend == "gemma4":
+            self._load_gemma4()
+        else:
+            self._load_whisper()
+        self._ready = self._transcriber is not None
+        self._loading = False
+
+    def _load_gemma4(self):
+        self._emit(VoiceEventType.MODEL_LOADING, ModelLoadingPayload("gemma4"))
+        try:
+            logger.info(f"Connecting Gemma 4 STT ({self._gemma_model})...")
+            from gemma_stt import Gemma4Transcriber
+            transcriber = Gemma4Transcriber(model=self._gemma_model,
+                                            host=self._gemma_host,
+                                            sample_rate=self._sample_rate)
+            transcriber.check()  # verify Ollama up + model pulled + audio-capable
+            self._transcriber = transcriber
+            self._load_error = None
+            self._emit(VoiceEventType.MODEL_READY,
+                       ModelReadyPayload("gemma4", self._gemma_model))
+            logger.info("Gemma 4 STT ready.")
+        except Exception as e:
+            self._emit(VoiceEventType.MODEL_LOAD_FAILED,
+                       ModelLoadFailedPayload("gemma4", str(e)))
+            logger.error(f"Failed to init Gemma 4 STT: {e}")
+            if self._stt_fallback:
+                logger.warning("Falling back to Whisper STT...")
+                self._load_whisper()   # sets _transcriber + clears _load_error on success
+                if self._transcriber is not None:
+                    self._load_error = None
+                    return
+            self._load_error = (
+                f"Failed to init Gemma 4 STT {self._gemma_model!r} "
+                f"at {self._gemma_host}: {e}")
+
+    def _load_whisper(self):
         self._emit(VoiceEventType.MODEL_LOADING, ModelLoadingPayload("whisper"))
         try:
             logger.info(f"Loading whisper model ({self._whisper_size})...")
             import torch
+            from faster_whisper import WhisperModel
             device = "cuda" if torch.cuda.is_available() else "cpu"
             compute_type = self._whisper_compute if device == "cuda" else "int8"
             self._whisper_model = WhisperModel(self._whisper_size,
                                                compute_type=compute_type,
                                                device=device)
+            self._transcriber = self._whisper_model
+            self._load_error = None
             self._emit(VoiceEventType.MODEL_READY,
                        ModelReadyPayload("whisper", f"{self._whisper_size} ({self._whisper_compute})"))
             logger.info("Whisper model loaded.")
@@ -565,8 +616,11 @@ class VoiceInput:
                        ModelLoadFailedPayload("whisper", str(e)))
             logger.error(f"Failed to load whisper: {e}")
 
-        self._ready = self._whisper_model is not None
-        self._loading = False
+    def _transcribe(self, audio):
+        """Run the active STT backend. Returns (segments, info) like whisper."""
+        if self._whisper_model is not None:
+            return self._whisper_model.transcribe(audio, beam_size=5)
+        return self._transcriber.transcribe(audio)
 
     def _ensure_vad(self):
         if self._vad_model is not None:
@@ -761,7 +815,7 @@ class VoiceInput:
         self._emit(VoiceEventType.TRANSCRIPTION_STARTED,
                    TranscriptionStartedPayload(audio_duration_ms, noise_reduced))
 
-        segments, info = self._whisper_model.transcribe(audio, beam_size=5)
+        segments, info = self._transcribe(audio)
         self.detected_language = info.language
         self.detected_language_prob = info.language_probability
 
@@ -813,7 +867,7 @@ class VoiceInput:
         self._emit(VoiceEventType.TRANSCRIPTION_STARTED,
                    TranscriptionStartedPayload(audio_duration_ms, noise_reduced))
 
-        segments, info = self._whisper_model.transcribe(audio, beam_size=5)
+        segments, info = self._transcribe(audio)
         self.detected_language = info.language
         self.detected_language_prob = info.language_probability
 
@@ -952,6 +1006,13 @@ _EVENT_COLORS = {
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone voice input (STT)")
+    parser.add_argument("--backend", default=STT_BACKEND,
+                        choices=["gemma4", "whisper"],
+                        help="STT backend (default: gemma4 native audio)")
+    parser.add_argument("--gemma-model", default=GEMMA_MODEL,
+                        help="Ollama model for the gemma4 backend")
+    parser.add_argument("--no-stt-fallback", action="store_true",
+                        help="Do not fall back to Whisper if the gemma4 model lacks audio")
     parser.add_argument("--whisper-model", default="base", help="Whisper model size")
     parser.add_argument("--vad-threshold", type=float, default=0.7)
     parser.add_argument("--no-continuous", action="store_true",
@@ -966,6 +1027,9 @@ def main():
                         datefmt="%H:%M:%S")
 
     voice = VoiceInput(
+        stt_backend=args.backend,
+        gemma_model=args.gemma_model,
+        stt_fallback=not args.no_stt_fallback,
         whisper_model_size=args.whisper_model,
         vad_threshold=args.vad_threshold,
         noise_reduce=not args.no_noise_reduce,

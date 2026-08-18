@@ -49,6 +49,19 @@ def get_language_models() -> dict[str, str]:
             if "tts_model" in cfg}
 
 
+def get_language_tts_servers() -> dict[str, dict[str, str]]:
+    """Return ``{lang_code: {"url": ..., "voice": ...}}`` for languages that
+    use an HTTP TTS server (OpenAI-compatible /v1/audio/speech) instead of a
+    local Piper model. ``voice`` may be absent (server default)."""
+    servers = {}
+    for lang, cfg in _LANGUAGES.items():
+        if "tts_server" in cfg:
+            servers[lang] = {"url": cfg["tts_server"]}
+            if "tts_voice" in cfg:
+                servers[lang]["voice"] = cfg["tts_voice"]
+    return servers
+
+
 def get_language_pronunciations() -> dict[str, dict[str, str]]:
     """Return ``{lang_code: {word: replacement}}`` for all configured languages."""
     return {lang: cfg["pronunciations"] for lang, cfg in _LANGUAGES.items()

@@ -23,6 +23,10 @@ dependencies = [
     # onnxruntime-gpu INSTEAD of this (the two wheels conflict); the provider
     # selector falls back to CPU/CoreML if CUDA is absent, so this default is
     # safe on every machine.
+    "ollama",
+    "soundfile",
+    "requests",  # HTTP TTS backend (kokoro-voice-server)
+    "fastmcp",   # ServiceHost: service persona + init/exit (mcp_client.py)
     "onnxruntime>=1.23.2,<2",
     "torch",
     "torchaudio",

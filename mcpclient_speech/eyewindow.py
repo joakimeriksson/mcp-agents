@@ -290,11 +290,13 @@ class EyeWindow:
         now = time.time()
         dt, self._scope_last_t = now - self._scope_last_t, now
         if vo is not None and hasattr(vo, "out_waveform"):
-            # The playback callback only rolls the buffer while audio plays;
-            # when idle, scroll zeros in at the same rate so finished speech
-            # drifts off the display like the mic trace does.
-            if not getattr(vo, "speaking", False):
-                n = min(len(vo.out_waveform), int(dt * 24000))
+            # The playback callback only rolls the buffer while audio is
+            # actually being written; whenever it isn't (idle, or the synth
+            # gap before playback starts), scroll zeros in at the buffer's
+            # own rate (it spans exactly 1s) so the trace moves at a
+            # constant one-window-per-second, just like the mic trace.
+            if now - getattr(vo, "out_last_write", 0.0) > 0.2:
+                n = min(len(vo.out_waveform), int(dt * len(vo.out_waveform)))
                 if n > 0:
                     vo.out_waveform = np.roll(vo.out_waveform, -n)
                     vo.out_waveform[-n:] = 0.0

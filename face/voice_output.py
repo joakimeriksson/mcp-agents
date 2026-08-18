@@ -146,8 +146,11 @@ class VoiceOutput:
         self._interrupted = False
         self._lock = threading.Lock()
         self._dispatcher = EventDispatcher(owner="voice_output")
-        # Rolling window of the last ~1s of played samples, for scope views
+        # Rolling window of the last ~1s of played samples, for scope views.
+        # Resized to the active stream's sample rate at playback time so the
+        # buffer always spans exactly one second regardless of engine.
         self.out_waveform = np.zeros(24000, dtype=np.float32)
+        self.out_last_write = 0.0   # time.time() of the last playback write
 
     # --- Event API ---
 
@@ -372,6 +375,9 @@ class VoiceOutput:
         )
 
     def _play_stream(self, text: str, chunks, sr: int):
+        if len(self.out_waveform) != sr:
+            # keep the scope window at exactly 1s for this stream's rate
+            self.out_waveform = np.zeros(sr, dtype=np.float32)
         buffer = collections.deque()
         finished = threading.Event()
         stop = self._stop_event
@@ -400,6 +406,7 @@ class VoiceOutput:
             n = min(frames, len(self.out_waveform))
             self.out_waveform = np.roll(self.out_waveform, -n)
             self.out_waveform[-n:] = outdata[-n:, 0]
+            self.out_last_write = time.time()
 
         emitted = False
 

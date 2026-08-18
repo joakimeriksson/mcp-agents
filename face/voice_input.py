@@ -44,6 +44,7 @@ SAMPLE_RATE = 16000
 RECORD_SECONDS = 4
 VAD_THRESHOLD = 0.7
 VAD_SILENCE_MS = 1200
+VAD_RESUME_MS = 130   # speech must sustain this long to reset the silence countdown
 VAD_MAX_SPEECH_S = 15
 VAD_PRE_SPEECH_MS = 500
 AUDIO_METER_DECAY = 0.92
@@ -478,6 +479,7 @@ class VoiceInput:
                  sample_rate: int = SAMPLE_RATE,
                  vad_threshold: float = VAD_THRESHOLD,
                  vad_silence_ms: int = VAD_SILENCE_MS,
+                 vad_resume_ms: int = VAD_RESUME_MS,
                  vad_max_speech_s: float = VAD_MAX_SPEECH_S,
                  vad_pre_speech_ms: int = VAD_PRE_SPEECH_MS,
                  noise_reduce: bool = NOISE_REDUCE,
@@ -493,6 +495,7 @@ class VoiceInput:
         self._device = device
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
+        self._vad_resume_ms = vad_resume_ms
         self._vad_max_speech_s = vad_max_speech_s
         self._vad_pre_speech_ms = vad_pre_speech_ms
         self._noise_reduce = noise_reduce
@@ -729,12 +732,16 @@ class VoiceInput:
         chunk_ms = 32
         chunk_samples = 512
         silence_chunks_needed = int(self._vad_silence_ms / chunk_ms)
+        # Debounce: a blip shorter than this (breath, chair creak — too short
+        # to be a word) must not restart the whole silence countdown.
+        resume_chunks_needed = max(1, int(self._vad_resume_ms / chunk_ms))
         max_chunks = int(self._vad_max_speech_s * 1000 / chunk_ms)
         pre_speech_chunks = int(self._vad_pre_speech_ms / chunk_ms)
 
         pre_buffer = collections.deque(maxlen=pre_speech_chunks)
         speech_chunks = []
         silence_count = 0
+        speech_run = 0     # consecutive speech chunks within trailing silence
         speech_started = False
         total_chunks = 0
 
@@ -786,6 +793,7 @@ class VoiceInput:
                 else:
                     speech_chunks.append(chunk.copy())
                     if speech_prob < self._vad_threshold:
+                        speech_run = 0
                         silence_count += 1
                         if silence_count >= silence_chunks_needed:
                             duration_ms = len(speech_chunks) * chunk_ms
@@ -793,7 +801,12 @@ class VoiceInput:
                                        VadSpeechEndPayload(duration_ms, speech_prob))
                             break
                     else:
-                        silence_count = 0
+                        speech_run += 1
+                        if speech_run >= resume_chunks_needed:
+                            # Sustained speech — the person really resumed.
+                            silence_count = 0
+                        # else: sub-word blip — pause the countdown for the
+                        # blip's own duration, but don't restart it.
 
                     if len(speech_chunks) >= max_chunks:
                         duration_ms = len(speech_chunks) * chunk_ms

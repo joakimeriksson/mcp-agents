@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -147,6 +148,7 @@ class EyeWindow:
         self._audio_monitor = None
         self._voice_input = None
         self._voice_output = None
+        self._scope_last_t = time.time()
         self.win.set_background(self.bg)
         self.win.register_target((0.15, 0.1, 0.7, 0.7), self)
         self.win.add_resize_callback(self.resize)
@@ -264,7 +266,17 @@ class EyeWindow:
         if m is not None and hasattr(m, "waveform"):
             self.scope_in.set_ydata(self._scope_trace(m.waveform, self._scope_n))
         vo = self._voice_output
+        now = time.time()
+        dt, self._scope_last_t = now - self._scope_last_t, now
         if vo is not None and hasattr(vo, "out_waveform"):
+            # The playback callback only rolls the buffer while audio plays;
+            # when idle, scroll zeros in at the same rate so finished speech
+            # drifts off the display like the mic trace does.
+            if not getattr(vo, "speaking", False):
+                n = min(len(vo.out_waveform), int(dt * 24000))
+                if n > 0:
+                    vo.out_waveform = np.roll(vo.out_waveform, -n)
+                    vo.out_waveform[-n:] = 0.0
             self.scope_out.set_ydata(
                 self._scope_trace(vo.out_waveform, self._scope_n))
 

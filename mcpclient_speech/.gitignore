@@ -1,0 +1,6 @@
+# Downloaded model binaries — fetched at runtime / by download scripts,
+# never committed (they bloat the repo; see face/.gitignore for the same)
+piper_models/
+emotion_model/
+*.onnx
+*.wav

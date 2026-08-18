@@ -686,21 +686,24 @@ class Agent:
             self.state = "TALKING"
             self.speak(response, language=lang)
 
-            # Off the critical path: transcribe for memory, then reuse the
-            # normal name-learning and fact-extraction flows on the text.
+            # Off the critical path: transcribe for memory (reachy-style —
+            # folding the transcript into the reply call degrades gemma4's
+            # reply/tool/transcript quality all at once, so keep it separate),
+            # then reuse the normal name-learning and fact-extraction flows.
             def _memorize(audio=audio, tid=tid, person=person, lang=lang):
                 try:
-                    segments, info = self.direct_llm.transcriber.transcribe(audio)
+                    segments, info = \
+                        self.direct_llm.transcriber.transcribe(audio)
                     text = "".join(s.text for s in segments).strip()
+                    lang = info.language or lang
+                    logger.info(f"[direct] background transcript: {text}")
                 except Exception as e:
                     logger.warning(f"background transcription failed: {e}")
                     return
                 if not text:
                     return
-                logger.info(f"[direct] background transcript: {text}")
                 if tid:
-                    self.memory.add_dialogue(tid, "person", text,
-                                             language=info.language or lang)
+                    self.memory.add_dialogue(tid, "person", text, language=lang)
                     if person and not person.is_identified:
                         self._try_learn_name(tid, text)
                     if person:

@@ -8,7 +8,10 @@ call replaces a 0.7-2.7 s STT call plus a ~0.8 s chat call).
 
 What still needs text (per-person memory, fact extraction, name learning) is
 served by a background transcription AFTER the reply — off the critical path,
-exactly like reachy's remote_stt.
+exactly like reachy's remote_stt. Deliberately NOT folded into the reply call:
+asking gemma4 to also emit a word-for-word transcript alongside reply + tool
+calls degrades all three (tried Aug 2026 — transcripts got sloppy and tool
+turns sometimes lost their prose), which is why reachy split it too.
 
 The reply carries its language as a leading ISO tag ("[sv] Hej!") so the TTS
 voice can be routed without a separate detection step; tools are fetched once
@@ -134,7 +137,8 @@ class DirectAudioLLM:
                 context: str = "",
                 language_hint: str = "en") -> tuple[str, str]:
         """Audio in, (reply_text, language) out. Blocking; one to a few
-        model calls depending on tool use."""
+        model calls depending on tool use. Transcription for memory is the
+        caller's job, in the background (see agent._on_heard_audio)."""
         wav = _to_wav_bytes(audio, self._sample_rate)
 
         service = ""
@@ -156,17 +160,22 @@ class DirectAudioLLM:
         ]
 
         start = time.time()
-        reply = last_content = ""
+        reply, used_tools = "", False
+        texts: list[str] = []   # every piece of prose the model produced
+
         for round_no in range(_MAX_TOOL_ROUNDS):
             resp = self._client.chat(model=self._model, messages=messages,
                                      tools=self._tools or None,
                                      think=False, stream=False)
             msg = resp["message"]
             calls = msg.get("tool_calls") or []
-            reply = (msg.get("content") or "").strip()
-            last_content = reply or last_content
+            content = (msg.get("content") or "").strip()
+            if content:
+                texts.append(content)
             if not calls:
+                reply = content
                 break
+            used_tools = True
             messages.append(msg)
             for call in calls:
                 fn = call["function"]
@@ -174,10 +183,21 @@ class DirectAudioLLM:
                 result = self._call_tool(fn["name"], dict(fn["arguments"]))
                 messages.append({"role": "tool", "tool_name": fn["name"],
                                  "content": result})
+
+        # A tool round can yield no prose at all. Never go silent after
+        # moving the arm: fall back to earlier prose, else ask for a short
+        # confirmation (text-only, cheap) — the model still has the tool
+        # results in its history.
+        reply = reply or (texts[-1] if texts else "")
+        if not reply and used_tools:
+            messages.append({"role": "user", "content":
+                             "Briefly tell the user what you just did, in "
+                             "their spoken language, starting with its ISO "
+                             "code in brackets. 1 sentence."})
+            resp = self._client.chat(model=self._model, messages=messages,
+                                     think=False, stream=False)
+            reply = (resp["message"].get("content") or "").strip()
         elapsed = time.time() - start
-        # A tool round can end with an empty final message — fall back to the
-        # last text the model produced alongside its tool call.
-        reply = reply or last_content
 
         language = language_hint or "en"
         m = _LANG_TAG.match(reply)

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Callable, Union
 
+import numpy as np
 import sounddevice as sd
 from piper import PiperVoice
 
@@ -145,6 +146,8 @@ class VoiceOutput:
         self._interrupted = False
         self._lock = threading.Lock()
         self._dispatcher = EventDispatcher(owner="voice_output")
+        # Rolling window of the last ~1s of played samples, for scope views
+        self.out_waveform = np.zeros(24000, dtype=np.float32)
 
     # --- Event API ---
 
@@ -394,6 +397,9 @@ class VoiceOutput:
                 outdata[:, 0] = 0
                 if finished.is_set():
                     raise sd.CallbackStop
+            n = min(frames, len(self.out_waveform))
+            self.out_waveform = np.roll(self.out_waveform, -n)
+            self.out_waveform[-n:] = outdata[-n:, 0]
 
         emitted = False
 

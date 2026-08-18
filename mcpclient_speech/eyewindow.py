@@ -117,8 +117,36 @@ class EyeWindow:
                               "MIC", self.bg)
         self.vu_vad = VUMeter(self.win.fig, (0.070, 0.18, 0.030, 0.55),
                               "VAD", self.bg)
+        # End-of-utterance countdown: fills while you are silent; at the top
+        # the robot stops listening and starts processing. Blips pause it.
+        self.vu_sil = VUMeter(self.win.fig, (0.115, 0.18, 0.030, 0.55),
+                              "SIL", self.bg)
+        # Oscilloscope (top-left, mirroring the camera thumbnail): last ~1s
+        # of mic input (cyan) and TTS output (yellow), each normalized to
+        # its own recent peak.
+        self.scope_ax = self.win.fig.add_axes((0.02, 0.80, 0.22, 0.18),
+                                              xticks=[], yticks=[])
+        self.scope_ax.set_facecolor(gray(0.42))
+        for s in self.scope_ax.spines.values():
+            s.set_color(gray(0.3))
+            s.set_linewidth(0.8)
+        self._scope_n = 400
+        self.scope_ax.set_xlim(0, self._scope_n - 1)
+        self.scope_ax.set_ylim(-1.05, 1.05)
+        x = np.arange(self._scope_n)
+        self.scope_out = self.scope_ax.plot(
+            x, np.zeros(self._scope_n), color=(0.95, 0.78, 0.15),
+            linewidth=0.7)[0]
+        self.scope_in = self.scope_ax.plot(
+            x, np.zeros(self._scope_n), color=(0.15, 0.75, 0.9),
+            linewidth=0.7)[0]
+        self.scope_ax.text(0.02, 0.03, "in", color=(0.15, 0.75, 0.9),
+                           fontsize=7, transform=self.scope_ax.transAxes)
+        self.scope_ax.text(0.10, 0.03, "out", color=(0.95, 0.78, 0.15),
+                           fontsize=7, transform=self.scope_ax.transAxes)
         self._audio_monitor = None
         self._voice_input = None
+        self._voice_output = None
         self.win.set_background(self.bg)
         self.win.register_target((0.15, 0.1, 0.7, 0.7), self)
         self.win.add_resize_callback(self.resize)
@@ -185,13 +213,27 @@ class EyeWindow:
         if self.func2:
             self.func2(event, self.obj)
 
-    def set_audio_sources(self, audio_monitor=None, voice_input=None):
-        """Attach the level sources for the VU meters: an AudioMonitor
-        (rms/peak) and/or a VoiceInput (vad_prob/vad_threshold)."""
+    def set_audio_sources(self, audio_monitor=None, voice_input=None,
+                          voice_output=None):
+        """Attach the sources for the VU meters and the scope: an
+        AudioMonitor (rms/peak/waveform), a VoiceInput
+        (vad_prob/vad_threshold/silence_progress) and a VoiceOutput
+        (out_waveform)."""
         self._audio_monitor = audio_monitor
         self._voice_input = voice_input
+        self._voice_output = voice_output
         if voice_input is not None:
             self.vu_vad.set_threshold(voice_input.vad_threshold)
+
+    @staticmethod
+    def _scope_trace(waveform, npoints):
+        """Downsample a waveform to npoints and normalize to its own peak."""
+        step = max(1, len(waveform) // npoints)
+        y = waveform[::step][:npoints]
+        if len(y) < npoints:
+            y = np.pad(y, (npoints - len(y), 0))
+        peak = float(np.max(np.abs(y)))
+        return y / peak if peak > 0.02 else y
 
     def _update_meters(self):
         m = self._audio_monitor
@@ -213,6 +255,18 @@ class EyeWindow:
             active = p >= v.vad_threshold
             color = (0.1, 0.75, 0.9) if active else (0.7, 0.45, 0.1)
             self.vu_vad.update(p, color)
+            sp = getattr(v, "silence_progress", 0.0)
+            sil_color = (0.9, 0.3, 0.2) if sp > 0.75 else (0.55, 0.55, 0.85)
+            remaining = (1.0 - sp) * v._vad_silence_ms / 1000.0
+            self.vu_sil.update(sp, sil_color,
+                               text=f"{remaining:.1f}" if sp > 0 else "")
+        m = self._audio_monitor
+        if m is not None and hasattr(m, "waveform"):
+            self.scope_in.set_ydata(self._scope_trace(m.waveform, self._scope_n))
+        vo = self._voice_output
+        if vo is not None and hasattr(vo, "out_waveform"):
+            self.scope_out.set_ydata(
+                self._scope_trace(vo.out_waveform, self._scope_n))
 
     def check_events(self):
         if self.camwin is not None:

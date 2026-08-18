@@ -632,11 +632,6 @@ async def main(args):
         listener.paused = True
         print('Continuous listener started')
 
-        # VU meters in the eye window: mic level + VAD probability
-        audio_monitor = AudioMonitor()
-        audio_monitor.start()
-        win.set_audio_sources(audio_monitor, voice_in)
-
         ### Initialize voice_output (piper TTS)
         voice_out = VoiceOutput()
         print('Loading piper model...')
@@ -644,6 +639,12 @@ async def main(args):
         if not voice_out.ready:
             print('Failed to load piper model')
             return False
+
+        # Debug panel in the eye window: VU meters (mic level, VAD
+        # probability, silence countdown) + in/out oscilloscope
+        audio_monitor = AudioMonitor()
+        audio_monitor.start()
+        win.set_audio_sources(audio_monitor, voice_in, voice_out)
 
         ### Initialize the face_tracker here, with on_face_change as callback
         # Tuning comes from face/face_config.toml [tracker]; CLI flags override.

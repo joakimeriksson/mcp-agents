@@ -43,7 +43,7 @@ GEMMA_HOST = "http://localhost:11434"
 SAMPLE_RATE = 16000
 RECORD_SECONDS = 4
 VAD_THRESHOLD = 0.7
-VAD_SILENCE_MS = 1200
+VAD_SILENCE_MS = 800
 VAD_RESUME_MS = 130   # speech must sustain this long to reset the silence countdown
 VAD_MAX_SPEECH_S = 15
 VAD_PRE_SPEECH_MS = 500
@@ -197,6 +197,8 @@ class AudioMonitor:
         self.rms: float = 0.0
         self.peak: float = 0.0
         self.max_seen: float = 0.001
+        # Rolling window of the last ~1s of raw mic samples, for scope views
+        self.waveform = np.zeros(sample_rate, dtype=np.float32)
         self._sample_rate = sample_rate
         self._decay = decay
         self._device = device
@@ -214,6 +216,9 @@ class AudioMonitor:
                 self.peak = rms
             else:
                 self.peak = self.peak * self._decay
+            n = min(len(indata), len(self.waveform))
+            self.waveform = np.roll(self.waveform, -n)
+            self.waveform[-n:] = indata[-n:, 0]
 
         self._stream = sd.InputStream(
             samplerate=self._sample_rate, channels=1, dtype='float32',
@@ -519,6 +524,9 @@ class VoiceInput:
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
         self.last_audio: Optional[np.ndarray] = None  # last captured utterance
+        # Live end-of-utterance countdown: 0.0 (no trailing silence yet) to
+        # 1.0 (silence long enough — utterance ends). For debug meters.
+        self.silence_progress: float = 0.0
 
         self._dispatcher = EventDispatcher(owner="voice_input")
 
@@ -723,6 +731,7 @@ class VoiceInput:
         self._ensure_vad()
         self.listen_phase = "waiting"
         self.vad_prob = 0.0
+        self.silence_progress = 0.0
         self._cancel_listen = False
         self._flush_listen = False
 
@@ -795,6 +804,7 @@ class VoiceInput:
                     if speech_prob < self._vad_threshold:
                         speech_run = 0
                         silence_count += 1
+                        self.silence_progress = silence_count / silence_chunks_needed
                         if silence_count >= silence_chunks_needed:
                             duration_ms = len(speech_chunks) * chunk_ms
                             self._emit(VoiceEventType.VAD_SPEECH_END,
@@ -805,6 +815,7 @@ class VoiceInput:
                         if speech_run >= resume_chunks_needed:
                             # Sustained speech — the person really resumed.
                             silence_count = 0
+                            self.silence_progress = 0.0
                         # else: sub-word blip — pause the countdown for the
                         # blip's own duration, but don't restart it.
 
@@ -816,6 +827,7 @@ class VoiceInput:
         finally:
             stream.stop()
             stream.close()
+            self.silence_progress = 0.0
 
         if not speech_chunks:
             self.listen_phase = ""

@@ -18,5 +18,10 @@ dependencies = [
     "piper-tts",
     "opencv-python",
     "face-recognition",
+    # The shared face_tracker (../face) defaults to the InsightFace backend
+    "insightface>=1.0.1,<2",
     "onnxruntime",
+    "soundfile>=0.14.0",
+    "ollama>=0.6.2",
+    "requests>=2.34.2",
 ]

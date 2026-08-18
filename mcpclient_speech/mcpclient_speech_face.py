@@ -27,7 +27,10 @@ if _FACE_DIR not in sys.path:
 
 from readnb import *
 from eyewindow import *
-from voice_input import VoiceInput, ContinuousListener, VoiceEventType, list_input_devices
+from voice_input import (
+    VoiceInput, ContinuousListener, VoiceEventType, AudioMonitor,
+    list_input_devices,
+)
 from voice_output import VoiceOutput
 from face_tracker import (
     FaceTracker, FaceDatabase, FaceEventType,
@@ -164,6 +167,10 @@ def parse_args():
                       help='Max |pitch| degrees for the focused face to count as engaged')
     tune.add_argument('--engage-dwell-seconds', type=float, default=None,
                       help='Seconds the focused face must face the camera before FACE_ENGAGED')
+
+    parser.add_argument('--debug-audio', action='store_true', default=None,
+                        help='Show the audio debug panel (VU meters + oscilloscope) '
+                             'in the eye window (default from config [debug] audio_panel)')
 
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument('--log-file', default=None, help='Log every interaction event to this JSONL file (overwrites on each run)')
@@ -576,7 +583,7 @@ async def main(args):
                  'listen':    ((0, 0.6, 0.8), "Listening", ""),
                  'greet':     ((0.9, 0.5, 0), "Contact", "Please wait"),
                  'process':   ((0.9, 0.5, 0), "Processing", "Please wait"),
-                 'talk':      ((0.95, 0.75, 0), "~~~", ""),
+                 'talk':      ((0.95, 0.75, 0), "Speaking", ""),
                  'muted':     ((0.4, 0.4, 0.4), "MUTED", "Press 'm' to unmute"),
                  }
         if has_name:
@@ -584,7 +591,7 @@ async def main(args):
             name = tmp[0].text
         else:
             name = "MCP Speech Client"
-        win = EyeWindow(name, sdict, 'ready')
+        win = EyeWindow(name, sdict, 'ready', debug=args.debug_audio)
         win.set_exit_callback(on_exit, state)
         win.keydict["m"] = (kp_toggle_mute, None)
         win.keydict[" "] = (kp_force_process, None)
@@ -636,6 +643,13 @@ async def main(args):
         if not voice_out.ready:
             print('Failed to load piper model')
             return False
+
+        # Debug panel in the eye window: VU meters (mic level, VAD
+        # probability, silence countdown) + in/out oscilloscope
+        if args.debug_audio:
+            audio_monitor = AudioMonitor(device=args.mic)
+            audio_monitor.start()
+            win.set_audio_sources(audio_monitor, voice_in, voice_out)
 
         ### Initialize the face_tracker here, with on_face_change as callback
         # Tuning comes from face/face_config.toml [tracker]; CLI flags override.
@@ -762,6 +776,16 @@ async def main(args):
         # When listening, sound triggers -> process (above)
         # Face out of focus -> wait
 
+        # Persistent UI pump: repaints the eye window (state changes, VU
+        # meters, camera thumbnail) whenever the main coroutine is awaiting —
+        # e.g. during LLM inference or MCP tool calls. Without it the
+        # 'Processing' state never gets painted before the blocking work.
+        async def _pump_ui():
+            while state.get('currstate') != 'exit':
+                win.check_events()
+                await asyncio.sleep(0.03)
+        pump_task = asyncio.ensure_future(_pump_ui())
+
         set_state(state, 'wait')
         newstate = False
         prompt_source = None
@@ -857,7 +881,10 @@ async def main(args):
                       messages_sent=msg,
                       tool_count=len(tools or []))
                 try:
-                    response = openai.chat.completions.create(
+                    # In a thread so the UI pump keeps the window alive during
+                    # inference (and 'Processing' actually shows).
+                    response = await asyncio.to_thread(
+                        openai.chat.completions.create,
                         model=model,
                         messages=msg,
                         tools=tools,
@@ -931,7 +958,8 @@ async def main(args):
                           messages_sent=msg,
                           tool_count=len(tools or []))
                     try:
-                        response = openai.chat.completions.create(
+                        response = await asyncio.to_thread(
+                            openai.chat.completions.create,
                             model=model,
                             messages=msg,
                             tools=tools,
@@ -1041,6 +1069,8 @@ def run():
         args.mic = cfg["devices"].get("microphone")
 
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
+    if args.debug_audio is None:
+        args.debug_audio = cfg["debug"].get("audio_panel", False)
 
     # Resolve camera index (auto-detect if still None after config)
     if args.camera is None:

@@ -3,14 +3,15 @@ Voice input module: microphone monitoring, VAD, recording, and transcription.
 
 Provides:
 - AudioMonitor: real-time mic level (RMS, peak, dB)
-- VoiceInput: VAD-based speech detection + whisper transcription
+- VoiceInput: VAD-based speech detection + transcription (Gemma 4 native audio
+  by default, faster-whisper optional via stt_backend="whisper")
 - ContinuousListener: always-on background listening
 - Typed event system with subscribe/unsubscribe
 
 Does NOT handle TTS (text-to-speech) or conversation logic.
 
 Can be run standalone:
-    python voice_input.py [--whisper-model base] [--vad-threshold 0.7]
+    python voice_input.py [--backend gemma4|whisper] [--vad-threshold 0.7]
 """
 
 import numpy as np
@@ -26,17 +27,24 @@ from datetime import datetime
 from typing import Optional, Callable, Union
 
 import sounddevice as sd
-from faster_whisper import WhisperModel
 
 from events import EventDispatcher
 
 logger = logging.getLogger("voice_input")
 
 # Default constants
+STT_BACKEND = "gemma4"        # "gemma4" (native audio), "whisper", or "raw"
+
+# Marker emitted instead of a transcription by the "raw" backend: the audio is
+# kept on VoiceInput.last_audio for a direct-audio consumer (see direct_llm.py).
+RAW_AUDIO_TEXT = "<<raw-audio>>"
+GEMMA_MODEL = "gemma4:latest"   # audio-capable variant; gemma4:26b is text-only
+GEMMA_HOST = "http://localhost:11434"
 SAMPLE_RATE = 16000
 RECORD_SECONDS = 4
 VAD_THRESHOLD = 0.7
-VAD_SILENCE_MS = 1200
+VAD_SILENCE_MS = 800
+VAD_RESUME_MS = 130   # speech must sustain this long to reset the silence countdown
 VAD_MAX_SPEECH_S = 15
 VAD_PRE_SPEECH_MS = 500
 AUDIO_METER_DECAY = 0.92
@@ -189,6 +197,8 @@ class AudioMonitor:
         self.rms: float = 0.0
         self.peak: float = 0.0
         self.max_seen: float = 0.001
+        # Rolling window of the last ~1s of raw mic samples, for scope views
+        self.waveform = np.zeros(sample_rate, dtype=np.float32)
         self._sample_rate = sample_rate
         self._decay = decay
         self._device = device
@@ -206,6 +216,9 @@ class AudioMonitor:
                 self.peak = rms
             else:
                 self.peak = self.peak * self._decay
+            n = min(len(indata), len(self.waveform))
+            self.waveform = np.roll(self.waveform, -n)
+            self.waveform[-n:] = indata[-n:, 0]
 
         self._stream = sd.InputStream(
             samplerate=self._sample_rate, channels=1, dtype='float32',
@@ -462,28 +475,39 @@ class VoiceInput:
     """
 
     def __init__(self, *,
+                 stt_backend: str = STT_BACKEND,
+                 gemma_model: str = GEMMA_MODEL,
+                 gemma_host: str = GEMMA_HOST,
+                 stt_fallback: bool = True,
                  whisper_model_size: str = "medium",
                  whisper_compute_type: str = "float16",
                  sample_rate: int = SAMPLE_RATE,
                  vad_threshold: float = VAD_THRESHOLD,
                  vad_silence_ms: int = VAD_SILENCE_MS,
+                 vad_resume_ms: int = VAD_RESUME_MS,
                  vad_max_speech_s: float = VAD_MAX_SPEECH_S,
                  vad_pre_speech_ms: int = VAD_PRE_SPEECH_MS,
                  noise_reduce: bool = NOISE_REDUCE,
                  record_seconds: int = RECORD_SECONDS,
                  device: int | None = None):
+        self._stt_backend = stt_backend
+        self._gemma_model = gemma_model
+        self._gemma_host = gemma_host
+        self._stt_fallback = stt_fallback
         self._whisper_size = whisper_model_size
         self._whisper_compute = whisper_compute_type
         self._sample_rate = sample_rate
         self._device = device
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
+        self._vad_resume_ms = vad_resume_ms
         self._vad_max_speech_s = vad_max_speech_s
         self._vad_pre_speech_ms = vad_pre_speech_ms
         self._noise_reduce = noise_reduce
         self._record_seconds = record_seconds
 
         self._whisper_model = None
+        self._transcriber = None   # active STT engine (whisper or gemma4)
         self._vad_model = None
         self._loading = False
         self._ready = False
@@ -499,6 +523,10 @@ class VoiceInput:
         self._save_dir: str = "recordings"
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
+        self.last_audio: Optional[np.ndarray] = None  # last captured utterance
+        # Live end-of-utterance countdown: 0.0 (no trailing silence yet) to
+        # 1.0 (silence long enough — utterance ends). For debug meters.
+        self.silence_progress: float = 0.0
 
         self._dispatcher = EventDispatcher(owner="voice_input")
 
@@ -545,15 +573,73 @@ class VoiceInput:
         self._load_models()
 
     def _load_models(self):
+        if self._stt_backend == "raw":
+            self._load_raw()
+        elif self._stt_backend == "gemma4":
+            self._load_gemma4()
+        else:
+            self._load_whisper()
+        self._ready = self._transcriber is not None
+        self._loading = False
+
+    def _load_gemma4(self):
+        self._emit(VoiceEventType.MODEL_LOADING, ModelLoadingPayload("gemma4"))
+        try:
+            logger.info(f"Connecting Gemma 4 STT ({self._gemma_model})...")
+            from gemma_stt import Gemma4Transcriber
+            transcriber = Gemma4Transcriber(model=self._gemma_model,
+                                            host=self._gemma_host,
+                                            sample_rate=self._sample_rate)
+            transcriber.check()  # verify Ollama up + model pulled + audio-capable
+            self._transcriber = transcriber
+            self._load_error = None
+            self._emit(VoiceEventType.MODEL_READY,
+                       ModelReadyPayload("gemma4", self._gemma_model))
+            logger.info("Gemma 4 STT ready.")
+        except Exception as e:
+            self._emit(VoiceEventType.MODEL_LOAD_FAILED,
+                       ModelLoadFailedPayload("gemma4", str(e)))
+            logger.error(f"Failed to init Gemma 4 STT: {e}")
+            if self._stt_fallback:
+                logger.warning("Falling back to Whisper STT...")
+                self._load_whisper()   # sets _transcriber + clears _load_error on success
+                if self._transcriber is not None:
+                    self._load_error = None
+                    return
+            self._load_error = (
+                f"Failed to init Gemma 4 STT {self._gemma_model!r} "
+                f"at {self._gemma_host}: {e}")
+
+    def _load_raw(self):
+        """No STT: VAD only. Every utterance 'transcribes' to RAW_AUDIO_TEXT
+        instantly and the waveform stays on ``self.last_audio`` — for the
+        direct-audio path where the conversation model hears the audio itself."""
+        from gemma_stt import Segment, TranscriptionInfo
+
+        class _RawPassthrough:
+            def transcribe(self, audio, beam_size=None):
+                duration = len(audio) / SAMPLE_RATE if len(audio) else 0.0
+                return ([Segment(text=RAW_AUDIO_TEXT, start=0.0, end=duration)],
+                        TranscriptionInfo(language="", language_probability=0.0))
+
+        self._transcriber = _RawPassthrough()
+        self._load_error = None
+        self._emit(VoiceEventType.MODEL_READY, ModelReadyPayload("raw", "vad-only"))
+        logger.info("Raw-audio mode: VAD only, no STT on the critical path.")
+
+    def _load_whisper(self):
         self._emit(VoiceEventType.MODEL_LOADING, ModelLoadingPayload("whisper"))
         try:
             logger.info(f"Loading whisper model ({self._whisper_size})...")
             import torch
+            from faster_whisper import WhisperModel
             device = "cuda" if torch.cuda.is_available() else "cpu"
             compute_type = self._whisper_compute if device == "cuda" else "int8"
             self._whisper_model = WhisperModel(self._whisper_size,
                                                compute_type=compute_type,
                                                device=device)
+            self._transcriber = self._whisper_model
+            self._load_error = None
             self._emit(VoiceEventType.MODEL_READY,
                        ModelReadyPayload("whisper", f"{self._whisper_size} ({self._whisper_compute})"))
             logger.info("Whisper model loaded.")
@@ -565,8 +651,11 @@ class VoiceInput:
                        ModelLoadFailedPayload("whisper", str(e)))
             logger.error(f"Failed to load whisper: {e}")
 
-        self._ready = self._whisper_model is not None
-        self._loading = False
+    def _transcribe(self, audio):
+        """Run the active STT backend. Returns (segments, info) like whisper."""
+        if self._whisper_model is not None:
+            return self._whisper_model.transcribe(audio, beam_size=5)
+        return self._transcriber.transcribe(audio)
 
     def _ensure_vad(self):
         if self._vad_model is not None:
@@ -642,6 +731,7 @@ class VoiceInput:
         self._ensure_vad()
         self.listen_phase = "waiting"
         self.vad_prob = 0.0
+        self.silence_progress = 0.0
         self._cancel_listen = False
         self._flush_listen = False
 
@@ -651,12 +741,16 @@ class VoiceInput:
         chunk_ms = 32
         chunk_samples = 512
         silence_chunks_needed = int(self._vad_silence_ms / chunk_ms)
+        # Debounce: a blip shorter than this (breath, chair creak — too short
+        # to be a word) must not restart the whole silence countdown.
+        resume_chunks_needed = max(1, int(self._vad_resume_ms / chunk_ms))
         max_chunks = int(self._vad_max_speech_s * 1000 / chunk_ms)
         pre_speech_chunks = int(self._vad_pre_speech_ms / chunk_ms)
 
         pre_buffer = collections.deque(maxlen=pre_speech_chunks)
         speech_chunks = []
         silence_count = 0
+        speech_run = 0     # consecutive speech chunks within trailing silence
         speech_started = False
         total_chunks = 0
 
@@ -708,14 +802,22 @@ class VoiceInput:
                 else:
                     speech_chunks.append(chunk.copy())
                     if speech_prob < self._vad_threshold:
+                        speech_run = 0
                         silence_count += 1
+                        self.silence_progress = silence_count / silence_chunks_needed
                         if silence_count >= silence_chunks_needed:
                             duration_ms = len(speech_chunks) * chunk_ms
                             self._emit(VoiceEventType.VAD_SPEECH_END,
                                        VadSpeechEndPayload(duration_ms, speech_prob))
                             break
                     else:
-                        silence_count = 0
+                        speech_run += 1
+                        if speech_run >= resume_chunks_needed:
+                            # Sustained speech — the person really resumed.
+                            silence_count = 0
+                            self.silence_progress = 0.0
+                        # else: sub-word blip — pause the countdown for the
+                        # blip's own duration, but don't restart it.
 
                     if len(speech_chunks) >= max_chunks:
                         duration_ms = len(speech_chunks) * chunk_ms
@@ -725,6 +827,7 @@ class VoiceInput:
         finally:
             stream.stop()
             stream.close()
+            self.silence_progress = 0.0
 
         if not speech_chunks:
             self.listen_phase = ""
@@ -758,10 +861,11 @@ class VoiceInput:
             except Exception as e:
                 logger.warning(f"Noise reduction failed: {e}")
 
+        self.last_audio = audio  # kept for direct-audio consumers (raw backend)
         self._emit(VoiceEventType.TRANSCRIPTION_STARTED,
                    TranscriptionStartedPayload(audio_duration_ms, noise_reduced))
 
-        segments, info = self._whisper_model.transcribe(audio, beam_size=5)
+        segments, info = self._transcribe(audio)
         self.detected_language = info.language
         self.detected_language_prob = info.language_probability
 
@@ -810,10 +914,11 @@ class VoiceInput:
             except Exception as e:
                 logger.warning(f"Noise reduction failed: {e}")
 
+        self.last_audio = audio  # kept for direct-audio consumers (raw backend)
         self._emit(VoiceEventType.TRANSCRIPTION_STARTED,
                    TranscriptionStartedPayload(audio_duration_ms, noise_reduced))
 
-        segments, info = self._whisper_model.transcribe(audio, beam_size=5)
+        segments, info = self._transcribe(audio)
         self.detected_language = info.language
         self.detected_language_prob = info.language_probability
 
@@ -952,6 +1057,13 @@ _EVENT_COLORS = {
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone voice input (STT)")
+    parser.add_argument("--backend", default=STT_BACKEND,
+                        choices=["gemma4", "whisper"],
+                        help="STT backend (default: gemma4 native audio)")
+    parser.add_argument("--gemma-model", default=GEMMA_MODEL,
+                        help="Ollama model for the gemma4 backend")
+    parser.add_argument("--no-stt-fallback", action="store_true",
+                        help="Do not fall back to Whisper if the gemma4 model lacks audio")
     parser.add_argument("--whisper-model", default="base", help="Whisper model size")
     parser.add_argument("--vad-threshold", type=float, default=0.7)
     parser.add_argument("--no-continuous", action="store_true",
@@ -966,6 +1078,9 @@ def main():
                         datefmt="%H:%M:%S")
 
     voice = VoiceInput(
+        stt_backend=args.backend,
+        gemma_model=args.gemma_model,
+        stt_fallback=not args.no_stt_fallback,
         whisper_model_size=args.whisper_model,
         vad_threshold=args.vad_threshold,
         noise_reduce=not args.no_noise_reduce,

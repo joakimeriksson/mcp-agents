@@ -20,7 +20,7 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from pydantic_ai import Agent as PydanticAgent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -81,7 +81,9 @@ class ConversationLLM:
                  mcp_servers: Optional[list] = None,
                  mcp_descriptions: Optional[list[str]] = None,
                  agent_name: str = "Face Agent",
-                 smart_greetings: bool = False):
+                 smart_greetings: bool = False,
+                 service_prompt: Optional[str] = None,
+                 augmentation_provider: Optional[Callable[[str], Optional[str]]] = None):
         provider = OpenAIProvider(base_url=ollama_url, api_key="ollama")
         model = OpenAIChatModel(model_name, provider=provider)
         self._model = model
@@ -90,6 +92,10 @@ class ConversationLLM:
         self._mcp_servers = mcp_servers or []
         self._agent_name = agent_name
         self._smart_greetings = smart_greetings
+        self._service_prompt = service_prompt
+        # Called before each response with the language code; returns fresh
+        # service state (e.g. candy positions) to inject before the user turn.
+        self._augmentation_provider = augmentation_provider
 
         # Build capabilities text from MCP descriptions
         if mcp_descriptions:
@@ -157,6 +163,8 @@ class ConversationLLM:
             time=datetime.now().strftime("%H:%M"),
             capabilities=self._capabilities,
         )
+        if self._service_prompt:
+            system += f"\n\nYour service role:\n{self._service_prompt}"
         return PydanticAgent(
             self._model,
             system_prompt=system,
@@ -272,8 +280,16 @@ Emotion: {emotion or 'neutral'}"""
         else:
             context = "Unknown person."
 
+        augmentation = ""
+        if self._augmentation_provider:
+            aug = self._augmentation_provider(language)
+            if aug:
+                augmentation = (f"Current state from your service "
+                                f"(internal — never read it out verbatim):\n"
+                                f"{aug}\n\n")
+
         lang_name = self._LANG_NAMES.get(language, language)
-        prompt = f"""They said: "{heard_text}"
+        prompt = f"""{augmentation}They said: "{heard_text}"
 {context}
 
 You MUST reply in {lang_name}. Keep it to 1-2 short sentences. Address them by name when it fits. You may reference what you already know about them (facts, earlier conversation) if it makes the reply more personal."""

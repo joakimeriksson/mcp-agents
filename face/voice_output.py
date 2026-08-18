@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Callable, Union
 
+import numpy as np
 import sounddevice as sd
 from piper import PiperVoice
 
@@ -37,11 +38,13 @@ PIPER_MODEL_NAME = "en_US-lessac-medium"
 
 from languages_config import (
     get_language_models, get_language_pronunciations, get_default_language,
+    get_language_tts_servers,
 )
 
 LANGUAGE_MODELS = get_language_models()
 DEFAULT_LANGUAGE = get_default_language()
 LANG_PRONUNCIATIONS = get_language_pronunciations()
+LANGUAGE_TTS_SERVERS = get_language_tts_servers()
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +56,7 @@ class TtsEventType(Enum):
     MODEL_READY = auto()
     MODEL_LOAD_FAILED = auto()
     TTS_STARTED = auto()
+    TTS_AUDIO_START = auto()  # first real audio sample reached the output device
     TTS_FINISHED = auto()
     TTS_BUSY = auto()       # speak() called while already speaking
 
@@ -80,6 +84,13 @@ class TtsStartedPayload:
 
 
 @dataclass(frozen=True)
+class TtsAudioStartPayload:
+    text: str
+    synth_latency_s: float   # speak() start -> first audible sample
+    audio_start_ts: float    # absolute time.time() of the first audible sample
+
+
+@dataclass(frozen=True)
 class TtsFinishedPayload:
     text: str
     duration_s: float
@@ -92,7 +103,7 @@ class TtsBusyPayload:
 
 TtsEventPayload = Union[
     ModelLoadingPayload, ModelReadyPayload, ModelLoadFailedPayload,
-    TtsStartedPayload, TtsFinishedPayload, TtsBusyPayload,
+    TtsStartedPayload, TtsAudioStartPayload, TtsFinishedPayload, TtsBusyPayload,
 ]
 
 
@@ -123,6 +134,7 @@ class VoiceOutput:
         self._model_dir = model_dir
         self._default_model = model_name
         self._language_models = dict(language_models or LANGUAGE_MODELS)
+        self._tts_servers = dict(LANGUAGE_TTS_SERVERS)
         self._lang_pron = LANG_PRONUNCIATIONS
         # Loaded PiperVoice instances keyed by model name
         self._voices: dict[str, PiperVoice] = {}
@@ -134,6 +146,11 @@ class VoiceOutput:
         self._interrupted = False
         self._lock = threading.Lock()
         self._dispatcher = EventDispatcher(owner="voice_output")
+        # Rolling window of the last ~1s of played samples, for scope views.
+        # Resized to the active stream's sample rate at playback time so the
+        # buffer always spans exactly one second regardless of engine.
+        self.out_waveform = np.zeros(24000, dtype=np.float32)
+        self.out_last_write = 0.0   # time.time() of the last playback write
 
     # --- Event API ---
 
@@ -265,18 +282,44 @@ class VoiceOutput:
             return
 
         try:
-            voice = self._get_voice(language)
-            if voice is None:
-                logger.warning(f"TTS not ready, would say: {text}")
-                return
+            # Normalize: no/unknown language means the default language —
+            # otherwise a caller passing None/False/"hi" silently bypasses
+            # the configured TTS server and lands on the default Piper voice.
+            if (not language or (language not in self._tts_servers
+                                 and language not in self._language_models)):
+                language = DEFAULT_LANGUAGE
+            server = self._tts_servers.get(language)
+            voice = None
+            if server is None:
+                voice = self._get_voice(language)
+                if voice is None:
+                    logger.warning(f"TTS not ready, would say: {text}")
+                    return
             self._speaking = True
             self._interrupted = False
             self._stop_event.clear()
-            tts_text = self._apply_pronunciations(text, language)
+            # Pronunciation replacements are piper-specific phonetic hacks —
+            # the HTTP server (Kokoro, real g2p) gets the raw text instead.
+            tts_text = text if server is not None \
+                else self._apply_pronunciations(text, language)
             start = time.time()
             self._emit(TtsEventType.TTS_STARTED,
                        TtsStartedPayload(text, tts_text if tts_text != text else None))
-            self._play(tts_text, voice)
+            if server is not None:
+                try:
+                    audio, sr = self._http_synth(tts_text, language, server)
+                    self._play_stream(text, iter([audio]), sr)
+                except Exception as e:
+                    logger.warning(
+                        f"HTTP TTS ({server['url']}) failed: {e} — "
+                        f"falling back to piper")
+                    voice = self._get_voice(language)
+                    if voice is None:
+                        logger.warning(f"TTS not ready, would say: {text}")
+                        return
+                    self._play(self._apply_pronunciations(text, language), voice)
+            else:
+                self._play(tts_text, voice)
             duration = time.time() - start
             self._emit(TtsEventType.TTS_FINISHED,
                        TtsFinishedPayload(text, duration))
@@ -291,17 +334,63 @@ class VoiceOutput:
         threading.Thread(target=self.speak, args=(text, language),
                          daemon=True).start()
 
+    def _http_synth(self, text: str, language: Optional[str], server: dict):
+        """Synthesize via an OpenAI-compatible /v1/audio/speech server.
+
+        Returns (float32 mono numpy array, sample_rate). Raises on any
+        network/decode error so the caller can fall back to piper.
+        """
+        import io
+        import wave
+        import numpy as np
+        import requests
+
+        body = {"input": text, "response_format": "wav"}
+        if server.get("voice"):
+            body["voice"] = server["voice"]
+        # Advisory, not authoritative: the client's per-turn language
+        # detection is flaky (a Swedish turn mislabeled 'it' would make the
+        # server speak Swedish text through the Italian pipeline). The server
+        # detects the language from the reply text itself — lingua restricted
+        # to its allow-list, with this hint only breaking low-confidence ties
+        # (the machinery debugged in reachy_mini_conversation_app).
+        if language:
+            body["language_hint"] = language
+        resp = requests.post(server["url"], json=body, timeout=60)
+        resp.raise_for_status()
+        with wave.open(io.BytesIO(resp.content)) as wf:
+            if wf.getsampwidth() != 2 or wf.getnchannels() != 1:
+                raise ValueError(
+                    f"expected mono PCM16 wav, got {wf.getnchannels()}ch "
+                    f"{wf.getsampwidth() * 8}-bit")
+            sr = wf.getframerate()
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+        return pcm.astype("float32") / 32768.0, sr
+
     def _play(self, text: str, voice: PiperVoice):
-        sr = voice.config.sample_rate
+        self._play_stream(
+            text,
+            (chunk.audio_float_array for chunk in voice.synthesize(text)),
+            voice.config.sample_rate,
+        )
+
+    def _play_stream(self, text: str, chunks, sr: int):
+        if len(self.out_waveform) != sr:
+            # keep the scope window at exactly 1s for this stream's rate
+            self.out_waveform = np.zeros(sr, dtype=np.float32)
         buffer = collections.deque()
         finished = threading.Event()
         stop = self._stop_event
+        play_start = time.time()
+        first_audio = {}   # 't' set (in the audio thread) at the first audible sample
 
         def callback(outdata, frames, time_info, status):
             if stop.is_set():
                 outdata[:, 0] = 0
                 raise sd.CallbackStop
             if buffer:
+                if "t" not in first_audio:        # first real sample leaving the device
+                    first_audio["t"] = time.time()
                 chunk = buffer.popleft()
                 if len(chunk) < frames:
                     outdata[:len(chunk), 0] = chunk
@@ -314,18 +403,34 @@ class VoiceOutput:
                 outdata[:, 0] = 0
                 if finished.is_set():
                     raise sd.CallbackStop
+            n = min(frames, len(self.out_waveform))
+            self.out_waveform = np.roll(self.out_waveform, -n)
+            self.out_waveform[-n:] = outdata[-n:, 0]
+            self.out_last_write = time.time()
+
+        emitted = False
+
+        def _maybe_emit_audio_start():
+            nonlocal emitted
+            if not emitted and "t" in first_audio:
+                ts = first_audio["t"]
+                self._emit(TtsEventType.TTS_AUDIO_START,
+                           TtsAudioStartPayload(text, ts - play_start, ts))
+                emitted = True
 
         stream = sd.OutputStream(
             samplerate=sr, channels=1, dtype="float32",
             blocksize=4096, callback=callback,
         )
         stream.start()
-        for audio_chunk in voice.synthesize(text):
+        for audio_chunk in chunks:
             if stop.is_set():
                 break
-            buffer.append(audio_chunk.audio_float_array)
+            buffer.append(audio_chunk)
+            _maybe_emit_audio_start()
         finished.set()
         while stream.active:
+            _maybe_emit_audio_start()
             if stop.is_set():
                 stream.abort()
                 break

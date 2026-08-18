@@ -4,7 +4,7 @@ from pathlib import Path
 
 _DEFAULTS: dict = {
     "llm": {
-        "model": "PetrosStav/gemma3-tools:12b",
+        "model": "gemma4:latest",
         "base_url": "http://localhost:11434/v1/",
         "api_key": "ollama",
     },
@@ -14,6 +14,11 @@ _DEFAULTS: dict = {
     "devices": {
         "microphone": None,
         "camera": None,
+    },
+    "debug": {
+        # Audio debug panel in the eye window: VU meters (mic/VAD/silence
+        # countdown) + in/out oscilloscope. Widens the window slightly.
+        "audio_panel": False,
     },
 }
 

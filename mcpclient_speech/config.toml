@@ -5,7 +5,7 @@ api_key  = "ollama"
 direct_audio = true    # speech straight into gemma4 (one call: hear + think + tools)
 
 [face]
-omit_names_and_prefs = false
+omit_names_and_prefs = true    # skip "vad heter du?" and the per-person distillation LLM call
 
 [devices]
 # camera     = 0   # uncomment to set default camera index (face client only)

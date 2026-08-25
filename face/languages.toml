@@ -44,11 +44,6 @@ ask_name = [
     "Hey! What's your name?",
 ]
 
-[languages.en.pronunciations]
-Niclas = "Nick-lass"
-Joakim = "Yo-ah-kim"
-Anders = "Ahn-ders"
-
 [languages.en.interview]
 favourite_candy = [
     "Hi {name}! What's your favourite candy?",
@@ -171,11 +166,6 @@ ask_name = [
     "Hey ! Quel est ton prénom ?",
 ]
 
-[languages.fr.pronunciations]
-Niclas = "Nick-lasse"
-Joakim = "Yo-akim"
-Anders = "Ann-dèrss"
-
 [languages.fr.interview]
 favourite_colour = [
     "Salut {name} ! Quelle est ta couleur préférée ?",
@@ -224,11 +214,6 @@ ask_name = [
     "¡Hola, no creo que nos conozcamos! ¿Cómo te llamas?",
     "¡Hey! ¿Cuál es tu nombre?",
 ]
-
-[languages.es.pronunciations]
-Niclas = "Nick-las"
-Joakim = "Yo-akim"
-Anders = "An-ders"
 
 [languages.es.interview]
 favourite_colour = [
@@ -330,11 +315,6 @@ ask_name = [
     "Ehi, non credo che ci siamo già incontrati — come ti chiami?",
     "Ciao! Qual è il tuo nome?",
 ]
-
-[languages.it.pronunciations]
-Niclas = "Nick-lass"
-Joakim = "Yo-akim"
-Anders = "An-ders"
 
 [languages.it.interview]
 favourite_colour = [

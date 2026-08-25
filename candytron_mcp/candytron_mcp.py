@@ -53,18 +53,11 @@ def service_exit() -> bool:
 @mcp.prompt()
 def get_service_prompt(lang: str) -> str:
     """Return the system message snippet suitable for this service."""
-    # Spelled the way the TTS should SAY it, per language. "Kandutron" was a
-    # respelling for the old Swedish Piper voice; with Kokoro's real g2p it is
-    # simply the wrong name. Round-tripped through Kokoro -> Whisper (sv):
-    # "Candytron" -> "Canditon", "Kandutron" -> "Kandutron", "Candy Tron" -> "Candytron".
-    names = { "en": "Candy Tron",
-              "sv": "Candy Tron",
-              "de": "Candy Tronn",   # de still uses Piper (no Kokoro German voice) — respelling kept
-              "fr": "Candy Tron",
-              "es": "Candy Tron"}
-    if not lang in names:
-        lang = 'en'
-    name = names[lang]
+    # The robot's real name, in every language. (There used to be per-language
+    # phonetic respellings here -- "Kandutron", "Candue Tronne" -- for the old
+    # Piper voices; Kokoro has real g2p, so they only made it introduce itself
+    # by the wrong name.)
+    name = mcp.name
     return f"Your name is {name}. You are situated at an exhibition to demonstrate how several AI systems can be connected, such as speech recognition, a large language model, speech synthesis, computer vision, and a robot arm. You are this system. Specifically, you have a robot arm, which allows you to move different types of candy between different positions on a table. You can chat with the visitors, and they may ask about your demonstration. They may also ask you to move candy around on the table or to give them some specific candy. When you know what specific candy on the table the user wants (but not before), you hand it out to them by moving it to the special position O0. Information on the latest positions of candy and their characteristics will be regularly provided by the vision system, for you to internally look up information needed to answer questions or perform moves. However, you never give this type of lists directly to the user. Your replies are friendly, concise and as plain text with no formatting."
 
 def scene_message(scene, lang):

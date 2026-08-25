@@ -1105,8 +1105,14 @@ async def main(args):
                         # The model heard a language switch; trust it only on a
                         # real sentence (the tag misfires on short turns).
                         lang = choose_language(lang, tag_lang, reply_text)
+                    for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
+                        print(f"\n  Function: {_tn} ( {json.dumps(_ta)} )")
+                        print(f"  Result:   {_tr}")
+                        _ilog("tool_call", name=_tn, arguments=_ta, result=_tr)
                     messages.append({"role": "assistant", "content": reply_text})
                     _ilog("direct_response", content=reply_text, lang=lang,
+                          tool_calls=[{"name": n, "arguments": a}
+                                      for n, a, _ in getattr(direct_llm, "last_tool_calls", [])],
                           seconds=round(time.time() - t0, 2))
                     print(f"  (direct-audio turn: {time.time() - t0:.2f}s)")
                     threading.Thread(target=_direct_transcribe,

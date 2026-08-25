@@ -79,6 +79,7 @@ class DirectAudioLLM:
                  tools_url: Optional[str] = None,
                  sample_rate: int = 16000,
                  temperature: float = 0.2):
+        self.last_tool_calls: list = []
         import ollama
         self._client = ollama.Client(host=host)
         self._model = model
@@ -192,6 +193,10 @@ class DirectAudioLLM:
                          "images": [wav]})
 
         start = time.time()
+        # What this turn actually called: [(name, args, result)]. The caller
+        # shows it — a demo where the arm silently does nothing looks the
+        # same as one where it works, so this must not be INFO-only.
+        self.last_tool_calls = []
         reply, used_tools = "", False
         texts: list[str] = []   # every piece of prose the model produced
 
@@ -213,7 +218,9 @@ class DirectAudioLLM:
             for call in calls:
                 fn = call["function"]
                 logger.info(f"direct: tool call {fn['name']}({dict(fn['arguments'])})")
-                result = self._call_tool(fn["name"], dict(fn["arguments"]))
+                args = dict(fn["arguments"])
+                result = self._call_tool(fn["name"], args)
+                self.last_tool_calls.append((fn["name"], args, result))
                 messages.append({"role": "tool", "tool_name": fn["name"],
                                  "content": result})
 

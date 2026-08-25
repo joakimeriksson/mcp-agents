@@ -247,6 +247,23 @@ class VoiceOutput:
                 self._load_model(model_name)
         return self._voices.get(model_name)
 
+    # --- Server voice selection ---
+
+    def server_voice(self, language: str) -> Optional[str]:
+        """Voice name used on the TTS server for *language* (None = server default)."""
+        return self._tts_servers.get(language, {}).get("voice")
+
+    def server_voices(self, language: str) -> list:
+        """Selectable server voices for *language* (from languages.toml tts_voices)."""
+        return list(self._tts_servers.get(language, {}).get("voices", []))
+
+    def set_server_voice(self, language: str, voice: str):
+        """Switch the server voice for *language* live (next utterance uses it)."""
+        if language not in self._tts_servers:
+            raise ValueError(f"no TTS server configured for language {language!r}")
+        self._tts_servers[language]["voice"] = voice
+        logger.info(f"TTS voice for {language} -> {voice}")
+
     # --- Pronunciation ---
 
     def _apply_pronunciations(self, text: str, language: Optional[str]) -> str:

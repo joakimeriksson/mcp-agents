@@ -82,6 +82,7 @@ The MCP server must already be running on SSE before the client starts.
 | `m`      | —                      | Toggle mute (mic + TTS)             |
 | `s`      | —                      | Arm next recording for saving (press N times for N saves) |
 | `i`      | —                      | Next microphone (live; the active mic is shown top-left) |
+| `v`      | —                      | Next Swedish voice (live; speaks a sample; list in `face/languages.toml` `tts_voices`) |
 | `c`      | Clear conversation     | —                                   |
 | `r`      | Repeat last response   | —                                   |
 | `q`      | Quit                   | Quit                                |

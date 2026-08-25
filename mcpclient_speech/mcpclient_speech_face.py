@@ -260,11 +260,41 @@ def _current_mic() -> tuple[int | None, str]:
         return idx, f"device {idx}"
 
 def _show_mic_indicator() -> None:
+    """Indicator line: active mic + active voice, with their hotkeys."""
     if win is None:
         return
     idx, name = _current_mic()
-    win.set_indicator(f"Mic {idx}: {name}   (i = next mic)")
+    text = f"Mic {idx}: {name} (i)"
+    if voice_out is not None and voice_out.server_voices(default_lang):
+        text += f"   |   Voice: {voice_out.server_voice(default_lang)} (v)"
+    win.set_indicator(text)
     win.check_events()
+
+def kp_cycle_voice(_event, _obj):
+    """'v': next server voice for the default language (Swedish), live.
+    Speaks a short sample in the new voice when the robot is idle."""
+    if voice_out is None:
+        return
+    voices = voice_out.server_voices(default_lang)
+    if not voices:
+        logger.info("No selectable voices configured for %s", default_lang)
+        return
+    cur = voice_out.server_voice(default_lang)
+    pos = voices.index(cur) if cur in voices else -1
+    new_voice = voices[(pos + 1) % len(voices)]
+    voice_out.set_server_voice(default_lang, new_voice)
+    _ilog("voice_change", language=default_lang, voice=new_voice)
+    _show_mic_indicator()
+    if state.get('currstate') in ('wait', 'listen') and not voice_out.speaking:
+        # Audition: pause the mic while the sample plays, then restore.
+        if listener:
+            listener.paused = True
+        def _sample():
+            voice_out.speak(f"Hej, jag heter {new_voice}.", default_lang)
+            time.sleep(0.3)
+            if listener:
+                listener.paused = (state.get('currstate') != 'listen')
+        threading.Thread(target=_sample, daemon=True).start()
 
 def kp_cycle_mic(_event, _obj):
     """'i': switch to the next input device, live — VAD/STT and the
@@ -641,6 +671,7 @@ async def main(args):
         win.keydict[" "] = (kp_force_process, None)
         win.keydict["s"] = (kp_save_recording, None)
         win.keydict["i"] = (kp_cycle_mic, None)
+        win.keydict["v"] = (kp_cycle_voice, None)
         cam_win = CameraWindow(f"{name} - People camera {args.camera}", keydict=win.keydict)
         cam_win.set_exit_callback(on_exit, state)
         win.attach_camera_window(cam_win)

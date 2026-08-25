@@ -59,6 +59,8 @@ def get_language_tts_servers() -> dict[str, dict[str, str]]:
             servers[lang] = {"url": cfg["tts_server"]}
             if "tts_voice" in cfg:
                 servers[lang]["voice"] = cfg["tts_voice"]
+            if "tts_voices" in cfg:
+                servers[lang]["voices"] = list(cfg["tts_voices"])
     return servers
 
 

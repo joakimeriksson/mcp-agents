@@ -43,6 +43,56 @@ DEFAULT_PROMPT = (
     "and nothing else. If there is no intelligible speech, use an empty text."
 )
 
+_LANG_NAMES = {
+    "en": "English", "sv": "Swedish", "de": "German", "fr": "French",
+    "es": "Spanish", "it": "Italian", "no": "Norwegian", "da": "Danish",
+    "fi": "Finnish", "nl": "Dutch", "pt": "Portuguese",
+}
+
+# Replies that are not transcriptions: the model echoing its own instruction,
+# or describing silence in words. Both must become an empty transcript, or
+# they reach the LLM as if the person had said them.
+_NON_SPEECH = re.compile(
+    r"^\W*(no|there is no|there's no)?\s*(intelligible|audible|clear)?\s*"
+    r"(speech|audio|sound|voice)\b.*(detected|found|heard|present|audible)?\W*$"
+    r"|^\W*(silence|inaudible|unintelligible|\[.*\]|\(.*\))\W*$",
+    re.IGNORECASE)
+
+
+# Fragments of the instruction as the model tends to echo (or translate) it.
+_PROMPT_ECHO_MARKERS = (
+    "transcribe the speech", "detect the language", "json object", "iso 639",
+    "listen to the audio", "word for word",
+    "transkrib", "lyssna på ljud", "hör på ljud", "ord för ord",      # sv
+    "transcri", "écoute", "mot pour mot",                            # fr
+    "escucha el audio", "palabra por palabra",                       # es
+    "trascri", "ascolta", "parola per parola",                       # it
+    "höre dir", "wort für wort",                                     # de
+)
+
+
+def build_prompt(expected_languages=None, language_hint=None) -> str:
+    """The transcription prompt with a language prior.
+
+    *expected_languages*: ISO codes the deployment supports — the model is
+    told to choose among them, which stops one-word replies coming back as
+    Hindi or Italian. *language_hint*: the conversation's language so far;
+    short or unclear utterances are most likely in it.
+    """
+    prompt = DEFAULT_PROMPT
+    if expected_languages:
+        names = ", ".join(f"{_LANG_NAMES.get(c, c)} ({c})" for c in expected_languages)
+        prompt += f" The speech is in one of these languages: {names}."
+    if language_hint:
+        # NOTE: measured Aug 2026 — telling gemma4 to *assume* a language makes
+        # it over-commit (English mis-heard as that language, hallucinated text
+        # on noise). Prefer listing candidates without a hint (see transcribe()).
+        name = _LANG_NAMES.get(language_hint, language_hint)
+        prompt += (f" The conversation so far has been in {name}, so when the "
+                   f"audio is short or unclear assume {name} — but if the words "
+                   f"are clearly another listed language, report that language.")
+    return prompt
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -66,11 +116,17 @@ class Gemma4Transcriber:
                  model: str = DEFAULT_MODEL,
                  host: str = DEFAULT_HOST,
                  prompt: str = DEFAULT_PROMPT,
+                 expected_languages: Optional[List[str]] = None,
                  sample_rate: int = 16000):
         import ollama  # imported here so the dep is only needed for this backend
 
         self._model = model
         self._prompt = prompt
+        self._expected = list(expected_languages) if expected_languages else []
+        # Conversation language so far (ISO code); set by the caller between
+        # turns. Used as a prior in the prompt, never as a hard override.
+        self.language_hint: str = ""
+        self._rehear_max_s = 3.0   # utterances up to this long get the pass-2 prior
         self._sample_rate = sample_rate
         self._client = ollama.Client(host=host)
 
@@ -117,18 +173,33 @@ class Gemma4Transcriber:
         """Transcribe a float32 mono waveform. Signature matches WhisperModel."""
         wav_bytes = self._to_wav_bytes(audio)
 
-        response = self._client.chat(
-            model=self._model,
-            messages=[{
-                "role": "user",
-                "content": self._prompt,
-                "images": [wav_bytes],
-            }],
-            think=False,
-            stream=False,
-        )
-        raw = (response.get("message", {}).get("content") or "").strip()
-        text, language = self._parse(raw)
+        duration = len(audio) / self._sample_rate if len(audio) else 0.0
+
+        # Pass 1: the plain prompt. Measured (Aug 2026): any language prior in
+        # the prompt makes gemma4 over-commit to it and hallucinate on noise,
+        # while the plain prompt is English-biased on SHORT Swedish ("Ja tack"
+        # -> "Hi there"). So the prior is applied only as a targeted pass 2.
+        text, language = self._ask(wav_bytes, self._prompt)
+        text, language = self._sanitize(text, language)
+
+        # Pass 2: a short utterance that disagrees with the conversation's
+        # language is re-heard with that language as the prior. Long
+        # utterances are trusted as heard (that is how a language switch
+        # happens); empty ones stay empty (no prior on noise).
+        hint = self.language_hint
+        if (text and hint and language != hint and duration <= self._rehear_max_s
+                and (not self._expected or hint in self._expected)):
+            # Neutral re-hear: name the two candidates, don't say which to
+            # assume — "assume Swedish" made gemma4 mis-transcribe English
+            # into Swedish gibberish; "Swedish or English?" keeps both right.
+            candidates = [hint] + ([language] if language and language != hint else [])
+            text2, lang2 = self._ask(wav_bytes, build_prompt(candidates, None)
+                                     + " Decide the language from the words you hear.")
+            text2, lang2 = self._sanitize(text2, lang2)
+            if text2:
+                logger.info(f"Gemma STT: re-heard {duration:.1f}s utterance with "
+                            f"prior {hint}: [{language}] {text!r} -> [{lang2}] {text2!r}")
+                text, language = text2, lang2
 
         duration = len(audio) / self._sample_rate if len(audio) else 0.0
         segments = [Segment(text=text, start=0.0, end=duration)] if text else []
@@ -146,6 +217,33 @@ class Gemma4Transcriber:
         sf.write(buf, samples, self._sample_rate, format="WAV", subtype="PCM_16")
         return buf.getvalue()
 
+    def _ask(self, wav_bytes: bytes, prompt: str) -> Tuple[str, str]:
+        response = self._client.chat(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt, "images": [wav_bytes]}],
+            think=False,
+            stream=False,
+        )
+        raw = (response.get("message", {}).get("content") or "").strip()
+        return self._parse(raw)
+
+    def _sanitize(self, text: str, language: str) -> Tuple[str, str]:
+        """Drop non-transcriptions and languages outside the expected set."""
+        if text:
+            lowered = text.lower()
+            # Prompt echo: the model repeated (part of) its own instruction.
+            if any(chunk in lowered for chunk in _PROMPT_ECHO_MARKERS):
+                logger.warning(f"Gemma STT: prompt echo dropped: {text[:60]!r}")
+                text = ""
+            elif _NON_SPEECH.match(text):
+                logger.info(f"Gemma STT: non-speech reply dropped: {text!r}")
+                text = ""
+        if language and self._expected and language not in self._expected:
+            logger.info(f"Gemma STT: language {language!r} outside expected "
+                        f"{self._expected} -> unknown")
+            language = ""
+        return text, language
+
     @staticmethod
     def _parse(raw: str) -> Tuple[str, str]:
         """Extract (text, language) from Gemma's reply, tolerating extra prose."""
@@ -161,13 +259,21 @@ class Gemma4Transcriber:
                     language = ""
                 return text, language
             except (json.JSONDecodeError, TypeError, ValueError):
-                logger.warning("Gemma STT: JSON parse failed, using raw text")
+                logger.warning("Gemma STT: JSON parse failed, salvaging fields")
+        if raw.lstrip().startswith("{"):
+            # Truncated / malformed JSON: salvage the fields by regex rather
+            # than passing the JSON fragment on as if it were speech.
+            m_text = re.search(r'"text"\s*:\s*"([^"]*)', raw)
+            m_lang = re.search(r'"language"\s*:\s*"([^"]*)"', raw)
+            language = (m_lang.group(1).strip().lower() if m_lang else "")
+            language = _LANG_ALIASES.get(language, language)
+            return (m_text.group(1).strip() if m_text else ""), (language if len(language) <= 3 else "")
         # Fallback: treat the whole reply as the transcription.
         return raw.strip(), ""
 
 
 _LANG_ALIASES = {
-    "swedish": "sv", "svenska": "sv",
+    "swedish": "sv", "svenska": "sv", "sw": "sv", "swe": "sv",  # 'sw' is what gemma writes for Swedish
     "english": "en",
     "norwegian": "no", "danish": "da", "finnish": "fi",
     "german": "de", "french": "fr", "spanish": "es",

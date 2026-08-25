@@ -502,6 +502,28 @@ async def augmentation_message(client, lang):
 def user_message(prompt):
     return {"role": "user", "content": prompt}
 
+KNOWN_LANGS = ('en', 'sv', 'de', 'fr', 'es', 'it')
+LANG_SWITCH_MIN_WORDS = 4   # a shorter utterance can't flip the conversation language
+
+def choose_language(current, detected, text):
+    """Sticky conversation language: keep *current* unless the STT detection
+    is a known language AND the utterance is long enough to be trusted.
+    One-word replies ("Yeah.", "Ja tack") never flip the language — the
+    detector is unreliable on them and a wrong flip is very audible."""
+    if not detected or detected not in KNOWN_LANGS:
+        return current or default_lang
+    if not current or current not in KNOWN_LANGS:
+        return detected
+    if detected == current:
+        return current
+    words = len((text or "").split())
+    if words >= LANG_SWITCH_MIN_WORDS:
+        logger.info("Language switch %s -> %s (%d words)", current, detected, words)
+        return detected
+    logger.info("Ignoring language %s for a %d-word utterance, staying in %s",
+                detected, words, current)
+    return current
+
 def language_message(lang):
     languages = { "en": "English",
                   "sv": "Swedish",
@@ -710,6 +732,7 @@ async def main(args):
         listener = ContinuousListener(voice_in)
         listener.start()
         listener.paused = True
+        voice_in.language_hint = default_lang
         print('Continuous listener started')
         _show_mic_indicator()
 
@@ -912,7 +935,7 @@ async def main(args):
                     if curr_prompt:
                         prompt = curr_prompt
                         if voice_in and voice_in.detected_language:
-                            lang = voice_in.detected_language
+                            lang = choose_language(lang, voice_in.detected_language, prompt)
                         curr_prompt = ""
                         prompt_source = "speech"
 
@@ -922,6 +945,8 @@ async def main(args):
                     else:
                         lang = default_lang
 
+                if voice_in is not None and lang:
+                    voice_in.language_hint = lang   # prior for the next STT call
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
                 augprompt = await augmentation_message(client, lang)

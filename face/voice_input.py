@@ -533,6 +533,9 @@ class VoiceInput:
         self.detected_language: str = ""
         self.detected_language_prob: float = 0.0
         self.last_audio: Optional[np.ndarray] = None  # last captured utterance
+        # Conversation language so far (ISO code) — a prior for the STT
+        # backend on short/unclear utterances. Callers update it per turn.
+        self.language_hint: str = ""
         # Live end-of-utterance countdown: 0.0 (no trailing silence yet) to
         # 1.0 (silence long enough — utterance ends). For debug meters.
         self.silence_progress: float = 0.0
@@ -609,9 +612,11 @@ class VoiceInput:
         try:
             logger.info(f"Connecting Gemma 4 STT ({self._gemma_model})...")
             from gemma_stt import Gemma4Transcriber
+            from languages_config import get_language_models
             transcriber = Gemma4Transcriber(model=self._gemma_model,
                                             host=self._gemma_host,
-                                            sample_rate=self._sample_rate)
+                                            sample_rate=self._sample_rate,
+                                            expected_languages=list(get_language_models()))
             transcriber.check()  # verify Ollama up + model pulled + audio-capable
             self._transcriber = transcriber
             self._load_error = None
@@ -677,6 +682,8 @@ class VoiceInput:
         """Run the active STT backend. Returns (segments, info) like whisper."""
         if self._whisper_model is not None:
             return self._whisper_model.transcribe(audio, beam_size=5)
+        if hasattr(self._transcriber, "language_hint"):
+            self._transcriber.language_hint = self.language_hint
         return self._transcriber.transcribe(audio)
 
     def _ensure_vad(self):

@@ -109,15 +109,6 @@ ask_name = [
     "Hej! Vad ska jag kalla dig?",
 ]
 
-[languages.sv.pronunciations]
-godis = "goo-this"
-favoritgodis = "favoritgoo-this"
-Niclas = "Niklas"
-Riesen = "Risen"
-robot = "robått"
-robotarm = "robått-arm"
-"päron" = "pähron"
-
 [languages.sv.interview]
 favourite_candy = [
     "Hej {name}! Vilket är ditt favoritgodis?",

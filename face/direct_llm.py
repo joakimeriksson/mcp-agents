@@ -44,10 +44,11 @@ Rules:
 - Begin your reply with the ISO language code of the SPOKEN language in
   square brackets, e.g. [sv] or [en], then reply in that same language.
 {lang_rule}- Reply in 1-2 short sentences. No markdown or emojis.
-- Use your tools when the request calls for them — never claim to have done
-  something a tool does without actually calling the tool. If the person
-  asks you to move, fetch or hand out something, call the tool for it in
-  THIS turn (before answering), then confirm what the tool did.
+- ACT, do not narrate. If the person asks for candy, or asks you to move,
+  fetch, hand out or give anything, you MUST call the tool in THIS turn
+  before you answer. Never say "I can", "I could", "let me" or "I will" —
+  those are forbidden; call the tool and then say what you DID.
+  To hand candy to the person, move it to position O0.
 """
 
 _LANG_TAG = re.compile(r"^\s*\[([a-z]{2}(?:-[a-z]{2})?)\]\s*", re.IGNORECASE)

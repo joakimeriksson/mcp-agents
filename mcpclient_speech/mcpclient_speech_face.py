@@ -596,7 +596,7 @@ async def main(args):
         win.keydict["m"] = (kp_toggle_mute, None)
         win.keydict[" "] = (kp_force_process, None)
         win.keydict["s"] = (kp_save_recording, None)
-        cam_win = CameraWindow(name + " - Camera", keydict=win.keydict)
+        cam_win = CameraWindow(f"{name} - People camera {args.camera}", keydict=win.keydict)
         cam_win.set_exit_callback(on_exit, state)
         win.attach_camera_window(cam_win)
         win.check_events()

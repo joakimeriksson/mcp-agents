@@ -85,10 +85,10 @@ def ned_move_between(src: str, dst: str) -> bool:
         _ned_worker.run(command)
     return True
 
-def init_ned(use_robot=True):
+def init_ned(use_robot=True, robot_ip=None):
     global ned, _ned_worker
     if not ned:
-        ned = ned2.Ned2()
+        ned = ned2.Ned2(robot_ip) if robot_ip else ned2.Ned2()
         if use_robot:
             ned.open()
             # Set max gripper hold torque

@@ -1,0 +1,3 @@
+# YOLO candy-detection weights (not in git; copied by ../setup.sh)
+models/
+scene-log/

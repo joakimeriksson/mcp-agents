@@ -2,6 +2,7 @@
 
 from fastmcp import FastMCP
 import argparse
+import os
 import atexit
 import logging
 import random
@@ -22,6 +23,11 @@ cam: CameraManager | None = None
 scene_state = SceneState()
 scene_logger: SceneLogger | None = None
 use_robot = True
+robot_ip = None  # None -> ned2.DEFAULT_ROBOT_IP
+
+def ned2_default_ip():
+    import ned2
+    return ned2.DEFAULT_ROBOT_IP
 
 @mcp.resource("url://get_service_name")
 def get_service_name() -> str:
@@ -31,8 +37,9 @@ def get_service_name() -> str:
 @mcp.resource("url://service_init")
 def service_init() -> bool:
     """Initialize the service. Is called before the first tool call from the client."""
-    init_ned(use_robot=use_robot)
-    logger.info("Initialized robot arm: Niryo Ned 2%s", " (simulated)" if not use_robot else "")
+    init_ned(use_robot=use_robot, robot_ip=robot_ip)
+    logger.info("Initialized robot arm: Niryo Ned 2%s", " (simulated)" if not use_robot
+                else f" at {robot_ip or ned2_default_ip()}")
     return True
 
 @mcp.resource("url://service_exit")
@@ -123,13 +130,15 @@ def _run_mcp_server(args):
 
 
 def main():
-    global use_robot, cam, scene_logger
+    global use_robot, robot_ip, cam, scene_logger
 
     parser = argparse.ArgumentParser(description=mcp.name)
     parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
     parser.add_argument('--port', default=8000, type=int, help='Port to bind to')
     parser.add_argument('--transport', default="sse", help='Transport to use (stdio, sse or http)')
     parser.add_argument('--simulate-robot', action='store_true', help='Simulate the robot arm instead of using real hardware')
+    parser.add_argument('--robot-ip', default=os.environ.get('NIRYO_IP'),
+                        help='IP of the Niryo Ned 2 (default: $NIRYO_IP, else 10.10.10.10)')
     parser.add_argument('--simulate-camera', action='store_true', help='Simulate the camera instead of using real hardware')
     parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
     parser.add_argument('--camera', type=int, default=None, help='Camera index to use (default: auto-detect first available)')
@@ -166,6 +175,7 @@ def main():
         sys.exit(0)
 
     use_robot = not args.simulate_robot
+    robot_ip = args.robot_ip
     simulate_camera = args.simulate_camera
 
     # Resolve camera index

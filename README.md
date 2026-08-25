@@ -8,48 +8,43 @@ robot arm + camera, and a speech client (`mcpclient_speech/`) lets you talk to
 it — face recognition, multi-language speech in/out, and an LLM (via Ollama)
 that calls the robot's MCP tools.
 
-### Prerequisites
+### Setup (one command)
 
 ```bash
-# 1. Ollama with a tool-calling model — we use gemma4 (set in
-#    mcpclient_speech/config.toml [llm], or per-run with --llm-model)
-ollama pull gemma4
-
-# 2. Piper TTS voices (downloads into face/piper_models/)
-cd face && uv run download_models.py && cd ..
+./setup.sh
 ```
 
-Optional, for the Kokoro voices: start a
+Idempotent — installs/verifies `uv`, `portaudio`, Ollama + `gemma4:latest`
+(audio-capable: it is the chat model *and* the speech-to-text model), syncs the
+three uv projects (`candytron_mcp`, `mcpclient_speech`, `face`), downloads the
+Piper voices (offline fallback), clones and syncs
 [kokoro-voice-server](https://github.com/joakimeriksson/kokoro-voice-server)
-on `:8880` — TTS for every Kokoro-supported language (Swedish with Stina &
-friends, plus en/fr/es/it) then goes through it, with automatic fallback to
-Piper if it isn't running. German has no Kokoro voice and always uses Piper.
-Configured in `face/languages.toml`.
+as a sibling checkout (`../kokoro-voice-server`, override with
+`KOKORO_VOICE_SERVER_DIR`), and warms the InsightFace face model.
+
+One thing it can only *check*: the YOLO candy-detection weights
+`candytron_mcp/models/best-m.pt` are not in git — copy them from the machine
+that trained them before using the real table camera.
+
+### Run
 
 ```bash
-git clone https://github.com/joakimeriksson/kokoro-voice-server
-cd kokoro-voice-server && uv sync
-PYTORCH_ENABLE_MPS_FALLBACK=1 uv run python voice_server.py \
-    --engine kokoro-svml --voice Stina --port 8880
+./start-candytron.sh --sim                       # simulated robot + camera
+./start-candytron.sh --robot-ip 10.10.10.10      # real Niryo Ned 2 + table camera
 ```
 
-### Run the demo (simulated robot)
+`start-candytron.sh` brings up the whole stack in order — Ollama, the
+kokoro-voice-server on `:8880` (left alone if one is already running; TTS
+falls back to Piper if it isn't available), `candytron_mcp` on `:7999`, then
+the CandyTron eye/speech client — and Ctrl-C stops what it started.
+`./start-demo.sh` is the same as `--sim`; `./stop-demo.sh` kills stragglers
+(`--all` also stops the voice server).
 
-```bash
-./start-demo.sh
-```
-
-This starts `candytron_mcp` on port 7999 with `--simulate-robot
---simulate-camera` and then the speech-face client. Stop everything with
-Ctrl-C (or `./stop-demo.sh`).
-
-If the wrong camera opens, pick another with `--camera <n>` (extra
-arguments are passed through to the client; `-l` lists cameras, and
-`[devices]` in `mcpclient_speech/config.toml` can set a default):
-
-```bash
-./start-demo.sh --camera 1
-```
+Options: `--robot-ip IP` (or `$NIRYO_IP`), `--robot-camera N` for the table
+camera, `--simulate-robot` / `--simulate-camera` individually,
+`--no-voice-server`, `--face-agent` to use the face agent as the client.
+Anything else goes to the client, e.g. `--camera N` (face camera, `-l` lists
+them), `--mic N`, `--debug-audio`.
 
 The eye window can show an audio debug panel — VU meters (mic level, VAD
 probability, end-of-utterance countdown) and separate in/out oscilloscopes.
@@ -70,13 +65,14 @@ cd face && uv run agent.py --llm-model gemma4 --service-server http://127.0.0.1:
 The standalone face agent (camera + conversation, no robot) is documented in
 [face/README.md](face/README.md).
 
-### Real robot
+### Real robot, by hand
 
-Start the server yourself without the simulation flags, then either client:
+The same thing `start-candytron.sh` does, step by step:
 
 ```bash
-cd candytron_mcp && uv run candytron_mcp.py --port 7999
-cd mcpclient_speech && uv run mcpclient_speech_face.py
+cd ../kokoro-voice-server && uv run python voice_server.py --engine kokoro-svml --voice Stina --port 8880 --whisper base
+cd candytron_mcp && uv run candytron_mcp.py --port 7999 --robot-ip 10.10.10.10   # add --camera N for the table camera
+cd mcpclient_speech && uv run mcpclient_speech_face.py --server http://127.0.0.1:7999/sse
 ```
 
 ## Dirigera

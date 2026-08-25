@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Kill any running candytron_mcp.py / mcpclient_speech_face.py processes.
+# Kill any running candytron_mcp.py / mcpclient_speech_face.py / face agent processes.
+# Add --all to also stop a running kokoro-voice-server.
 
 set -uo pipefail
 
@@ -22,4 +23,8 @@ kill_matching() {
 
 kill_matching 'candytron_mcp.py'
 kill_matching 'mcpclient_speech_face.py'
+kill_matching 'face/agent.py\|agent.py --llm-model'
+if [[ "${1:-}" == "--all" ]]; then
+    kill_matching 'voice_server.py'
+fi
 echo "[stop-demo] done"

@@ -46,6 +46,12 @@ camera, `--simulate-robot` / `--simulate-camera` individually,
 Anything else goes to the client, e.g. `--camera N` (face camera, `-l` lists
 them), `--mic N`, `--debug-audio`.
 
+**Direct audio** — `--direct-audio` (or `direct_audio = true` under `[llm]` in
+`mcpclient_speech/config.toml`) sends the captured speech straight into gemma4:
+one call does hearing + persona + live candy scene + tool calls (≈0.4 s per turn
+vs ≈1 s for the STT→text path). The transcript for the history/log is produced
+in the background. The classic two-step path remains the default.
+
 The eye window can show an audio debug panel — VU meters (mic level, VAD
 probability, end-of-utterance countdown) and separate in/out oscilloscopes.
 Toggle it with `[debug] audio_panel` in `mcpclient_speech/config.toml` or

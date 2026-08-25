@@ -43,9 +43,11 @@ as audio. You remember people you've met.
 Rules:
 - Begin your reply with the ISO language code of the SPOKEN language in
   square brackets, e.g. [sv] or [en], then reply in that same language.
-- Reply in 1-2 short sentences. No markdown or emojis.
+{lang_rule}- Reply in 1-2 short sentences. No markdown or emojis.
 - Use your tools when the request calls for them — never claim to have done
-  something a tool does without actually calling the tool.
+  something a tool does without actually calling the tool. If the person
+  asks you to move, fetch or hand out something, call the tool for it in
+  THIS turn (before answering), then confirm what the tool did.
 """
 
 _LANG_TAG = re.compile(r"^\s*\[([a-z]{2}(?:-[a-z]{2})?)\]\s*", re.IGNORECASE)
@@ -74,10 +76,15 @@ class DirectAudioLLM:
                  service_prompt: Optional[str] = None,
                  augmentation_provider: Optional[Callable[[str], Optional[str]]] = None,
                  tools_url: Optional[str] = None,
-                 sample_rate: int = 16000):
+                 sample_rate: int = 16000,
+                 temperature: float = 0.2):
         import ollama
         self._client = ollama.Client(host=host)
         self._model = model
+        # Low temperature: tool calling on audio turns is otherwise flaky —
+        # the same request sometimes calls move_between, sometimes just says
+        # it did (measured Aug 2026).
+        self._options = {"temperature": temperature}
         self._agent_name = agent_name
         self._service_prompt = service_prompt
         self._augmentation_provider = augmentation_provider
@@ -133,31 +140,55 @@ class DirectAudioLLM:
 
     # --- Hot path ---
 
+    _LANG_NAMES = {"en": "English", "sv": "Swedish", "de": "German",
+                   "fr": "French", "es": "Spanish", "it": "Italian"}
+
     def respond(self, audio: np.ndarray, *,
                 context: str = "",
-                language_hint: str = "en") -> tuple[str, str]:
+                language_hint: str = "en",
+                service_prompt: Optional[str] = None,
+                augmentation: Optional[str] = None,
+                history: Optional[list] = None) -> tuple[str, str]:
         """Audio in, (reply_text, language) out. Blocking; one to a few
         model calls depending on tool use. Transcription for memory is the
-        caller's job, in the background (see agent._on_heard_audio)."""
+        caller's job, in the background (see agent._on_heard_audio).
+
+        *service_prompt* / *augmentation* override the constructor's persona
+        and the augmentation provider for this turn (clients that already
+        fetch them per language pass them in). *history* is a list of prior
+        text turns ({"role": "user"|"assistant", "content": ...}) inserted
+        before the audio so the model has the conversation context.
+        """
         wav = _to_wav_bytes(audio, self._sample_rate)
 
         service = ""
-        if self._service_prompt:
-            service = f"\nYour service role:\n{self._service_prompt}\n"
-        if self._augmentation_provider:
+        persona = service_prompt if service_prompt is not None else self._service_prompt
+        if persona:
+            service = f"\nYour service role:\n{persona}\n"
+        aug = augmentation
+        if aug is None and self._augmentation_provider:
             aug = self._augmentation_provider(language_hint)
-            if aug:
-                service += (f"\nCurrent state from your service "
-                            f"(internal — never read it out verbatim):\n{aug}\n")
-        system = DIRECT_SYSTEM.format(name=self._agent_name, service=service)
+        if aug:
+            service += (f"\nCurrent state from your service "
+                        f"(internal — never read it out verbatim):\n{aug}\n")
+        lang_rule = ""
+        if language_hint and language_hint in self._LANG_NAMES:
+            lname = self._LANG_NAMES[language_hint]
+            lang_rule = (f"- Reply in the language the person actually spoke. "
+                         f"Only if the utterance is too short to tell, use "
+                         f"{lname}, the conversation's language so far.\n")
+        system = DIRECT_SYSTEM.format(name=self._agent_name, service=service,
+                                      lang_rule=lang_rule)
         if context:
             system += f"\nAbout the person you hear:\n{context}\n"
 
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": "(user speech attached as audio)",
-             "images": [wav]},
-        ]
+        messages = [{"role": "system", "content": system}]
+        for m in history or []:
+            if m.get("role") in ("user", "assistant") and m.get("content"):
+                messages.append({"role": m["role"], "content": str(m["content"])})
+        messages.append({"role": "user",
+                         "content": "(user speech attached as audio)",
+                         "images": [wav]})
 
         start = time.time()
         reply, used_tools = "", False
@@ -166,6 +197,7 @@ class DirectAudioLLM:
         for round_no in range(_MAX_TOOL_ROUNDS):
             resp = self._client.chat(model=self._model, messages=messages,
                                      tools=self._tools or None,
+                                     options=self._options,
                                      think=False, stream=False)
             msg = resp["message"]
             calls = msg.get("tool_calls") or []
@@ -195,6 +227,7 @@ class DirectAudioLLM:
                              "their spoken language, starting with its ISO "
                              "code in brackets. 1 sentence."})
             resp = self._client.chat(model=self._model, messages=messages,
+                                     options=self._options,
                                      think=False, stream=False)
             reply = (resp["message"].get("content") or "").strip()
         elapsed = time.time() - start

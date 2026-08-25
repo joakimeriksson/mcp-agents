@@ -33,6 +33,7 @@ the built-in defaults in `config.py`. Sections:
 model    = "gemma4:latest"
 base_url = "http://localhost:11434/v1/"
 api_key  = "ollama"
+direct_audio = false   # true: speech straight into gemma4 (one call: hear + think + tools)
 
 [debug]
 audio_panel = true   # VU meters + in/out oscilloscopes in the eye window

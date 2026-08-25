@@ -2,6 +2,7 @@
 model    = "gemma4:latest"
 base_url = "http://localhost:11434/v1/"
 api_key  = "ollama"
+direct_audio = false   # true: speech straight into gemma4 (one call: hear + think + tools)
 
 [face]
 omit_names_and_prefs = false

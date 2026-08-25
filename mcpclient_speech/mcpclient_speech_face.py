@@ -29,7 +29,7 @@ from readnb import *
 from eyewindow import *
 from voice_input import (
     VoiceInput, ContinuousListener, VoiceEventType, AudioMonitor,
-    list_input_devices,
+    list_input_devices, RAW_AUDIO_TEXT,
 )
 from voice_output import VoiceOutput
 from face_tracker import (
@@ -99,6 +99,7 @@ voice_in: VoiceInput | None = None
 voice_out: VoiceOutput | None = None
 listener: ContinuousListener | None = None
 audio_monitor: AudioMonitor | None = None   # debug panel meters (may be None)
+direct_llm = None   # DirectAudioLLM when --direct-audio (speech straight into gemma4)
 tracker: FaceTracker | None = None
 model: str | None = None
 
@@ -170,6 +171,11 @@ def parse_args():
     tune.add_argument('--engage-dwell-seconds', type=float, default=None,
                       help='Seconds the focused face must face the camera before FACE_ENGAGED')
 
+    parser.add_argument('--direct-audio', action='store_true', default=None,
+                        help='Send the captured speech straight into the (audio-capable) LLM: '
+                             'one call does hearing + reasoning + tool calls. The transcript '
+                             'for the history/log is produced in the background. '
+                             '(default from config [llm] direct_audio)')
     parser.add_argument('--debug-audio', action='store_true', default=None,
                         help='Show the audio debug panel (VU meters + oscilloscope) '
                              'in the eye window (default from config [debug] audio_panel)')
@@ -502,6 +508,32 @@ async def augmentation_message(client, lang):
 def user_message(prompt):
     return {"role": "user", "content": prompt}
 
+def _text_history(mlst, max_turns):
+    """Recent user/assistant turns as plain dicts (for the direct-audio call).
+    Skips tool traffic and works for both dict and OpenAI message objects."""
+    out = []
+    for m in mlst:
+        role = m.get('role') if isinstance(m, dict) else getattr(m, 'role', None)
+        content = m.get('content') if isinstance(m, dict) else getattr(m, 'content', None)
+        if role in ('user', 'assistant') and content:
+            out.append({'role': role, 'content': str(content)})
+    return out[-2 * max_turns:]
+
+def _direct_transcribe(audio, user_msg, lang):
+    """Background: transcribe the utterance for the history/log (the reply
+    was already produced straight from the audio)."""
+    try:
+        tr = direct_llm.transcriber
+        tr.language_hint = lang
+        segs, info = tr.transcribe(audio)
+        text = "".join(seg.text for seg in segs).strip()
+    except Exception as e:
+        logger.warning("background transcription failed: %s", e)
+        text = ""
+    user_msg['content'] = text or "(unintelligible audio)"
+    print(f"\n  Heard: ({info.language or lang if text else '?'}) {text}")
+    _ilog("user_transcript", content=text, lang=(info.language if text else "") or lang)
+
 KNOWN_LANGS = ('en', 'sv', 'de', 'fr', 'es', 'it')
 LANG_SWITCH_MIN_WORDS = 4   # a shorter utterance can't flip the conversation language
 
@@ -623,7 +655,7 @@ async def main(args):
     global has_name
     global has_init
     global has_exit
-    global voice_in, voice_out, listener, tracker, audio_monitor
+    global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm
     global curr_prompt
 
     # Connect via SSE to the MCP server
@@ -701,7 +733,8 @@ async def main(args):
         print('Created the interaction window')
 
         ### Initialize voice_input library, as ContinuousListener with on_speech as callback here
-        voice_in = VoiceInput(device=args.mic)
+        voice_in = VoiceInput(device=args.mic,
+                              stt_backend="raw" if args.direct_audio else "gemma4")
         voice_in.subscribe(
             lambda ev: _ilog("transcription",
                              text=ev.payload.text,
@@ -734,6 +767,20 @@ async def main(args):
         listener.paused = True
         voice_in.language_hint = default_lang
         print('Continuous listener started')
+
+        if args.direct_audio:
+            from direct_llm import DirectAudioLLM
+            ollama_host = re.sub(r'/v1/?$', '', args.llm_url.rstrip('/'))
+            # Built in a worker thread: it fetches the MCP tools with
+            # asyncio.run(), which is not allowed inside this running loop.
+            direct_llm = await asyncio.to_thread(
+                DirectAudioLLM, model=args.llm_model, host=ollama_host,
+                agent_name=name, tools_url=args.server)
+            direct_llm.transcriber.check()   # fail fast if the model can't hear
+            if not direct_llm._tools:
+                print('WARNING: direct-audio mode loaded no tools from the server')
+            print(f'Direct-audio mode: speech goes straight into {args.llm_model} '
+                  f'({len(direct_llm._tools)} tools)')
         _show_mic_indicator()
 
         ### Initialize voice_output (piper TTS)
@@ -947,6 +994,8 @@ async def main(args):
 
                 if voice_in is not None and lang:
                     voice_in.language_hint = lang   # prior for the next STT call
+                if curr_person is not None and lang in KNOWN_LANGS:
+                    curr_person.lang = lang
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
                 augprompt = await augmentation_message(client, lang)
@@ -956,7 +1005,18 @@ async def main(args):
                     print(augprompt['content'])
                     augpromptlist.append(augprompt)
                 augpromptlist.append(langprompt)
-                if newstate == 'process':
+                direct_turn = (direct_llm is not None and newstate == 'process'
+                               and prompt == RAW_AUDIO_TEXT
+                               and voice_in is not None and voice_in.last_audio is not None)
+                if direct_turn:
+                    turn_audio = voice_in.last_audio
+                    print("\n  User: (", lang, ") [audio, %.1fs]" % (len(turn_audio) / voice_in.sample_rate))
+                    _ilog("user_turn", kind="speech_audio", content="",
+                          lang=lang, seconds=round(len(turn_audio) / voice_in.sample_rate, 2))
+                    prompt_source = None
+                    pending_user_msg = {"role": "user", "content": "(audio — transcribing)"}
+                    messages.append(pending_user_msg)
+                elif newstate == 'process':
                     print("\n  User: (", lang, ") ", prompt)
                     _ilog("user_turn", kind=prompt_source or "unknown", content=prompt, lang=lang)
                     prompt_source = None
@@ -973,84 +1033,36 @@ async def main(args):
                           lang=lang)
                     messages.append(greetprompt)
 
-                iteration = 0
-                msg = compose_messages(sysprompt, messages, augpromptlist)
-                #messagedump(msg)
-                _ilog("llm_request",
-                      iteration=iteration,
-                      model=model,
-                      messages_full=list(messages),
-                      messages_sent=msg,
-                      tool_count=len(tools or []))
-                try:
-                    # In a thread so the UI pump keeps the window alive during
-                    # inference (and 'Processing' actually shows).
-                    response = await asyncio.to_thread(
-                        openai.chat.completions.create,
-                        model=model,
-                        messages=msg,
-                        tools=tools,
-                    )
-                except Exception as e:
-                    _ilog("llm_error",
-                          iteration=iteration,
-                          error_class=type(e).__name__,
-                          error_message=str(e))
-                    raise
-                _ilog("llm_response",
-                      iteration=iteration,
-                      content=response.choices[0].message.content,
-                      tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
-
-                tool_calls = response.choices[0].message.tool_calls
-                while tool_calls:
-                    messages.append(response.choices[0].message)
-                    for tool_call in tool_calls:
-                        try:
-                            args_parsed = json.loads(tool_call.function.arguments)
-                        except (TypeError, ValueError):
-                            args_parsed = None
-                        try:
-                            result = await client.call_tool(tool_call.function.name,
-                                                            json.loads(tool_call.function.arguments))
-                            if type(result)==list:
-                                resulttxt = result[0].text
-                            else:
-                                resulttxt = result.content[0].text
-                            result_message = {
-                                "role": "tool",
-                                "content": json.dumps({
-                                    "result": resulttxt
-                                }),
-                                "tool_call_id": tool_call.id
-                            }
-                            print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                            print(  "  Result:   ", resulttxt)
-                            _ilog("mcp_tool_call",
-                                  name=tool_call.function.name,
-                                  arguments=tool_call.function.arguments,
-                                  arguments_parsed=args_parsed,
-                                  success=True,
-                                  result_text=resulttxt)
-                            messages.append(result_message)
-                        except exceptions.ToolError as te:
-                            result_message = {
-                                "role": "tool",
-                                "content": json.dumps({
-                                    "result": "unknown function called"
-                                }),
-                                "tool_call_id": tool_call.id
-                            }
-                            print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                            _ilog("mcp_tool_call",
-                                  name=tool_call.function.name,
-                                  arguments=tool_call.function.arguments,
-                                  arguments_parsed=args_parsed,
-                                  success=False,
-                                  error_message=f"ToolError: {te}")
-                            messages.append(result_message)
-
-                    iteration += 1
+                if direct_turn:
+                    # One multimodal call: hear + persona + live scene + tools.
+                    history = _text_history(messages[:-1], messages_trunclen)
+                    t0 = time.time()
+                    _ilog("direct_request", lang=lang, history_turns=len(history),
+                          tool_count=len(direct_llm._tools))
+                    try:
+                        reply_text, tag_lang = await asyncio.to_thread(
+                            direct_llm.respond, turn_audio,
+                            language_hint=lang,
+                            service_prompt=sysprompt['content'],
+                            augmentation=augprompt['content'] if augprompt else None,
+                            history=history)
+                    except Exception as e:
+                        logger.exception("direct-audio turn failed")
+                        _ilog("llm_error", error_class=type(e).__name__, error_message=str(e))
+                        reply_text, tag_lang = "", lang
+                    if tag_lang in KNOWN_LANGS and tag_lang != lang:
+                        # The model heard a language switch; trust it only on a
+                        # real sentence (the tag misfires on short turns).
+                        lang = choose_language(lang, tag_lang, reply_text)
+                    messages.append({"role": "assistant", "content": reply_text})
+                    _ilog("direct_response", content=reply_text, lang=lang,
+                          seconds=round(time.time() - t0, 2))
+                    print(f"  (direct-audio turn: {time.time() - t0:.2f}s)")
+                    threading.Thread(target=_direct_transcribe,
+                                     args=(turn_audio, pending_user_msg, lang),
+                                     daemon=True).start()
+                else:
+                    iteration = 0
                     msg = compose_messages(sysprompt, messages, augpromptlist)
                     #messagedump(msg)
                     _ilog("llm_request",
@@ -1060,6 +1072,8 @@ async def main(args):
                           messages_sent=msg,
                           tool_count=len(tools or []))
                     try:
+                        # In a thread so the UI pump keeps the window alive during
+                        # inference (and 'Processing' actually shows).
                         response = await asyncio.to_thread(
                             openai.chat.completions.create,
                             model=model,
@@ -1076,11 +1090,86 @@ async def main(args):
                           iteration=iteration,
                           content=response.choices[0].message.content,
                           tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
-                    tool_calls = response.choices[0].message.tool_calls
 
-                # No tool calls, just print the response.
-                messages.append(response.choices[0].message)
-                reply_text = response.choices[0].message.content or ""
+                    tool_calls = response.choices[0].message.tool_calls
+                    while tool_calls:
+                        messages.append(response.choices[0].message)
+                        for tool_call in tool_calls:
+                            try:
+                                args_parsed = json.loads(tool_call.function.arguments)
+                            except (TypeError, ValueError):
+                                args_parsed = None
+                            try:
+                                result = await client.call_tool(tool_call.function.name,
+                                                                json.loads(tool_call.function.arguments))
+                                if type(result)==list:
+                                    resulttxt = result[0].text
+                                else:
+                                    resulttxt = result.content[0].text
+                                result_message = {
+                                    "role": "tool",
+                                    "content": json.dumps({
+                                        "result": resulttxt
+                                    }),
+                                    "tool_call_id": tool_call.id
+                                }
+                                print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
+                                print(  "  Result:   ", resulttxt)
+                                _ilog("mcp_tool_call",
+                                      name=tool_call.function.name,
+                                      arguments=tool_call.function.arguments,
+                                      arguments_parsed=args_parsed,
+                                      success=True,
+                                      result_text=resulttxt)
+                                messages.append(result_message)
+                            except exceptions.ToolError as te:
+                                result_message = {
+                                    "role": "tool",
+                                    "content": json.dumps({
+                                        "result": "unknown function called"
+                                    }),
+                                    "tool_call_id": tool_call.id
+                                }
+                                print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
+                                _ilog("mcp_tool_call",
+                                      name=tool_call.function.name,
+                                      arguments=tool_call.function.arguments,
+                                      arguments_parsed=args_parsed,
+                                      success=False,
+                                      error_message=f"ToolError: {te}")
+                                messages.append(result_message)
+
+                        iteration += 1
+                        msg = compose_messages(sysprompt, messages, augpromptlist)
+                        #messagedump(msg)
+                        _ilog("llm_request",
+                              iteration=iteration,
+                              model=model,
+                              messages_full=list(messages),
+                              messages_sent=msg,
+                              tool_count=len(tools or []))
+                        try:
+                            response = await asyncio.to_thread(
+                                openai.chat.completions.create,
+                                model=model,
+                                messages=msg,
+                                tools=tools,
+                            )
+                        except Exception as e:
+                            _ilog("llm_error",
+                                  iteration=iteration,
+                                  error_class=type(e).__name__,
+                                  error_message=str(e))
+                            raise
+                        _ilog("llm_response",
+                              iteration=iteration,
+                              content=response.choices[0].message.content,
+                              tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
+                        tool_calls = response.choices[0].message.tool_calls
+
+                    # No tool calls, just print the response.
+                    messages.append(response.choices[0].message)
+                    reply_text = response.choices[0].message.content or ""
                 print(f'\n  Response: {reply_text}  (lang={lang})')
                 set_win_state('talk')
                 if not reply_text:
@@ -1173,6 +1262,8 @@ def run():
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
     if args.debug_audio is None:
         args.debug_audio = cfg["debug"].get("audio_panel", False)
+    if args.direct_audio is None:
+        args.direct_audio = cfg["llm"].get("direct_audio", False)
 
     # Resolve camera index (auto-detect if still None after config)
     if args.camera is None:

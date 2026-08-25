@@ -7,6 +7,9 @@ _DEFAULTS: dict = {
         "model": "gemma4:latest",
         "base_url": "http://localhost:11434/v1/",
         "api_key": "ollama",
+        # Speech straight into the (audio-capable) model: one call for
+        # hearing + reasoning + tools; transcript in the background.
+        "direct_audio": False,
     },
     "face": {
         "omit_names_and_prefs": False,

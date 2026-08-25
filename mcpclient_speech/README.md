@@ -81,6 +81,7 @@ The MCP server must already be running on SSE before the client starts.
 | Space    | Stop recording, send   | Stop listening, transcribe captured audio |
 | `m`      | —                      | Toggle mute (mic + TTS)             |
 | `s`      | —                      | Arm next recording for saving (press N times for N saves) |
+| `i`      | —                      | Next microphone (live; the active mic is shown top-left) |
 | `c`      | Clear conversation     | —                                   |
 | `r`      | Repeat last response   | —                                   |
 | `q`      | Quit                   | Quit                                |

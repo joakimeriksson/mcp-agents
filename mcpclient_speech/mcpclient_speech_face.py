@@ -37,6 +37,7 @@ from face_tracker import (
 )
 from face_config import build_db_kwargs, build_tracker_kwargs, backend_metric
 import cv2
+import sounddevice as sd
 from config import load_config
 from interaction_logger import InteractionLogger
 
@@ -97,6 +98,7 @@ cam_win: CameraWindow | None = None
 voice_in: VoiceInput | None = None
 voice_out: VoiceOutput | None = None
 listener: ContinuousListener | None = None
+audio_monitor: AudioMonitor | None = None   # debug panel meters (may be None)
 tracker: FaceTracker | None = None
 model: str | None = None
 
@@ -244,11 +246,53 @@ def kp_force_process(_event, _obj):
     else:
         logger.debug("force-process pressed but ignored (state=%s)", state.get('currstate'))
 
+def _current_mic() -> tuple[int | None, str]:
+    """(index, name) of the microphone in use; resolves the system default."""
+    idx = voice_in.device if voice_in is not None else None
+    if idx is None:
+        try:
+            idx = sd.default.device[0]
+        except Exception:
+            return None, "system default"
+    try:
+        return idx, sd.query_devices(idx)['name']
+    except Exception:
+        return idx, f"device {idx}"
+
+def _show_mic_indicator() -> None:
+    if win is None:
+        return
+    idx, name = _current_mic()
+    win.set_indicator(f"Mic {idx}: {name}   (i = next mic)")
+    win.check_events()
+
+def kp_cycle_mic(_event, _obj):
+    """'i': switch to the next input device, live — VAD/STT and the
+    debug-panel meters follow. The active mic is shown in the indicator."""
+    if voice_in is None:
+        return
+    devices = list_input_devices()
+    if not devices:
+        return
+    cur, _ = _current_mic()
+    idxs = [d[0] for d in devices]
+    pos = idxs.index(cur) if cur in idxs else -1
+    new_idx, name = devices[(pos + 1) % len(devices)][:2]
+    voice_in.set_device(new_idx)
+    if audio_monitor is not None:
+        audio_monitor.set_device(new_idx)
+    logger.info("Microphone -> %d: %s", new_idx, name)
+    _ilog("mic_change", device=new_idx, name=name)
+    _show_mic_indicator()
+
 def _refresh_save_indicator(count: int) -> None:
     if win is None:
         return
-    win.set_indicator(f"Save next {count}" if count > 0 else None)
-    win.check_events()
+    if count > 0:
+        win.set_indicator(f"Save next {count}")
+        win.check_events()
+    else:
+        _show_mic_indicator()
 
 def kp_save_recording(_event, _obj):
     if voice_in is None:
@@ -527,7 +571,7 @@ async def main(args):
     global has_name
     global has_init
     global has_exit
-    global voice_in, voice_out, listener, tracker
+    global voice_in, voice_out, listener, tracker, audio_monitor
     global curr_prompt
 
     # Connect via SSE to the MCP server
@@ -596,6 +640,7 @@ async def main(args):
         win.keydict["m"] = (kp_toggle_mute, None)
         win.keydict[" "] = (kp_force_process, None)
         win.keydict["s"] = (kp_save_recording, None)
+        win.keydict["i"] = (kp_cycle_mic, None)
         cam_win = CameraWindow(f"{name} - People camera {args.camera}", keydict=win.keydict)
         cam_win.set_exit_callback(on_exit, state)
         win.attach_camera_window(cam_win)
@@ -635,6 +680,7 @@ async def main(args):
         listener.start()
         listener.paused = True
         print('Continuous listener started')
+        _show_mic_indicator()
 
         ### Initialize voice_output (piper TTS)
         voice_out = VoiceOutput()

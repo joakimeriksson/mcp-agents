@@ -232,6 +232,15 @@ class AudioMonitor:
             self._stream.close()
             self._stream = None
 
+    def set_device(self, device: int | None):
+        """Switch the monitored input device live (restarts the stream)."""
+        running = self._stream is not None
+        self.stop()
+        self._device = device
+        self.max_seen = 0.001   # re-calibrate the meter for the new mic
+        if running:
+            self.start()
+
     @property
     def db(self) -> float:
         return 20 * np.log10(self.rms + 1e-10)
@@ -542,6 +551,19 @@ class VoiceInput:
     @property
     def vad_threshold(self) -> float:
         return self._vad_threshold
+
+    @property
+    def device(self) -> int | None:
+        """Input device index in use (None = system default)."""
+        return self._device
+
+    def set_device(self, device: int | None):
+        """Switch the microphone live. Each listen() opens its own input
+        stream, so a listen in progress is cancelled and the next one
+        (the ContinuousListener retries immediately) uses the new device."""
+        self._device = device
+        self._cancel_listen = True
+        logger.info(f"Input device -> {device if device is not None else 'system default'}")
 
     @property
     def sample_rate(self) -> int:

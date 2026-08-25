@@ -53,10 +53,14 @@ def service_exit() -> bool:
 @mcp.prompt()
 def get_service_prompt(lang: str) -> str:
     """Return the system message snippet suitable for this service."""
+    # Spelled the way the TTS should SAY it, per language. "Kandutron" was a
+    # respelling for the old Swedish Piper voice; with Kokoro's real g2p it is
+    # simply the wrong name. Round-tripped through Kokoro -> Whisper (sv):
+    # "Candytron" -> "Canditon", "Kandutron" -> "Kandutron", "Candy Tron" -> "Candytron".
     names = { "en": "Candy Tron",
-              "sv": "Kandutron",
-              "de": "Candy Tronn",
-              "fr": "Candue Tronne",
+              "sv": "Candy Tron",
+              "de": "Candy Tronn",   # de still uses Piper (no Kokoro German voice) — respelling kept
+              "fr": "Candy Tron",
               "es": "Candy Tron"}
     if not lang in names:
         lang = 'en'

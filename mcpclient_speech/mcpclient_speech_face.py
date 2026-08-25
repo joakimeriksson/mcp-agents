@@ -353,6 +353,7 @@ def on_face_change(id):
     logger.info("Face change event")
     if muted or state['newstate'] == 'exit':
         return
+    reset_language_switch()   # a new person starts the switch hysteresis over
     prev_face_id = next((pid for pid, p in persondict.items() if p is curr_person), None)
     if curr_person:
         logger.info("Storing current person")
@@ -539,24 +540,59 @@ def _direct_transcribe(audio, user_msg, lang):
 
 KNOWN_LANGS = ('en', 'sv', 'de', 'fr', 'es', 'it')
 LANG_SWITCH_MIN_WORDS = 4   # a shorter utterance can't flip the conversation language
+LANG_SWITCH_TURNS = 2       # ...and it takes this many consecutive turns to flip
+# Pending language switch: {lang, count}. Module state so a single stray turn
+# cannot flip the conversation on its own (see choose_language).
+_lang_pending = {"lang": None, "count": 0}
+
+
+def reset_language_switch():
+    """Forget a half-finished language switch (new person / new session)."""
+    _lang_pending["lang"] = None
+    _lang_pending["count"] = 0
+
 
 def choose_language(current, detected, text):
-    """Sticky conversation language: keep *current* unless the STT detection
-    is a known language AND the utterance is long enough to be trusted.
-    One-word replies ("Yeah.", "Ja tack") never flip the language — the
-    detector is unreliable on them and a wrong flip is very audible."""
+    """Sticky conversation language.
+
+    Two guards, because the STT's failure modes need both:
+      * word count — a one-word reply ("Yeah.", "Ja tack") carries almost no
+        language signal, so it can never flip the conversation, and
+      * hysteresis — gemma's other failure mode is transcribing Swedish audio
+        as a fluent, LONG English sentence, which the word-count rule alone
+        happily trusts. Requiring LANG_SWITCH_TURNS consecutive turns in the
+        new language means one bad transcript costs nothing, while a person
+        who really switched language is followed one turn later.
+    """
     if not detected or detected not in KNOWN_LANGS:
         return current or default_lang
     if not current or current not in KNOWN_LANGS:
+        reset_language_switch()
         return detected
     if detected == current:
+        reset_language_switch()
         return current
+
     words = len((text or "").split())
-    if words >= LANG_SWITCH_MIN_WORDS:
-        logger.info("Language switch %s -> %s (%d words)", current, detected, words)
+    if words < LANG_SWITCH_MIN_WORDS:
+        logger.info("Ignoring language %s for a %d-word utterance, staying in %s",
+                    detected, words, current)
+        return current
+
+    if _lang_pending["lang"] == detected:
+        _lang_pending["count"] += 1
+    else:
+        _lang_pending["lang"] = detected
+        _lang_pending["count"] = 1
+
+    if _lang_pending["count"] >= LANG_SWITCH_TURNS:
+        logger.info("Language switch %s -> %s (%d consecutive turns)",
+                    current, detected, _lang_pending["count"])
+        reset_language_switch()
         return detected
-    logger.info("Ignoring language %s for a %d-word utterance, staying in %s",
-                detected, words, current)
+    logger.info("Heard %s (%d words) but staying in %s — needs %d turns in a row "
+                "(a mis-transcription should not flip the language)",
+                detected, words, current, LANG_SWITCH_TURNS)
     return current
 
 def language_message(lang):

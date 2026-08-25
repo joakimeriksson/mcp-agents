@@ -126,7 +126,7 @@ class Gemma4Transcriber:
         # Conversation language so far (ISO code); set by the caller between
         # turns. Used as a prior in the prompt, never as a hard override.
         self.language_hint: str = ""
-        self._rehear_max_s = 3.0   # utterances up to this long get the pass-2 prior
+        self._rehear_max_s = 6.0   # utterances up to this long get the pass-2 prior
         self._sample_rate = sample_rate
         self._client = ollama.Client(host=host)
 

@@ -87,7 +87,7 @@ favourite_music = [
 tts_model = "sv_SE-lisa-medium"    # Piper fallback if the server is down
 # Swedish Kokoro voices via kokoro-voice-server (start it on :8880).
 tts_server = "http://127.0.0.1:8880/v1/audio/speech"
-tts_voice = "Stina"
+tts_voice = "Greta"
 # Selectable live in the clients (mcpclient_speech: press 'v')
 tts_voices = ["Stina", "Alice", "Ebba", "Elsa", "Greta", "Anton", "Björn", "Lars", "Nils", "Oskar"]
 tts_speed = 1.3      # speech rate: <1 slower, >1 faster (0.5-2.0)

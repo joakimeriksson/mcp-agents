@@ -61,6 +61,8 @@ def get_language_tts_servers() -> dict[str, dict[str, str]]:
                 servers[lang]["voice"] = cfg["tts_voice"]
             if "tts_voices" in cfg:
                 servers[lang]["voices"] = list(cfg["tts_voices"])
+            if "tts_speed" in cfg:
+                servers[lang]["speed"] = float(cfg["tts_speed"])
     return servers
 
 

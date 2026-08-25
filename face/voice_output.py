@@ -365,6 +365,8 @@ class VoiceOutput:
         body = {"input": text, "response_format": "wav"}
         if server.get("voice"):
             body["voice"] = server["voice"]
+        if server.get("speed"):
+            body["speed"] = server["speed"]
         # Advisory, not authoritative: the client's per-turn language
         # detection is flaky (a Swedish turn mislabeled 'it' would make the
         # server speak Swedish text through the Italian pipeline). The server

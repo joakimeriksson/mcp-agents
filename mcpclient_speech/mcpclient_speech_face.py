@@ -176,6 +176,9 @@ def parse_args():
                              'one call does hearing + reasoning + tool calls. The transcript '
                              'for the history/log is produced in the background. '
                              '(default from config [llm] direct_audio)')
+    parser.add_argument('--detect-fps', type=int, default=6,
+                        help='Max face-detection rate (Hz). Lower = far less memory '
+                             '(InsightFace/onnxruntime leaks ~40MB per inference on this build).')
     parser.add_argument('--debug-audio', action='store_true', default=None,
                         help='Show the audio debug panel (VU meters + oscilloscope) '
                              'in the eye window (default from config [debug] audio_panel)')
@@ -859,12 +862,24 @@ async def main(args):
             sys.exit(1)
 
         def _camera_loop():
+            detect_interval = 1.0 / max(1, args.detect_fps)
+            last_detect = [0.0]
             try:
                 while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
                     ret, frame = cap.read()
                     if not ret:
                         time.sleep(0.05)
                         continue
+                    # Throttle detection to DETECT_FPS. onnxruntime retains
+                    # ~40 MB per InsightFace inference on this build (a known
+                    # leak, provider-independent), so running it at full camera
+                    # fps grows RSS by gigabytes/minute. A few detections per
+                    # second is plenty to notice someone walking up.
+                    now = time.time()
+                    if now - last_detect[0] < detect_interval:
+                        time.sleep(0.005)
+                        continue
+                    last_detect[0] = now
                     faces = tracker.process_frame(frame)
                     focus_id = tracker.focus_track_id
                     for face in (faces or []):

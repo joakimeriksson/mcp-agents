@@ -2,7 +2,7 @@
 name = "face-agent"
 version = "0.1.0"
 description = "Face recognition app that learns faces over time"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 
 dependencies = [
     "dlib",
@@ -27,7 +27,7 @@ dependencies = [
     "soundfile",
     "requests",  # HTTP TTS backend (kokoro-voice-server)
     "fastmcp",   # ServiceHost: service persona + init/exit (mcp_client.py)
-    "onnxruntime>=1.23.2,<2",
+    "onnxruntime>=1.22,<1.23",   # 1.23+ leaks ~40MB per inference on varying input (macOS); 1.22 is clean,
     "torch",
     "torchaudio",
     "noisereduce",

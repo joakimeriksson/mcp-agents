@@ -43,8 +43,22 @@ the CandyTron eye/speech client — and Ctrl-C stops what it started.
 Options: `--robot-ip IP` (or `$NIRYO_IP`), `--robot-camera N` for the table
 camera, `--simulate-robot` / `--simulate-camera` individually,
 `--no-voice-server`, `--face-agent` to use the face agent as the client.
-Anything else goes to the client, e.g. `--camera N` (face camera, `-l` lists
-them), `--mic N`, `--debug-audio`.
+Anything else goes to the client, e.g. `--camera` (people camera), `--mic N`,
+`--debug-audio`.
+
+**Cameras are picked by name, not index.** An iPhone waking up as a Continuity
+Camera renumbers every index — and when it is idle it streams black frames, so
+the demo looks broken. Both `--camera` and `--robot-camera` therefore accept
+part of a device name, which does not move:
+
+```bash
+./start-candytron.sh --robot-camera brio --camera macbook
+```
+
+`mcpclient_speech/config.toml` defaults the people camera to `"macbook"` (the
+built-in laptop camera). `-l` lists cameras with their names, `-m` the
+microphones. A named device that turns out to be black is skipped and the next
+match is tried.
 
 **Direct audio** — `--direct-audio` (or `direct_audio = true` under `[llm]` in
 `mcpclient_speech/config.toml`) sends the captured speech straight into gemma4:

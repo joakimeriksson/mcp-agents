@@ -26,6 +26,8 @@ _DEFAULTS: dict = {
     },
     "devices": {
         "microphone": None,
+        # Index, or part of a device name ("macbook", "brio"). Names are
+        # stable across replugging; indices are not.
         "camera": None,
     },
     "debug": {

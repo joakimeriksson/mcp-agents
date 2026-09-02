@@ -151,7 +151,9 @@ def main():
                         help='IP of the Niryo Ned 2 (default: $NIRYO_IP, else 10.10.10.10)')
     parser.add_argument('--simulate-camera', action='store_true', help='Simulate the camera instead of using real hardware')
     parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
-    parser.add_argument('--camera', type=int, default=None, help='Camera index to use (default: auto-detect first available)')
+    parser.add_argument('--camera', default=None,
+                        help="Table-camera index, or part of its name (e.g. 'brio', 'hp'). "
+                             "Names survive replugging; indices do not. Default: auto-detect.")
     parser.add_argument('--no-window', action='store_true', help='Disable the OpenCV display window')
     parser.add_argument('--log-scenes-dir', default=None, help='If set, log every scene request (annotated camera frame + returned state) to this directory')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
@@ -190,6 +192,21 @@ def main():
 
     # Resolve camera index
     camera_index = args.camera
+    if camera_index is not None and not str(camera_index).lstrip("-").isdigit():
+        # A name: resolve it to an index that actually delivers video, so an
+        # idle Continuity Camera can't be picked for the candy table.
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        '..', 'face'))
+        from camera_utils import resolve_camera
+        cap, idx, cam_name = resolve_camera(camera_index)
+        if cap is None:
+            logger.error("No camera matching %r", camera_index)
+            sys.exit(1)
+        cap.release()
+        logger.info("Table camera %d (%s) for %r", idx, cam_name, camera_index)
+        camera_index = idx
+    elif camera_index is not None:
+        camera_index = int(camera_index)
     if camera_index is None and not simulate_camera:
         camera_index = CameraManager.find_first_camera()
         if camera_index is not None:

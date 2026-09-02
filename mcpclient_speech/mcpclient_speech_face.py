@@ -106,6 +106,11 @@ model: str | None = None
 
 
 def list_cameras(max_index=10):
+    """Cameras OpenCV can open, annotated with their device names."""
+    try:
+        from camera_utils import camera_name
+    except Exception:
+        camera_name = lambda i: ""
     available = []
     for i in range(max_index):
         cap = cv2.VideoCapture(i)
@@ -116,6 +121,7 @@ def list_cameras(max_index=10):
                 'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                 'fps': cap.get(cv2.CAP_PROP_FPS),
                 'backend': cap.getBackendName(),
+                'name': camera_name(i),
             }
             available.append(info)
             cap.release()
@@ -134,7 +140,10 @@ def find_first_camera(max_index=10):
 def parse_args():
     parser = argparse.ArgumentParser(description="MCP Speech Client with Face Tracking")
     parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
-    parser.add_argument('--camera', type=int, default=None, help='Camera index (default: auto-detect)')
+    parser.add_argument('--camera', default=None,
+                        help="Camera index, or part of its name (e.g. 'macbook', 'brio'). "
+                             "Names are stable; indices shuffle when an iPhone wakes up as a "
+                             "Continuity Camera or a USB webcam is plugged in. Default: auto-detect.")
     parser.add_argument('--server', default="http://127.0.0.1:8000/sse", help='MCP server SSE URL')
     parser.add_argument('--llm-model', default=None, help='LLM model name')
     parser.add_argument('--llm-url', default=None, help='LLM base URL')
@@ -769,7 +778,7 @@ async def main(args):
         win.keydict["s"] = (kp_save_recording, None)
         win.keydict["i"] = (kp_cycle_mic, None)
         win.keydict["v"] = (kp_cycle_voice, None)
-        cam_win = CameraWindow(f"{name} - People camera {args.camera}", keydict=win.keydict)
+        cam_win = CameraWindow(f"{name} - People camera", keydict=win.keydict)
         cam_win.set_exit_callback(on_exit, state)
         win.attach_camera_window(cam_win)
         win.check_events()
@@ -937,10 +946,14 @@ async def main(args):
                          FaceEventType.FACE_ENROLLED},
         )
 
-        cap = cv2.VideoCapture(args.camera)
-        if not cap.isOpened():
-            print(f"ERROR: Could not open camera {args.camera}")
+        from camera_utils import resolve_camera
+        cap, cam_index, cam_name = resolve_camera(args.camera)
+        if cap is None:
+            print(f"ERROR: no working camera for --camera {args.camera!r}")
             sys.exit(1)
+        print(f"People camera: {cam_index}"
+              f"{f' ({cam_name})' if cam_name else ''}")
+        _ilog("camera_selected", requested=args.camera, index=cam_index, name=cam_name)
 
         def _camera_loop():
             detect_interval = 1.0 / max(1, args.detect_fps)
@@ -1348,7 +1361,9 @@ def run():
         if cameras:
             print("Available cameras:")
             for c in cameras:
-                print(f"  Index {c['index']}: {c['width']}x{c['height']} @ {c['fps']:.1f} fps ({c['backend']})")
+                label = f" {c['name']}" if c.get('name') else ""
+                print(f"  Index {c['index']}:{label}  {c['width']}x{c['height']} "
+                      f"@ {c['fps']:.1f} fps ({c['backend']})")
         else:
             print("No cameras found")
         sys.exit(0)
@@ -1374,14 +1389,8 @@ def run():
     if args.vad_near_field_ratio is None:
         args.vad_near_field_ratio = cfg["audio"].get("near_field_ratio")
 
-    # Resolve camera index (auto-detect if still None after config)
-    if args.camera is None:
-        args.camera = find_first_camera()
-        if args.camera is not None:
-            print(f"Auto-selected camera at index {args.camera}")
-        else:
-            print("ERROR: No cameras found. Use --camera N.")
-            sys.exit(1)
+    # A name or index may come from --camera or [devices] camera; resolving it
+    # to a device that actually delivers video happens at open time.
 
     global interaction_log
     interaction_log = InteractionLogger.from_args(args)

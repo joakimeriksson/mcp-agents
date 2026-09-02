@@ -10,7 +10,8 @@ import sys
 import threading
 
 from camera import CameraManager
-from robotarm import init_ned, exit_ned, ned_move_between
+from robotarm import (init_ned, exit_ned, ned_move_between,
+                      ned_is_busy, ned_known_positions)
 from transtable import transhead, transtable
 from scene_state import SceneState
 from scene_logger import SceneLogger
@@ -112,10 +113,57 @@ def show_demo_move() -> str:
 @mcp.tool()
 def move_between(src: str, dst: str) -> str:
     """Move an object from one position to another position, using the robot arm. The argument 'src' is the current position of the object. The argument 'dst' is the destination position of the object."""
+    refusal = _refuse_move(src, dst)
+    if refusal:
+        logger.warning("Refused move %r -> %r: %s", src, dst, refusal)
+        return refusal
+    src, dst = src.strip().upper(), dst.strip().upper()
     if ned_move_between(src, dst):
-        return f"Successfully moved from {src} to {dst}"
-    else:
-        return "Failed to move"
+        # The worker runs the move asynchronously, so this is "started", not
+        # "finished" -- saying otherwise makes the robot announce a success it
+        # cannot yet know about (and that a collision may still cancel).
+        return f"Started moving the candy from {src} to {dst}; the arm is moving now."
+    return "Failed to move"
+
+
+# Positions the arm is calibrated for, as a last-resort allow-list for when the
+# robot object isn't up yet (simulation, or before service_init).
+_FALLBACK_POSITIONS = {f"{r}{c}" for r in "ABCD" for c in "123"} | {"O0"}
+
+
+def _refuse_move(src: str, dst: str) -> str | None:
+    """Reason to refuse this move, or None to allow it.
+
+    This is the guard at the hardware boundary: every client goes through it,
+    not just the one that happens to validate on its own side.
+    """
+    if not isinstance(src, str) or not isinstance(dst, str) or not src.strip() or not dst.strip():
+        return "Refused: src and dst must both be position names, e.g. 'D2' and 'O0'."
+    src_n, dst_n = src.strip().upper(), dst.strip().upper()
+
+    known = {p.upper() for p in ned_known_positions()} or _FALLBACK_POSITIONS
+    movable = sorted(p for p in known if p != "HOME")
+    for label, pos in (("src", src_n), ("dst", dst_n)):
+        if pos not in known or pos == "HOME":
+            # Also catches coordinate strings: get_pose() would otherwise parse
+            # "[0.3, 0.1, ...]" and drive the arm to an arbitrary point.
+            return (f"Refused: {label}={pos!r} is not a position on the table. "
+                    f"Valid positions are: {', '.join(movable)}.")
+    if src_n == dst_n:
+        return f"Refused: src and dst are both {src_n}; nothing to do."
+
+    scene = scene_state.get_scene()
+    if scene:                      # only trust these when the vision system sees something
+        if src_n not in scene:
+            occupied = ", ".join(f"{p} ({c})" for p, c in sorted(scene.items()))
+            return (f"Refused: there is no candy at {src_n}, so the arm would grip "
+                    f"nothing. Candy is at: {occupied}.")
+        if dst_n in scene:
+            return (f"Refused: {dst_n} already holds {scene[dst_n]}; moving there would "
+                    f"drop one candy on top of another. Pick a free position.")
+    if ned_is_busy():
+        return "Refused: the arm is still finishing the previous move. Try again in a moment."
+    return None
 
 @mcp.tool()
 def default_action() -> str:

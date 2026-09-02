@@ -60,6 +60,15 @@ _SCENE_POS = re.compile(r"^\s*([A-Z]\d)\s*:\s*(.+?)\s*$", re.MULTILINE)
 # The robot claiming it did something physical. If a turn ends with one of
 # these and NO tool was called, the arm never moved and the visitor is being
 # told a lie -- the single worst failure mode at a stand.
+# Offers and descriptions ("I can show you HOW I move candy", "shall I move
+# it?") are not claims. Treating them as one triggers a retry that tells the
+# model it failed to act -- which can push it into moving candy nobody asked
+# for, the exact failure this guard exists to prevent.
+_NOT_A_CLAIM = re.compile(
+    r"\b(hur jag|om du vill|vill du att jag|ska jag|kan jag visa|"
+    r"how i|if you (want|like)|shall i|would you like|do you want me)\b",
+    re.IGNORECASE)
+
 _ACTION_CLAIM = re.compile(
     r"\b("
     r"jag (flyttar|tar|ger|hämtar|lägger|placerar|skickar)"
@@ -309,7 +318,8 @@ class DirectAudioLLM:
         # the visitor is being told it did. Give the model exactly one chance
         # to make good on it, with the tools still attached.
         if (self._tools and not self.last_tool_calls
-                and reply and _ACTION_CLAIM.search(reply)):
+                and reply and _ACTION_CLAIM.search(reply)
+                and not _NOT_A_CLAIM.search(reply)):
             logger.warning(f"direct: action claimed without a tool call: {reply[:70]!r}"
                            " — retrying")
             messages.append({"role": "assistant", "content": reply})

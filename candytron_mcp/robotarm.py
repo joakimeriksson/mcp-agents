@@ -74,6 +74,28 @@ def ned_move_home():
     if _ned_worker:
         _ned_worker.run({'op':'home'})
 
+def ned_is_busy() -> bool:
+    """True while the arm is executing a move.
+
+    SingleJobWorker.run() blocks until the previous job finishes, so without
+    this check a second move silently stalls the MCP handler (and the whole
+    conversation turn) instead of being reported to the caller.
+    """
+    return bool(_ned_worker) and not _ned_worker.job_done.is_set()
+
+
+def ned_known_positions() -> set:
+    """Names the arm has a calibrated pose for. Anything else must be refused:
+    get_pose() falls back to parsing its argument as raw coordinates, so an
+    unchecked name is a path from model output to an arbitrary arm position."""
+    if not ned:
+        return set()
+    try:
+        return set(ned.get_poses().keys())
+    except Exception:
+        return set()
+
+
 def ned_move_between(src: str, dst: str) -> bool:
     if _ned_worker:
         pos1 = ned.get_pose(src)

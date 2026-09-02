@@ -49,10 +49,49 @@ Rules:
   before you answer. Never say "I can", "I could", "let me" or "I will" —
   those are forbidden; call the tool and then say what you DID.
   To hand candy to the person, move it to position O0.
+- But only act on what you actually HEARD. If the audio was unclear, or you
+  cannot tell WHICH candy they mean, ask them to say it again — do NOT call a
+  tool and do NOT move a random candy. A wrong move is worse than a question.
 """
+
+# Positions the vision system reports, e.g. "A2 : Riesen-kola, brun ...".
+_SCENE_POS = re.compile(r"^\s*([A-Z]\d)\s*:\s*(.+?)\s*$", re.MULTILINE)
+
+# The robot claiming it did something physical. If a turn ends with one of
+# these and NO tool was called, the arm never moved and the visitor is being
+# told a lie -- the single worst failure mode at a stand.
+_ACTION_CLAIM = re.compile(
+    r"\b("
+    r"jag (flyttar|tar|ger|hämtar|lägger|placerar|skickar)"
+    r"|här (får|har) du|varsågod|nu (flyttar|ger|tar) jag|jag har (flyttat|gett|tagit)"
+    r"|i (moved|gave|placed|took|put)|i'?m (moving|giving|getting|taking)"
+    r"|here (you go|it is)|moving it|i'?ll (move|give|get|take)"
+    r"|ich (bewege|gebe|nehme)|je (déplace|donne|prends)"
+    r")\b", re.IGNORECASE)
+
+
+def parse_scene_positions(augmentation: Optional[str]) -> dict:
+    """{position: description} from the vision system's scene text."""
+    if not augmentation:
+        return {}
+    return {m.group(1): m.group(2) for m in _SCENE_POS.finditer(augmentation)}
+
 
 _LANG_TAG = re.compile(r"^\s*\[([a-z]{2}(?:-[a-z]{2})?)\]\s*", re.IGNORECASE)
 _MAX_TOOL_ROUNDS = 3
+
+
+def _split_lang(text: str, default: str) -> tuple:
+    """('sv', 'Hej!') from '[sv] Hej!'; the tag is never spoken."""
+    m = _LANG_TAG.match(text or "")
+    if not m:
+        return default, (text or "").strip()
+    return m.group(1).lower(), text[m.end():].strip()
+
+
+def _has_words(text: str) -> bool:
+    """True if there is something to say once the language tag is removed."""
+    return bool(_split_lang(text or "", "")[1])
 
 
 def _to_wav_bytes(audio: np.ndarray, sample_rate: int = 16000) -> bytes:
@@ -80,6 +119,7 @@ class DirectAudioLLM:
                  sample_rate: int = 16000,
                  temperature: float = 0.2):
         self.last_tool_calls: list = []
+        self.rejected_tool_calls: list = []
         import ollama
         self._client = ollama.Client(host=host)
         self._model = model
@@ -140,6 +180,29 @@ class DirectAudioLLM:
             logger.warning(f"direct: tool {name}({args}) failed: {e}")
             return f"Tool {name} failed: {e}"
 
+    def _reject_bad_move(self, name: str, args: dict, scene: dict) -> Optional[str]:
+        """Reason to refuse this call, or None to let it through.
+
+        The server happily reports "Successfully moved from B1 to O0" for an
+        empty square -- the arm grips air and the visitor gets nothing while
+        the robot says it worked. Only the caller knows what the vision system
+        actually sees, so the check belongs here.
+        """
+        if name != "move_between" or not scene:
+            return None
+        src = str(args.get("src", "")).upper().strip()
+        dst = str(args.get("dst", "")).upper().strip()
+        known = ", ".join(f"{p} ({d.split(',')[0]})" for p, d in sorted(scene.items()))
+        if not src or not dst:
+            return f"Missing src or dst. Candy is at: {known}."
+        if src == dst:
+            return f"src and dst are both {src}; pick a different destination."
+        if src not in scene:
+            return (f"Position {src} is EMPTY -- there is no candy there, so "
+                    f"nothing was moved. Candy is at: {known}. "
+                    f"Call move_between again with one of those as src.")
+        return None
+
     # --- Hot path ---
 
     _LANG_NAMES = {"en": "English", "sv": "Swedish", "de": "German",
@@ -197,6 +260,8 @@ class DirectAudioLLM:
         # shows it — a demo where the arm silently does nothing looks the
         # same as one where it works, so this must not be INFO-only.
         self.last_tool_calls = []
+        self.rejected_tool_calls = []
+        scene = parse_scene_positions(aug)
         reply, used_tools = "", False
         texts: list[str] = []   # every piece of prose the model produced
 
@@ -219,6 +284,16 @@ class DirectAudioLLM:
                 fn = call["function"]
                 logger.info(f"direct: tool call {fn['name']}({dict(fn['arguments'])})")
                 args = dict(fn["arguments"])
+                refusal = self._reject_bad_move(fn["name"], args, scene)
+                if refusal:
+                    # Don't send the arm after candy that isn't there. Hand the
+                    # model the reason plus the real positions so it can retry
+                    # in the next round instead of miming an empty square.
+                    logger.warning(f"direct: rejected {fn['name']}({args}): {refusal}")
+                    self.rejected_tool_calls.append((fn["name"], args, refusal))
+                    messages.append({"role": "tool", "tool_name": fn["name"],
+                                     "content": refusal})
+                    continue
                 result = self._call_tool(fn["name"], args)
                 self.last_tool_calls.append((fn["name"], args, result))
                 messages.append({"role": "tool", "tool_name": fn["name"],
@@ -229,21 +304,75 @@ class DirectAudioLLM:
         # confirmation (text-only, cheap) — the model still has the tool
         # results in its history.
         reply = reply or (texts[-1] if texts else "")
-        if not reply and used_tools:
+
+        # Claimed an action without calling the tool: the arm never moved and
+        # the visitor is being told it did. Give the model exactly one chance
+        # to make good on it, with the tools still attached.
+        if (self._tools and not self.last_tool_calls
+                and reply and _ACTION_CLAIM.search(reply)):
+            logger.warning(f"direct: action claimed without a tool call: {reply[:70]!r}"
+                           " — retrying")
+            messages.append({"role": "assistant", "content": reply})
             messages.append({"role": "user", "content":
-                             "Briefly tell the user what you just did, in "
-                             "their spoken language, starting with its ISO "
-                             "code in brackets. 1 sentence."})
+                             "You just told the person you were moving or "
+                             "handing over candy, but you did not call the "
+                             "tool, so nothing happened. Call the tool NOW "
+                             "for exactly that action, then confirm in one "
+                             "sentence starting with the ISO language code "
+                             "in brackets."})
+            for _ in range(2):
+                resp = self._client.chat(model=self._model, messages=messages,
+                                         tools=self._tools or None,
+                                         options=self._options,
+                                         think=False, stream=False)
+                m2 = resp["message"]
+                calls2 = m2.get("tool_calls") or []
+                content2 = (m2.get("content") or "").strip()
+                if not calls2:
+                    if _has_words(content2) and self.last_tool_calls:
+                        reply = content2
+                    break
+                messages.append(m2)
+                for call in calls2:
+                    fn = call["function"]
+                    args = dict(fn["arguments"])
+                    refusal = self._reject_bad_move(fn["name"], args, scene)
+                    if refusal:
+                        self.rejected_tool_calls.append((fn["name"], args, refusal))
+                        messages.append({"role": "tool", "tool_name": fn["name"],
+                                         "content": refusal})
+                        continue
+                    logger.info(f"direct: recovered tool call {fn['name']}({args})")
+                    result = self._call_tool(fn["name"], args)
+                    self.last_tool_calls.append((fn["name"], args, result))
+                    messages.append({"role": "tool", "tool_name": fn["name"],
+                                     "content": result})
+                # Only take the retry's words if it produced any: after a
+                # recovered tool call gemma often answers with the bare
+                # language tag ("[sv]"), and the sentence it already said in
+                # round 1 is now TRUE, so keeping it beats going silent.
+                if _has_words(content2):
+                    reply = content2
+            if not self.last_tool_calls:
+                logger.warning("direct: still no tool call — the claim stands "
+                               "but the arm did not move")
+
+        language, reply = _split_lang(reply, language_hint or "en")
+
+        # Never go silent, especially right after moving the arm: a visitor
+        # who gets candy and hears nothing assumes it is broken. Checked on
+        # the tag-stripped text, since a bare "[sv]" is not an answer.
+        if not reply and self.last_tool_calls:
+            messages.append({"role": "user", "content":
+                             "Tell the person in ONE short sentence what you "
+                             "just did, in their spoken language, starting "
+                             "with its ISO code in brackets."})
             resp = self._client.chat(model=self._model, messages=messages,
                                      options=self._options,
                                      think=False, stream=False)
-            reply = (resp["message"].get("content") or "").strip()
+            language, reply = _split_lang(
+                (resp["message"].get("content") or "").strip(), language)
         elapsed = time.time() - start
 
-        language = language_hint or "en"
-        m = _LANG_TAG.match(reply)
-        if m:
-            language = m.group(1).lower()
-            reply = reply[m.end():].strip()
         logger.info(f"direct: reply in {elapsed:.2f}s lang={language}: {reply}")
         return reply, language

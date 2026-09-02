@@ -86,6 +86,14 @@ def get_service_augmentation(lang: str) -> str:
 
 @mcp.tool()
 def show_demo_move() -> str:
+    """Show off the arm by moving ONE RANDOM candy to a random free position.
+
+    Only call this when the person explicitly asks to SEE a demonstration of
+    the robot arm ("show me what you can do", "visa vad du kan"). It picks the
+    candy and the destination at RANDOM and hands nothing to the person, so it
+    must never be used to fetch, give or move a specific candy — use
+    move_between for that.
+    """
     scene = scene_state.get_scene()
     scenepos = list(scene.keys())
     emptypos = [k for k in cam.camera_positions() if k not in scenepos] if cam else []
@@ -111,8 +119,13 @@ def move_between(src: str, dst: str) -> str:
 
 @mcp.tool()
 def default_action() -> str:
-    """This function can be called whenever there is no obvious other function to call."""
-    return "Successfully did nothing"
+    """Do nothing at all. The robot arm does NOT move.
+
+    Only for a request that needs no physical action. If the person wants a
+    candy moved, fetched or handed over, call move_between instead — calling
+    this one leaves them empty-handed.
+    """
+    return "Did nothing: no physical action was taken, the arm did not move."
 
 
 def _run_mcp_server(args):

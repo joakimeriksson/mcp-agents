@@ -46,6 +46,16 @@ VAD_THRESHOLD = 0.7
 VAD_SILENCE_MS = 800
 VAD_RESUME_MS = 130   # speech must sustain this long to reset the silence countdown
 VAD_MAX_SPEECH_S = 15
+# Near-field gate: a chunk only counts as "someone talking TO the robot" if it
+# is BOTH speech (Silero) and louder than the room's noise floor by this ratio.
+# Silero rates crowd chatter as speech, so at a fair the silence countdown
+# never completes and every utterance runs to VAD_MAX_SPEECH_S. The person at
+# the robot is much closer to the mic than the crowd, so loudness separates
+# them. 1.0 disables the gate (pre-fair behaviour). ~3.0 = +9.5 dB over the floor.
+VAD_NEAR_FIELD_RATIO = 3.0
+# Absolute floor so a silent room can't make the gate trigger on a whisper of
+# noise (RMS of true digital silence is ~0).
+VAD_NEAR_FIELD_MIN_RMS = 0.004
 VAD_PRE_SPEECH_MS = 500
 AUDIO_METER_DECAY = 0.92
 NOISE_REDUCE = True
@@ -494,6 +504,7 @@ class VoiceInput:
                  vad_threshold: float = VAD_THRESHOLD,
                  vad_silence_ms: int = VAD_SILENCE_MS,
                  vad_resume_ms: int = VAD_RESUME_MS,
+                 vad_near_field_ratio: float = VAD_NEAR_FIELD_RATIO,
                  vad_max_speech_s: float = VAD_MAX_SPEECH_S,
                  vad_pre_speech_ms: int = VAD_PRE_SPEECH_MS,
                  noise_reduce: bool = NOISE_REDUCE,
@@ -510,6 +521,7 @@ class VoiceInput:
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
         self._vad_resume_ms = vad_resume_ms
+        self._vad_near_ratio = vad_near_field_ratio
         self._vad_max_speech_s = vad_max_speech_s
         self._vad_pre_speech_ms = vad_pre_speech_ms
         self._noise_reduce = noise_reduce
@@ -539,6 +551,10 @@ class VoiceInput:
         # Live end-of-utterance countdown: 0.0 (no trailing silence yet) to
         # 1.0 (silence long enough — utterance ends). For debug meters.
         self.silence_progress: float = 0.0
+        # Near-field gate telemetry (debug panel / tuning at a venue)
+        self.noise_floor: float = 0.0
+        self.chunk_rms: float = 0.0
+        self.near_field: bool = False
 
         self._dispatcher = EventDispatcher(owner="voice_input")
 
@@ -778,6 +794,14 @@ class VoiceInput:
 
         pre_buffer = collections.deque(maxlen=pre_speech_chunks)
         speech_chunks = []
+        # Adaptive room-noise floor for the near-field gate. Seeded from the
+        # first non-speech chunks, then tracked fast-down / slow-up so it
+        # follows the room without ever being pulled up by the speaker.
+        # Rolling window of recent chunk levels, sampled only while NOT
+        # capturing an utterance, so the speaker's own voice never enters it.
+        floor_window = collections.deque(maxlen=int(3000 / chunk_ms))
+        noise_floor = 0.0
+        near_ratio = float(self._vad_near_ratio or 0.0)
         silence_count = 0
         speech_run = 0     # consecutive speech chunks within trailing silence
         speech_started = False
@@ -811,9 +835,36 @@ class VoiceInput:
                 speech_prob = vad_model(tensor, self._sample_rate).item()
                 self.vad_prob = speech_prob
 
+                # --- Near-field gate -------------------------------------
+                # Silero answers "is this speech?", not "is this speech aimed
+                # at me": at a fair it says yes to the whole room. Loudness
+                # relative to the room's own floor separates the person at the
+                # robot from the crowd behind them.
+                rms = float(np.sqrt(np.mean(chunk ** 2)))
+                self.chunk_rms = rms
+                vad_says_speech = speech_prob >= self._vad_threshold
+                # The floor must learn the ROOM, including crowd babble that
+                # Silero scores as speech. A min-tracker would latch onto the
+                # gaps between syllables and read the room as silent, so use a
+                # PERCENTILE of the last few seconds instead: for continuous
+                # babble that lands at the babble's own level. Sampled only
+                # while not capturing, so the speaker never raises the bar
+                # under their own voice.
+                if not speech_started:
+                    floor_window.append(rms)
+                if floor_window:
+                    noise_floor = float(np.percentile(floor_window, 50))
+                self.noise_floor = noise_floor
+                if near_ratio > 1.0:
+                    near = rms >= max(noise_floor * near_ratio, VAD_NEAR_FIELD_MIN_RMS)
+                else:
+                    near = True
+                self.near_field = near
+                is_speech = vad_says_speech and near
+
                 if not speech_started:
                     pre_buffer.append(chunk.copy())
-                    if speech_prob >= self._vad_threshold:
+                    if is_speech:
                         speech_started = True
                         self.listen_phase = "recording"
                         silence_count = 0
@@ -830,7 +881,7 @@ class VoiceInput:
                         return None
                 else:
                     speech_chunks.append(chunk.copy())
-                    if speech_prob < self._vad_threshold:
+                    if not is_speech:
                         speech_run = 0
                         silence_count += 1
                         self.silence_progress = silence_count / silence_chunks_needed

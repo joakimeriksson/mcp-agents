@@ -68,6 +68,7 @@ messages_trunclen = 8
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
 omit_names_and_prefs = False
+talk_to_unknown = True   # greet faces the DB doesn't know yet
 
 muted = False
 
@@ -160,6 +161,9 @@ def parse_args():
                       help='Average the k nearest stored samples per person when matching')
     tune.add_argument('--max-missing-seconds', type=float, default=None,
                       help='Grace period before a missing face is dropped (survives look-aways)')
+    tune.add_argument('--vad-near-field-ratio', type=float, default=None,
+                      help='How much louder than the room a voice must be to count as '
+                           'talking TO the robot (1.0 = off). Raise in a noisy hall.')
     tune.add_argument('--focus-min-area-frac', type=float, default=None,
                       help='Min fraction of frame a face must cover to take focus (0 = off)')
     tune.add_argument('--focus-dwell-seconds', type=float, default=None,
@@ -772,8 +776,12 @@ async def main(args):
         print('Created the interaction window')
 
         ### Initialize voice_input library, as ContinuousListener with on_speech as callback here
+        vin_kwargs = {}
+        if args.vad_near_field_ratio is not None:
+            vin_kwargs["vad_near_field_ratio"] = float(args.vad_near_field_ratio)
         voice_in = VoiceInput(device=args.mic,
-                              stt_backend="raw" if args.direct_audio else "gemma4")
+                              stt_backend="raw" if args.direct_audio else "gemma4",
+                              **vin_kwargs)
         voice_in.subscribe(
             lambda ev: _ilog("transcription",
                              text=ev.payload.text,
@@ -782,6 +790,25 @@ async def main(args):
                              audio_duration_ms=ev.payload.audio_duration_ms),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
         )
+        def _log_vad(ev):
+            # The fair failure mode leaves no trace otherwise: in a noisy hall
+            # every utterance runs to the length cap and arrives as a blob of
+            # crowd + visitor. Log the shape of each capture so it is visible.
+            if ev.type == VoiceEventType.VAD_SPEECH_END:
+                _ilog("vad_capture", duration_ms=ev.payload.duration_ms,
+                      noise_floor=round(getattr(voice_in, "noise_floor", 0.0), 5))
+            elif ev.type == VoiceEventType.VAD_TIMEOUT:
+                _ilog("vad_timeout", reason=ev.payload.reason,
+                      waited_ms=ev.payload.waited_ms,
+                      noise_floor=round(getattr(voice_in, "noise_floor", 0.0), 5))
+                if ev.payload.reason == "max_speech_length":
+                    logger.warning(
+                        "VAD hit the %.0fs length cap — the room is noisy enough that "
+                        "silence never registers. Raise [audio] near_field_ratio.",
+                        ev.payload.waited_ms / 1000)
+
+        voice_in.subscribe(_log_vad, event_types={VoiceEventType.VAD_SPEECH_END,
+                                                  VoiceEventType.VAD_TIMEOUT})
         voice_in.subscribe(
             lambda ev: on_speech(ev.payload.text),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
@@ -878,12 +905,30 @@ async def main(args):
 
         def _on_face_event(ev):
             if ev.type == FaceEventType.FOCUS_CHANGED:
-                focus_state["track_id"] = ev.payload.new_track_id
-                _emit(ev.payload.new_person_id)
+                tid = ev.payload.new_track_id
+                focus_state["track_id"] = tid
+                pid = ev.payload.new_person_id
+                if pid is None and tid is not None and talk_to_unknown:
+                    # Talk to a visitor the face DB doesn't know yet. Otherwise
+                    # the robot sits in 'wait' (green eye) until auto-enrollment
+                    # fires, which needs a big, sharp, frontal face -- at a stand
+                    # most visitors never clear that bar and are never greeted.
+                    pid = f"track:{tid}"
+                _emit(pid)
             elif ev.type in (FaceEventType.IDENTITY_CONFIRMED,
                              FaceEventType.FACE_ENROLLED):
                 if ev.track_id == focus_state["track_id"]:
-                    _emit(ev.payload.person_id)
+                    provisional = f"track:{ev.track_id}"
+                    if focus_state["person_id"] == provisional:
+                        # Same human, now identified: adopt the real id in place
+                        # so the ongoing conversation is NOT restarted.
+                        if provisional in persondict:
+                            persondict[ev.payload.person_id] = persondict.pop(provisional)
+                        focus_state["person_id"] = ev.payload.person_id
+                        logger.info("Provisional %s identified as %s",
+                                    provisional, ev.payload.person_id)
+                    else:
+                        _emit(ev.payload.person_id)
 
         tracker.subscribe(
             _on_face_event,
@@ -1105,6 +1150,10 @@ async def main(args):
                         # The model heard a language switch; trust it only on a
                         # real sentence (the tag misfires on short turns).
                         lang = choose_language(lang, tag_lang, reply_text)
+                    for _tn, _ta, _tr in getattr(direct_llm, "rejected_tool_calls", []):
+                        print(f"\n  Rejected: {_tn} ( {json.dumps(_ta)} )")
+                        print(f"  Reason:   {_tr[:90]}")
+                        _ilog("tool_call_rejected", name=_tn, arguments=_ta, reason=_tr)
                     for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
                         print(f"\n  Function: {_tn} ( {json.dumps(_ta)} )")
                         print(f"  Result:   {_tr}")
@@ -1267,7 +1316,7 @@ async def main(args):
         print('Exiting')
 
 def run():
-    global omit_names_and_prefs
+    global omit_names_and_prefs, talk_to_unknown
 
     args = parse_args()
 
@@ -1317,10 +1366,13 @@ def run():
         args.mic = cfg["devices"].get("microphone")
 
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
+    talk_to_unknown = cfg["face"].get("talk_to_unknown", True)
     if args.debug_audio is None:
         args.debug_audio = cfg["debug"].get("audio_panel", False)
     if args.direct_audio is None:
         args.direct_audio = cfg["llm"].get("direct_audio", False)
+    if args.vad_near_field_ratio is None:
+        args.vad_near_field_ratio = cfg["audio"].get("near_field_ratio")
 
     # Resolve camera index (auto-detect if still None after config)
     if args.camera is None:

@@ -30,6 +30,9 @@ VOICE_PORT="${VOICE_PORT:-8880}"
 VOICE_LANGS="${VOICE_LANGS:-sv,en,fr,es,it}"
 PORT=7999
 LOG_DIR="${CANDYTRON_LOG_DIR:-/tmp}"
+# Session transcript (JSONL) of every turn, tool call and VAD capture. On by
+# default: after the first fair we had no record of what actually happened.
+SESSION_LOG_DIR="${CANDYTRON_SESSION_LOG_DIR:-$ROOT/mcpclient_speech/logs}"
 
 SERVER_ARGS=()
 CLIENT_ARGS=()
@@ -124,7 +127,8 @@ if [[ $CLIENT == face ]]; then
 else
     echo "[candytron] starting mcpclient_speech_face"
     (cd "$ROOT/mcpclient_speech" && exec uv run mcpclient_speech_face.py \
-        --server "http://127.0.0.1:$PORT/sse" "${CLIENT_ARGS[@]}") &
+        --server "http://127.0.0.1:$PORT/sse" --log-dir "$SESSION_LOG_DIR" \
+        "${CLIENT_ARGS[@]}") &
 fi
 CLIENT_PID=$!
 STARTED+=("$CLIENT_PID")

@@ -275,6 +275,14 @@ class EyeWindow:
             db = 20 * np.log10(m.rms + 1e-10)
             self.vu_mic.update(level, color, peak=peak, text=f"{db:.0f}")
         v = self._voice_input
+        if v is not None and m is not None and getattr(v, "noise_floor", 0.0) > 0:
+            # Draw the near-field gate on the MIC bar: your voice has to reach
+            # this line to count as talking to the robot. Lets you check the
+            # setting against the actual room, from across the stand.
+            ratio = getattr(v, "_vad_near_ratio", 1.0) or 1.0
+            if ratio > 1.0:
+                ref = max(m.max_seen, 0.001)
+                self.vu_mic.set_threshold(min(1.0, (v.noise_floor * ratio) / ref))
         if v is not None:
             p = v.vad_prob
             active = p >= v.vad_threshold

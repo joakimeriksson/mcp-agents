@@ -13,6 +13,16 @@ _DEFAULTS: dict = {
     },
     "face": {
         "omit_names_and_prefs": False,
+        # Greet a focused face even when the face DB has no identity for it.
+        # False = the old behaviour: wait for recognition/auto-enrollment.
+        "talk_to_unknown": True,
+    },
+    "audio": {
+        # A voice must be this many times louder than the room's own noise
+        # floor to count as talking to the robot (1.0 = off). Silero rates
+        # crowd chatter as speech, so without this every utterance in a busy
+        # hall runs to the 15 s cap and background babble triggers turns.
+        "near_field_ratio": 3.0,
     },
     "devices": {
         "microphone": None,

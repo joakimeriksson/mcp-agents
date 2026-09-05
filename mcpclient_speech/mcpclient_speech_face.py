@@ -128,14 +128,6 @@ def list_cameras(max_index=10):
     return available
 
 
-def find_first_camera(max_index=10):
-    for i in range(max_index):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            cap.release()
-            return i
-    return None
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MCP Speech Client with Face Tracking")

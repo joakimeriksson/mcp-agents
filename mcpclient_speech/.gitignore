@@ -4,3 +4,6 @@ piper_models/
 emotion_model/
 *.onnx
 *.wav
+
+# Session transcripts written by --log-dir (on by default in start-candytron.sh)
+logs/

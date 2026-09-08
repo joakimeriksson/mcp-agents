@@ -333,7 +333,8 @@ def main():
     parser = argparse.ArgumentParser(description="Face Agent UI")
     parser.add_argument("--db-dir", default=os.path.join(_SOURCE_DIR, "known_faces"))
     parser.add_argument("--people-dir", default=os.path.join(_SOURCE_DIR, "people"))
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=-1,
+                        help="Camera index; -1 (default) auto-picks the first that delivers video")
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--no-auto-ask", action="store_true")
     parser.add_argument("--no-auto-greet", action="store_true")
@@ -457,9 +458,10 @@ def main():
     agent.start()
 
     # --- Camera + UI loop ---
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        logger.error(f"Could not open camera {args.camera}")
+    from camera_utils import open_camera
+    cap, cam_idx = open_camera(args.camera)
+    if cap is None:
+        logger.error("Could not open a working camera (all black/unavailable)")
         return
 
     cv2.namedWindow("Face Recognition", cv2.WINDOW_NORMAL)

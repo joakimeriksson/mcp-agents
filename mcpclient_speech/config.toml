@@ -1,11 +1,22 @@
 [llm]
-model    = "PetrosStav/gemma3-tools:12b"
+model    = "gemma4:latest"
 base_url = "http://localhost:11434/v1/"
 api_key  = "ollama"
+direct_audio = true    # speech straight into gemma4 (one call: hear + think + tools)
 
 [face]
-omit_names_and_prefs = false
+omit_names_and_prefs = true    # skip "vad heter du?" and the per-person distillation LLM call
+talk_to_unknown      = true    # greet visitors the face DB has never seen (no identity needed)
+
+[audio]
+near_field_ratio = 3.0   # voice must be 3x the room noise floor to count (1.0 = off)
 
 [devices]
-# camera     = 0   # uncomment to set default camera index (face client only)
-# microphone = 0   # uncomment to set default microphone device index
+# Camera/mic may be an index OR part of the device name. Prefer names: an
+# iPhone waking up as a Continuity Camera renumbers every index, and an idle
+# one streams black frames. Run with -l (cameras) or -m (mics) to list them.
+camera     = "macbook"   # the built-in laptop camera, never the iPhone
+# microphone = 0         # uncomment to pin a microphone
+
+[debug]
+audio_panel = true   # VU meters + oscilloscope in the eye window

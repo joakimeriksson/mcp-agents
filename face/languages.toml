@@ -2,6 +2,10 @@
 #
 # Each [languages.<code>] section defines a supported language:
 #   tts_model  — Piper voice model name (downloaded automatically)
+#   tts_server — optional: OpenAI-compatible /v1/audio/speech URL; when set,
+#                TTS goes over HTTP (kokoro-voice-server) with tts_voice as
+#                the voice name, and tts_model becomes the offline fallback
+#   tts_voices — optional list of alternative server voices (live selectable)
 #   greetings  — Plain greetings ({name} is replaced)
 #   goodbyes   — Farewell phrases ({name} is replaced)
 #   ask_name   — Prompts for asking an unknown person's name
@@ -16,7 +20,9 @@ default = "en"
 # ── English ──────────────────────────────────────────────────────────
 
 [languages.en]
-tts_model = "en_US-lessac-medium"
+tts_model = "en_US-lessac-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "af_heart"
 
 greetings = [
     "Hello, {name}!",
@@ -37,11 +43,6 @@ ask_name = [
     "Hi there, I don't think we've met — what should I call you?",
     "Hey! What's your name?",
 ]
-
-[languages.en.pronunciations]
-Niclas = "Nick-lass"
-Joakim = "Yo-ah-kim"
-Anders = "Ahn-ders"
 
 [languages.en.interview]
 favourite_candy = [
@@ -78,7 +79,13 @@ favourite_music = [
 # ── Swedish ──────────────────────────────────────────────────────────
 
 [languages.sv]
-tts_model = "sv_SE-lisa-medium"
+tts_model = "sv_SE-lisa-medium"    # Piper fallback if the server is down
+# Swedish Kokoro voices via kokoro-voice-server (start it on :8880).
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "Greta"
+# Selectable live in the clients (mcpclient_speech: press 'v')
+tts_voices = ["Stina", "Alice", "Ebba", "Elsa", "Greta", "Anton", "Björn", "Lars", "Nils", "Oskar"]
+tts_speed = 1.3      # speech rate: <1 slower, >1 faster (0.5-2.0)
 
 greetings = [
     "Hej {name}!",
@@ -99,15 +106,6 @@ ask_name = [
     "Hejsan, jag tror inte vi har träffats — vad heter du?",
     "Hej! Vad ska jag kalla dig?",
 ]
-
-[languages.sv.pronunciations]
-godis = "goo-this"
-favoritgodis = "favoritgoo-this"
-Niclas = "Niklas"
-Riesen = "Risen"
-robot = "robått"
-robotarm = "robått-arm"
-"päron" = "pähron"
 
 [languages.sv.interview]
 favourite_candy = [
@@ -144,7 +142,9 @@ favourite_music = [
 # ── French ───────────────────────────────────────────────────────────
 
 [languages.fr]
-tts_model = "fr_FR-siwis-medium"
+tts_model = "fr_FR-siwis-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "ff_siwis"
 
 greetings = [
     "Bonjour {name} !",
@@ -165,11 +165,6 @@ ask_name = [
     "Salut, je ne crois pas qu'on se connaît — comment tu t'appelles ?",
     "Hey ! Quel est ton prénom ?",
 ]
-
-[languages.fr.pronunciations]
-Niclas = "Nick-lasse"
-Joakim = "Yo-akim"
-Anders = "Ann-dèrss"
 
 [languages.fr.interview]
 favourite_colour = [
@@ -196,7 +191,9 @@ favourite_music = [
 # ── Spanish ──────────────────────────────────────────────────────────
 
 [languages.es]
-tts_model = "es_ES-davefx-medium"
+tts_model = "es_ES-davefx-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "ef_dora"
 
 greetings = [
     "¡Hola {name}!",
@@ -217,11 +214,6 @@ ask_name = [
     "¡Hola, no creo que nos conozcamos! ¿Cómo te llamas?",
     "¡Hey! ¿Cuál es tu nombre?",
 ]
-
-[languages.es.pronunciations]
-Niclas = "Nick-las"
-Joakim = "Yo-akim"
-Anders = "An-ders"
 
 [languages.es.interview]
 favourite_colour = [
@@ -300,7 +292,9 @@ favourite_music = [
 # ── Italian ─────────────────────────────────────────────────────────
 
 [languages.it]
-tts_model = "it_IT-paola-medium"
+tts_model = "it_IT-paola-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"
+tts_voice = "if_sara"
 
 greetings = [
     "Ciao {name}!",
@@ -321,11 +315,6 @@ ask_name = [
     "Ehi, non credo che ci siamo già incontrati — come ti chiami?",
     "Ciao! Qual è il tuo nome?",
 ]
-
-[languages.it.pronunciations]
-Niclas = "Nick-lass"
-Joakim = "Yo-akim"
-Anders = "An-ders"
 
 [languages.it.interview]
 favourite_colour = [

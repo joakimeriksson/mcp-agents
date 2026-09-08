@@ -3,7 +3,7 @@ name = "mcpscreen"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "openai",
     "fastmcp>=2.3.4",
@@ -18,5 +18,10 @@ dependencies = [
     "piper-tts",
     "opencv-python",
     "face-recognition",
-    "onnxruntime",
+    # The shared face_tracker (../face) defaults to the InsightFace backend
+    "insightface>=1.0.1,<2",
+    "onnxruntime>=1.22,<1.23",
+    "soundfile>=0.14.0",
+    "ollama>=0.6.2",
+    "requests>=2.34.2",
 ]

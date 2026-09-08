@@ -27,13 +27,17 @@ if _FACE_DIR not in sys.path:
 
 from readnb import *
 from eyewindow import *
-from voice_input import VoiceInput, ContinuousListener, VoiceEventType, list_input_devices
+from voice_input import (
+    VoiceInput, ContinuousListener, VoiceEventType, AudioMonitor,
+    list_input_devices, RAW_AUDIO_TEXT,
+)
 from voice_output import VoiceOutput
 from face_tracker import (
     FaceTracker, FaceDatabase, FaceEventType,
 )
 from face_config import build_db_kwargs, build_tracker_kwargs, backend_metric
 import cv2
+import sounddevice as sd
 from config import load_config
 from interaction_logger import InteractionLogger
 
@@ -64,6 +68,7 @@ messages_trunclen = 8
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
 omit_names_and_prefs = False
+talk_to_unknown = True   # greet faces the DB doesn't know yet
 
 muted = False
 
@@ -94,11 +99,18 @@ cam_win: CameraWindow | None = None
 voice_in: VoiceInput | None = None
 voice_out: VoiceOutput | None = None
 listener: ContinuousListener | None = None
+audio_monitor: AudioMonitor | None = None   # debug panel meters (may be None)
+direct_llm = None   # DirectAudioLLM when --direct-audio (speech straight into gemma4)
 tracker: FaceTracker | None = None
 model: str | None = None
 
 
 def list_cameras(max_index=10):
+    """Cameras OpenCV can open, annotated with their device names."""
+    try:
+        from camera_utils import camera_name
+    except Exception:
+        camera_name = lambda i: ""
     available = []
     for i in range(max_index):
         cap = cv2.VideoCapture(i)
@@ -109,25 +121,21 @@ def list_cameras(max_index=10):
                 'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                 'fps': cap.get(cv2.CAP_PROP_FPS),
                 'backend': cap.getBackendName(),
+                'name': camera_name(i),
             }
             available.append(info)
             cap.release()
     return available
 
 
-def find_first_camera(max_index=10):
-    for i in range(max_index):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            cap.release()
-            return i
-    return None
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MCP Speech Client with Face Tracking")
     parser.add_argument('-l', '--list-cameras', action='store_true', help='List available cameras and exit')
-    parser.add_argument('--camera', type=int, default=None, help='Camera index (default: auto-detect)')
+    parser.add_argument('--camera', default=None,
+                        help="Camera index, or part of its name (e.g. 'macbook', 'brio'). "
+                             "Names are stable; indices shuffle when an iPhone wakes up as a "
+                             "Continuity Camera or a USB webcam is plugged in. Default: auto-detect.")
     parser.add_argument('--server', default="http://127.0.0.1:8000/sse", help='MCP server SSE URL')
     parser.add_argument('--llm-model', default=None, help='LLM model name')
     parser.add_argument('--llm-url', default=None, help='LLM base URL')
@@ -154,6 +162,9 @@ def parse_args():
                       help='Average the k nearest stored samples per person when matching')
     tune.add_argument('--max-missing-seconds', type=float, default=None,
                       help='Grace period before a missing face is dropped (survives look-aways)')
+    tune.add_argument('--vad-near-field-ratio', type=float, default=None,
+                      help='How much louder than the room a voice must be to count as '
+                           'talking TO the robot (1.0 = off). Raise in a noisy hall.')
     tune.add_argument('--focus-min-area-frac', type=float, default=None,
                       help='Min fraction of frame a face must cover to take focus (0 = off)')
     tune.add_argument('--focus-dwell-seconds', type=float, default=None,
@@ -164,6 +175,18 @@ def parse_args():
                       help='Max |pitch| degrees for the focused face to count as engaged')
     tune.add_argument('--engage-dwell-seconds', type=float, default=None,
                       help='Seconds the focused face must face the camera before FACE_ENGAGED')
+
+    parser.add_argument('--direct-audio', action='store_true', default=None,
+                        help='Send the captured speech straight into the (audio-capable) LLM: '
+                             'one call does hearing + reasoning + tool calls. The transcript '
+                             'for the history/log is produced in the background. '
+                             '(default from config [llm] direct_audio)')
+    parser.add_argument('--detect-fps', type=int, default=6,
+                        help='Max face-detection rate (Hz). Lower = far less memory '
+                             '(InsightFace/onnxruntime leaks ~40MB per inference on this build).')
+    parser.add_argument('--debug-audio', action='store_true', default=None,
+                        help='Show the audio debug panel (VU meters + oscilloscope) '
+                             'in the eye window (default from config [debug] audio_panel)')
 
     log_group = parser.add_mutually_exclusive_group()
     log_group.add_argument('--log-file', default=None, help='Log every interaction event to this JSONL file (overwrites on each run)')
@@ -237,11 +260,83 @@ def kp_force_process(_event, _obj):
     else:
         logger.debug("force-process pressed but ignored (state=%s)", state.get('currstate'))
 
+def _current_mic() -> tuple[int | None, str]:
+    """(index, name) of the microphone in use; resolves the system default."""
+    idx = voice_in.device if voice_in is not None else None
+    if idx is None:
+        try:
+            idx = sd.default.device[0]
+        except Exception:
+            return None, "system default"
+    try:
+        return idx, sd.query_devices(idx)['name']
+    except Exception:
+        return idx, f"device {idx}"
+
+def _show_mic_indicator() -> None:
+    """Indicator line: active mic + active voice, with their hotkeys."""
+    if win is None:
+        return
+    idx, name = _current_mic()
+    text = f"Mic {idx}: {name} (i)"
+    if voice_out is not None and voice_out.server_voices(default_lang):
+        text += f"   |   Voice: {voice_out.server_voice(default_lang)} (v)"
+    win.set_indicator(text)
+    win.check_events()
+
+def kp_cycle_voice(_event, _obj):
+    """'v': next server voice for the default language (Swedish), live.
+    Speaks a short sample in the new voice when the robot is idle."""
+    if voice_out is None:
+        return
+    voices = voice_out.server_voices(default_lang)
+    if not voices:
+        logger.info("No selectable voices configured for %s", default_lang)
+        return
+    cur = voice_out.server_voice(default_lang)
+    pos = voices.index(cur) if cur in voices else -1
+    new_voice = voices[(pos + 1) % len(voices)]
+    voice_out.set_server_voice(default_lang, new_voice)
+    _ilog("voice_change", language=default_lang, voice=new_voice)
+    _show_mic_indicator()
+    if state.get('currstate') in ('wait', 'listen') and not voice_out.speaking:
+        # Audition: pause the mic while the sample plays, then restore.
+        if listener:
+            listener.paused = True
+        def _sample():
+            voice_out.speak(f"Hej, jag heter {new_voice}.", default_lang)
+            time.sleep(0.3)
+            if listener:
+                listener.paused = (state.get('currstate') != 'listen')
+        threading.Thread(target=_sample, daemon=True).start()
+
+def kp_cycle_mic(_event, _obj):
+    """'i': switch to the next input device, live — VAD/STT and the
+    debug-panel meters follow. The active mic is shown in the indicator."""
+    if voice_in is None:
+        return
+    devices = list_input_devices()
+    if not devices:
+        return
+    cur, _ = _current_mic()
+    idxs = [d[0] for d in devices]
+    pos = idxs.index(cur) if cur in idxs else -1
+    new_idx, name = devices[(pos + 1) % len(devices)][:2]
+    voice_in.set_device(new_idx)
+    if audio_monitor is not None:
+        audio_monitor.set_device(new_idx)
+    logger.info("Microphone -> %d: %s", new_idx, name)
+    _ilog("mic_change", device=new_idx, name=name)
+    _show_mic_indicator()
+
 def _refresh_save_indicator(count: int) -> None:
     if win is None:
         return
-    win.set_indicator(f"Save next {count}" if count > 0 else None)
-    win.check_events()
+    if count > 0:
+        win.set_indicator(f"Save next {count}")
+        win.check_events()
+    else:
+        _show_mic_indicator()
 
 def kp_save_recording(_event, _obj):
     if voice_in is None:
@@ -263,6 +358,7 @@ def on_face_change(id):
     logger.info("Face change event")
     if muted or state['newstate'] == 'exit':
         return
+    reset_language_switch()   # a new person starts the switch hysteresis over
     prev_face_id = next((pid for pid, p in persondict.items() if p is curr_person), None)
     if curr_person:
         logger.info("Storing current person")
@@ -421,6 +517,89 @@ async def augmentation_message(client, lang):
 def user_message(prompt):
     return {"role": "user", "content": prompt}
 
+def _text_history(mlst, max_turns):
+    """Recent user/assistant turns as plain dicts (for the direct-audio call).
+    Skips tool traffic and works for both dict and OpenAI message objects."""
+    out = []
+    for m in mlst:
+        role = m.get('role') if isinstance(m, dict) else getattr(m, 'role', None)
+        content = m.get('content') if isinstance(m, dict) else getattr(m, 'content', None)
+        if role in ('user', 'assistant') and content:
+            out.append({'role': role, 'content': str(content)})
+    return out[-2 * max_turns:]
+
+def _direct_transcribe(audio, user_msg, lang):
+    """Background: transcribe the utterance for the history/log (the reply
+    was already produced straight from the audio)."""
+    try:
+        tr = direct_llm.transcriber
+        tr.language_hint = lang
+        segs, info = tr.transcribe(audio)
+        text = "".join(seg.text for seg in segs).strip()
+    except Exception as e:
+        logger.warning("background transcription failed: %s", e)
+        text = ""
+    user_msg['content'] = text or "(unintelligible audio)"
+    print(f"\n  Heard: ({info.language or lang if text else '?'}) {text}")
+    _ilog("user_transcript", content=text, lang=(info.language if text else "") or lang)
+
+KNOWN_LANGS = ('en', 'sv', 'de', 'fr', 'es', 'it')
+LANG_SWITCH_MIN_WORDS = 4   # a shorter utterance can't flip the conversation language
+LANG_SWITCH_TURNS = 2       # ...and it takes this many consecutive turns to flip
+# Pending language switch: {lang, count}. Module state so a single stray turn
+# cannot flip the conversation on its own (see choose_language).
+_lang_pending = {"lang": None, "count": 0}
+
+
+def reset_language_switch():
+    """Forget a half-finished language switch (new person / new session)."""
+    _lang_pending["lang"] = None
+    _lang_pending["count"] = 0
+
+
+def choose_language(current, detected, text):
+    """Sticky conversation language.
+
+    Two guards, because the STT's failure modes need both:
+      * word count — a one-word reply ("Yeah.", "Ja tack") carries almost no
+        language signal, so it can never flip the conversation, and
+      * hysteresis — gemma's other failure mode is transcribing Swedish audio
+        as a fluent, LONG English sentence, which the word-count rule alone
+        happily trusts. Requiring LANG_SWITCH_TURNS consecutive turns in the
+        new language means one bad transcript costs nothing, while a person
+        who really switched language is followed one turn later.
+    """
+    if not detected or detected not in KNOWN_LANGS:
+        return current or default_lang
+    if not current or current not in KNOWN_LANGS:
+        reset_language_switch()
+        return detected
+    if detected == current:
+        reset_language_switch()
+        return current
+
+    words = len((text or "").split())
+    if words < LANG_SWITCH_MIN_WORDS:
+        logger.info("Ignoring language %s for a %d-word utterance, staying in %s",
+                    detected, words, current)
+        return current
+
+    if _lang_pending["lang"] == detected:
+        _lang_pending["count"] += 1
+    else:
+        _lang_pending["lang"] = detected
+        _lang_pending["count"] = 1
+
+    if _lang_pending["count"] >= LANG_SWITCH_TURNS:
+        logger.info("Language switch %s -> %s (%d consecutive turns)",
+                    current, detected, _lang_pending["count"])
+        reset_language_switch()
+        return detected
+    logger.info("Heard %s (%d words) but staying in %s — needs %d turns in a row "
+                "(a mis-transcription should not flip the language)",
+                detected, words, current, LANG_SWITCH_TURNS)
+    return current
+
 def language_message(lang):
     languages = { "en": "English",
                   "sv": "Swedish",
@@ -520,7 +699,7 @@ async def main(args):
     global has_name
     global has_init
     global has_exit
-    global voice_in, voice_out, listener, tracker
+    global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm
     global curr_prompt
 
     # Connect via SSE to the MCP server
@@ -576,7 +755,7 @@ async def main(args):
                  'listen':    ((0, 0.6, 0.8), "Listening", ""),
                  'greet':     ((0.9, 0.5, 0), "Contact", "Please wait"),
                  'process':   ((0.9, 0.5, 0), "Processing", "Please wait"),
-                 'talk':      ((0.95, 0.75, 0), "~~~", ""),
+                 'talk':      ((0.95, 0.75, 0), "Speaking", ""),
                  'muted':     ((0.4, 0.4, 0.4), "MUTED", "Press 'm' to unmute"),
                  }
         if has_name:
@@ -584,19 +763,26 @@ async def main(args):
             name = tmp[0].text
         else:
             name = "MCP Speech Client"
-        win = EyeWindow(name, sdict, 'ready')
+        win = EyeWindow(name, sdict, 'ready', debug=args.debug_audio)
         win.set_exit_callback(on_exit, state)
         win.keydict["m"] = (kp_toggle_mute, None)
         win.keydict[" "] = (kp_force_process, None)
         win.keydict["s"] = (kp_save_recording, None)
-        cam_win = CameraWindow(name + " - Camera", keydict=win.keydict)
+        win.keydict["i"] = (kp_cycle_mic, None)
+        win.keydict["v"] = (kp_cycle_voice, None)
+        cam_win = CameraWindow(f"{name} - People camera", keydict=win.keydict)
         cam_win.set_exit_callback(on_exit, state)
         win.attach_camera_window(cam_win)
         win.check_events()
         print('Created the interaction window')
 
         ### Initialize voice_input library, as ContinuousListener with on_speech as callback here
-        voice_in = VoiceInput(device=args.mic)
+        vin_kwargs = {}
+        if args.vad_near_field_ratio is not None:
+            vin_kwargs["vad_near_field_ratio"] = float(args.vad_near_field_ratio)
+        voice_in = VoiceInput(device=args.mic,
+                              stt_backend="raw" if args.direct_audio else "gemma4",
+                              **vin_kwargs)
         voice_in.subscribe(
             lambda ev: _ilog("transcription",
                              text=ev.payload.text,
@@ -605,6 +791,25 @@ async def main(args):
                              audio_duration_ms=ev.payload.audio_duration_ms),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
         )
+        def _log_vad(ev):
+            # The fair failure mode leaves no trace otherwise: in a noisy hall
+            # every utterance runs to the length cap and arrives as a blob of
+            # crowd + visitor. Log the shape of each capture so it is visible.
+            if ev.type == VoiceEventType.VAD_SPEECH_END:
+                _ilog("vad_capture", duration_ms=ev.payload.duration_ms,
+                      noise_floor=round(getattr(voice_in, "noise_floor", 0.0), 5))
+            elif ev.type == VoiceEventType.VAD_TIMEOUT:
+                _ilog("vad_timeout", reason=ev.payload.reason,
+                      waited_ms=ev.payload.waited_ms,
+                      noise_floor=round(getattr(voice_in, "noise_floor", 0.0), 5))
+                if ev.payload.reason == "max_speech_length":
+                    logger.warning(
+                        "VAD hit the %.0fs length cap — the room is noisy enough that "
+                        "silence never registers. Raise [audio] near_field_ratio.",
+                        ev.payload.waited_ms / 1000)
+
+        voice_in.subscribe(_log_vad, event_types={VoiceEventType.VAD_SPEECH_END,
+                                                  VoiceEventType.VAD_TIMEOUT})
         voice_in.subscribe(
             lambda ev: on_speech(ev.payload.text),
             event_types={VoiceEventType.TRANSCRIPTION_COMPLETE},
@@ -627,7 +832,23 @@ async def main(args):
         listener = ContinuousListener(voice_in)
         listener.start()
         listener.paused = True
+        voice_in.language_hint = default_lang
         print('Continuous listener started')
+
+        if args.direct_audio:
+            from direct_llm import DirectAudioLLM
+            ollama_host = re.sub(r'/v1/?$', '', args.llm_url.rstrip('/'))
+            # Built in a worker thread: it fetches the MCP tools with
+            # asyncio.run(), which is not allowed inside this running loop.
+            direct_llm = await asyncio.to_thread(
+                DirectAudioLLM, model=args.llm_model, host=ollama_host,
+                agent_name=name, tools_url=args.server)
+            direct_llm.transcriber.check()   # fail fast if the model can't hear
+            if not direct_llm._tools:
+                print('WARNING: direct-audio mode loaded no tools from the server')
+            print(f'Direct-audio mode: speech goes straight into {args.llm_model} '
+                  f'({len(direct_llm._tools)} tools)')
+        _show_mic_indicator()
 
         ### Initialize voice_output (piper TTS)
         voice_out = VoiceOutput()
@@ -636,6 +857,13 @@ async def main(args):
         if not voice_out.ready:
             print('Failed to load piper model')
             return False
+
+        # Debug panel in the eye window: VU meters (mic level, VAD
+        # probability, silence countdown) + in/out oscilloscope
+        if args.debug_audio:
+            audio_monitor = AudioMonitor(device=args.mic)
+            audio_monitor.start()
+            win.set_audio_sources(audio_monitor, voice_in, voice_out)
 
         ### Initialize the face_tracker here, with on_face_change as callback
         # Tuning comes from face/face_config.toml [tracker]; CLI flags override.
@@ -678,12 +906,30 @@ async def main(args):
 
         def _on_face_event(ev):
             if ev.type == FaceEventType.FOCUS_CHANGED:
-                focus_state["track_id"] = ev.payload.new_track_id
-                _emit(ev.payload.new_person_id)
+                tid = ev.payload.new_track_id
+                focus_state["track_id"] = tid
+                pid = ev.payload.new_person_id
+                if pid is None and tid is not None and talk_to_unknown:
+                    # Talk to a visitor the face DB doesn't know yet. Otherwise
+                    # the robot sits in 'wait' (green eye) until auto-enrollment
+                    # fires, which needs a big, sharp, frontal face -- at a stand
+                    # most visitors never clear that bar and are never greeted.
+                    pid = f"track:{tid}"
+                _emit(pid)
             elif ev.type in (FaceEventType.IDENTITY_CONFIRMED,
                              FaceEventType.FACE_ENROLLED):
                 if ev.track_id == focus_state["track_id"]:
-                    _emit(ev.payload.person_id)
+                    provisional = f"track:{ev.track_id}"
+                    if focus_state["person_id"] == provisional:
+                        # Same human, now identified: adopt the real id in place
+                        # so the ongoing conversation is NOT restarted.
+                        if provisional in persondict:
+                            persondict[ev.payload.person_id] = persondict.pop(provisional)
+                        focus_state["person_id"] = ev.payload.person_id
+                        logger.info("Provisional %s identified as %s",
+                                    provisional, ev.payload.person_id)
+                    else:
+                        _emit(ev.payload.person_id)
 
         tracker.subscribe(
             _on_face_event,
@@ -692,18 +938,34 @@ async def main(args):
                          FaceEventType.FACE_ENROLLED},
         )
 
-        cap = cv2.VideoCapture(args.camera)
-        if not cap.isOpened():
-            print(f"ERROR: Could not open camera {args.camera}")
+        from camera_utils import resolve_camera
+        cap, cam_index, cam_name = resolve_camera(args.camera)
+        if cap is None:
+            print(f"ERROR: no working camera for --camera {args.camera!r}")
             sys.exit(1)
+        print(f"People camera: {cam_index}"
+              f"{f' ({cam_name})' if cam_name else ''}")
+        _ilog("camera_selected", requested=args.camera, index=cam_index, name=cam_name)
 
         def _camera_loop():
+            detect_interval = 1.0 / max(1, args.detect_fps)
+            last_detect = [0.0]
             try:
                 while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
                     ret, frame = cap.read()
                     if not ret:
                         time.sleep(0.05)
                         continue
+                    # Throttle detection to DETECT_FPS. onnxruntime retains
+                    # ~40 MB per InsightFace inference on this build (a known
+                    # leak, provider-independent), so running it at full camera
+                    # fps grows RSS by gigabytes/minute. A few detections per
+                    # second is plenty to notice someone walking up.
+                    now = time.time()
+                    if now - last_detect[0] < detect_interval:
+                        time.sleep(0.005)
+                        continue
+                    last_detect[0] = now
                     faces = tracker.process_frame(frame)
                     focus_id = tracker.focus_track_id
                     for face in (faces or []):
@@ -762,6 +1024,16 @@ async def main(args):
         # When listening, sound triggers -> process (above)
         # Face out of focus -> wait
 
+        # Persistent UI pump: repaints the eye window (state changes, VU
+        # meters, camera thumbnail) whenever the main coroutine is awaiting —
+        # e.g. during LLM inference or MCP tool calls. Without it the
+        # 'Processing' state never gets painted before the blocking work.
+        async def _pump_ui():
+            while state.get('currstate') != 'exit':
+                win.check_events()
+                await asyncio.sleep(0.03)
+        pump_task = asyncio.ensure_future(_pump_ui())
+
         set_state(state, 'wait')
         newstate = False
         prompt_source = None
@@ -811,7 +1083,7 @@ async def main(args):
                     if curr_prompt:
                         prompt = curr_prompt
                         if voice_in and voice_in.detected_language:
-                            lang = voice_in.detected_language
+                            lang = choose_language(lang, voice_in.detected_language, prompt)
                         curr_prompt = ""
                         prompt_source = "speech"
 
@@ -821,6 +1093,10 @@ async def main(args):
                     else:
                         lang = default_lang
 
+                if voice_in is not None and lang:
+                    voice_in.language_hint = lang   # prior for the next STT call
+                if curr_person is not None and lang in KNOWN_LANGS:
+                    curr_person.lang = lang
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
                 augprompt = await augmentation_message(client, lang)
@@ -830,7 +1106,18 @@ async def main(args):
                     print(augprompt['content'])
                     augpromptlist.append(augprompt)
                 augpromptlist.append(langprompt)
-                if newstate == 'process':
+                direct_turn = (direct_llm is not None and newstate == 'process'
+                               and prompt == RAW_AUDIO_TEXT
+                               and voice_in is not None and voice_in.last_audio is not None)
+                if direct_turn:
+                    turn_audio = voice_in.last_audio
+                    print("\n  User: (", lang, ") [audio, %.1fs]" % (len(turn_audio) / voice_in.sample_rate))
+                    _ilog("user_turn", kind="speech_audio", content="",
+                          lang=lang, seconds=round(len(turn_audio) / voice_in.sample_rate, 2))
+                    prompt_source = None
+                    pending_user_msg = {"role": "user", "content": "(audio — transcribing)"}
+                    messages.append(pending_user_msg)
+                elif newstate == 'process':
                     print("\n  User: (", lang, ") ", prompt)
                     _ilog("user_turn", kind=prompt_source or "unknown", content=prompt, lang=lang)
                     prompt_source = None
@@ -847,81 +1134,46 @@ async def main(args):
                           lang=lang)
                     messages.append(greetprompt)
 
-                iteration = 0
-                msg = compose_messages(sysprompt, messages, augpromptlist)
-                #messagedump(msg)
-                _ilog("llm_request",
-                      iteration=iteration,
-                      model=model,
-                      messages_full=list(messages),
-                      messages_sent=msg,
-                      tool_count=len(tools or []))
-                try:
-                    response = openai.chat.completions.create(
-                        model=model,
-                        messages=msg,
-                        tools=tools,
-                    )
-                except Exception as e:
-                    _ilog("llm_error",
-                          iteration=iteration,
-                          error_class=type(e).__name__,
-                          error_message=str(e))
-                    raise
-                _ilog("llm_response",
-                      iteration=iteration,
-                      content=response.choices[0].message.content,
-                      tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
-
-                tool_calls = response.choices[0].message.tool_calls
-                while tool_calls:
-                    messages.append(response.choices[0].message)
-                    for tool_call in tool_calls:
-                        try:
-                            args_parsed = json.loads(tool_call.function.arguments)
-                        except (TypeError, ValueError):
-                            args_parsed = None
-                        try:
-                            result = await client.call_tool(tool_call.function.name,
-                                                            json.loads(tool_call.function.arguments))
-                            if type(result)==list:
-                                resulttxt = result[0].text
-                            else:
-                                resulttxt = result.content[0].text
-                            result_message = {
-                                "role": "tool",
-                                "content": json.dumps({
-                                    "result": resulttxt
-                                }),
-                                "tool_call_id": tool_call.id
-                            }
-                            print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                            print(  "  Result:   ", resulttxt)
-                            _ilog("mcp_tool_call",
-                                  name=tool_call.function.name,
-                                  arguments=tool_call.function.arguments,
-                                  arguments_parsed=args_parsed,
-                                  success=True,
-                                  result_text=resulttxt)
-                            messages.append(result_message)
-                        except exceptions.ToolError as te:
-                            result_message = {
-                                "role": "tool",
-                                "content": json.dumps({
-                                    "result": "unknown function called"
-                                }),
-                                "tool_call_id": tool_call.id
-                            }
-                            print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                            _ilog("mcp_tool_call",
-                                  name=tool_call.function.name,
-                                  arguments=tool_call.function.arguments,
-                                  arguments_parsed=args_parsed,
-                                  success=False,
-                                  error_message=f"ToolError: {te}")
-                            messages.append(result_message)
-
-                    iteration += 1
+                if direct_turn:
+                    # One multimodal call: hear + persona + live scene + tools.
+                    history = _text_history(messages[:-1], messages_trunclen)
+                    t0 = time.time()
+                    _ilog("direct_request", lang=lang, history_turns=len(history),
+                          tool_count=len(direct_llm._tools))
+                    try:
+                        reply_text, tag_lang = await asyncio.to_thread(
+                            direct_llm.respond, turn_audio,
+                            language_hint=lang,
+                            service_prompt=sysprompt['content'],
+                            augmentation=augprompt['content'] if augprompt else None,
+                            history=history)
+                    except Exception as e:
+                        logger.exception("direct-audio turn failed")
+                        _ilog("llm_error", error_class=type(e).__name__, error_message=str(e))
+                        reply_text, tag_lang = "", lang
+                    if tag_lang in KNOWN_LANGS and tag_lang != lang:
+                        # The model heard a language switch; trust it only on a
+                        # real sentence (the tag misfires on short turns).
+                        lang = choose_language(lang, tag_lang, reply_text)
+                    for _tn, _ta, _tr in getattr(direct_llm, "rejected_tool_calls", []):
+                        print(f"\n  Rejected: {_tn} ( {json.dumps(_ta)} )")
+                        print(f"  Reason:   {_tr[:90]}")
+                        _ilog("tool_call_rejected", name=_tn, arguments=_ta, reason=_tr)
+                    for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
+                        print(f"\n  Function: {_tn} ( {json.dumps(_ta)} )")
+                        print(f"  Result:   {_tr}")
+                        _ilog("tool_call", name=_tn, arguments=_ta, result=_tr)
+                    messages.append({"role": "assistant", "content": reply_text})
+                    _ilog("direct_response", content=reply_text, lang=lang,
+                          tool_calls=[{"name": n, "arguments": a}
+                                      for n, a, _ in getattr(direct_llm, "last_tool_calls", [])],
+                          seconds=round(time.time() - t0, 2))
+                    print(f"  (direct-audio turn: {time.time() - t0:.2f}s)")
+                    threading.Thread(target=_direct_transcribe,
+                                     args=(turn_audio, pending_user_msg, lang),
+                                     daemon=True).start()
+                else:
+                    iteration = 0
                     msg = compose_messages(sysprompt, messages, augpromptlist)
                     #messagedump(msg)
                     _ilog("llm_request",
@@ -931,7 +1183,10 @@ async def main(args):
                           messages_sent=msg,
                           tool_count=len(tools or []))
                     try:
-                        response = openai.chat.completions.create(
+                        # In a thread so the UI pump keeps the window alive during
+                        # inference (and 'Processing' actually shows).
+                        response = await asyncio.to_thread(
+                            openai.chat.completions.create,
                             model=model,
                             messages=msg,
                             tools=tools,
@@ -946,11 +1201,86 @@ async def main(args):
                           iteration=iteration,
                           content=response.choices[0].message.content,
                           tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
-                    tool_calls = response.choices[0].message.tool_calls
 
-                # No tool calls, just print the response.
-                messages.append(response.choices[0].message)
-                reply_text = response.choices[0].message.content or ""
+                    tool_calls = response.choices[0].message.tool_calls
+                    while tool_calls:
+                        messages.append(response.choices[0].message)
+                        for tool_call in tool_calls:
+                            try:
+                                args_parsed = json.loads(tool_call.function.arguments)
+                            except (TypeError, ValueError):
+                                args_parsed = None
+                            try:
+                                result = await client.call_tool(tool_call.function.name,
+                                                                json.loads(tool_call.function.arguments))
+                                if type(result)==list:
+                                    resulttxt = result[0].text
+                                else:
+                                    resulttxt = result.content[0].text
+                                result_message = {
+                                    "role": "tool",
+                                    "content": json.dumps({
+                                        "result": resulttxt
+                                    }),
+                                    "tool_call_id": tool_call.id
+                                }
+                                print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
+                                print(  "  Result:   ", resulttxt)
+                                _ilog("mcp_tool_call",
+                                      name=tool_call.function.name,
+                                      arguments=tool_call.function.arguments,
+                                      arguments_parsed=args_parsed,
+                                      success=True,
+                                      result_text=resulttxt)
+                                messages.append(result_message)
+                            except exceptions.ToolError as te:
+                                result_message = {
+                                    "role": "tool",
+                                    "content": json.dumps({
+                                        "result": "unknown function called"
+                                    }),
+                                    "tool_call_id": tool_call.id
+                                }
+                                print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
+                                _ilog("mcp_tool_call",
+                                      name=tool_call.function.name,
+                                      arguments=tool_call.function.arguments,
+                                      arguments_parsed=args_parsed,
+                                      success=False,
+                                      error_message=f"ToolError: {te}")
+                                messages.append(result_message)
+
+                        iteration += 1
+                        msg = compose_messages(sysprompt, messages, augpromptlist)
+                        #messagedump(msg)
+                        _ilog("llm_request",
+                              iteration=iteration,
+                              model=model,
+                              messages_full=list(messages),
+                              messages_sent=msg,
+                              tool_count=len(tools or []))
+                        try:
+                            response = await asyncio.to_thread(
+                                openai.chat.completions.create,
+                                model=model,
+                                messages=msg,
+                                tools=tools,
+                            )
+                        except Exception as e:
+                            _ilog("llm_error",
+                                  iteration=iteration,
+                                  error_class=type(e).__name__,
+                                  error_message=str(e))
+                            raise
+                        _ilog("llm_response",
+                              iteration=iteration,
+                              content=response.choices[0].message.content,
+                              tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
+                        tool_calls = response.choices[0].message.tool_calls
+
+                    # No tool calls, just print the response.
+                    messages.append(response.choices[0].message)
+                    reply_text = response.choices[0].message.content or ""
                 print(f'\n  Response: {reply_text}  (lang={lang})')
                 set_win_state('talk')
                 if not reply_text:
@@ -991,7 +1321,7 @@ async def main(args):
         print('Exiting')
 
 def run():
-    global omit_names_and_prefs
+    global omit_names_and_prefs, talk_to_unknown
 
     args = parse_args()
 
@@ -1023,7 +1353,9 @@ def run():
         if cameras:
             print("Available cameras:")
             for c in cameras:
-                print(f"  Index {c['index']}: {c['width']}x{c['height']} @ {c['fps']:.1f} fps ({c['backend']})")
+                label = f" {c['name']}" if c.get('name') else ""
+                print(f"  Index {c['index']}:{label}  {c['width']}x{c['height']} "
+                      f"@ {c['fps']:.1f} fps ({c['backend']})")
         else:
             print("No cameras found")
         sys.exit(0)
@@ -1041,15 +1373,16 @@ def run():
         args.mic = cfg["devices"].get("microphone")
 
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
+    talk_to_unknown = cfg["face"].get("talk_to_unknown", True)
+    if args.debug_audio is None:
+        args.debug_audio = cfg["debug"].get("audio_panel", False)
+    if args.direct_audio is None:
+        args.direct_audio = cfg["llm"].get("direct_audio", False)
+    if args.vad_near_field_ratio is None:
+        args.vad_near_field_ratio = cfg["audio"].get("near_field_ratio")
 
-    # Resolve camera index (auto-detect if still None after config)
-    if args.camera is None:
-        args.camera = find_first_camera()
-        if args.camera is not None:
-            print(f"Auto-selected camera at index {args.camera}")
-        else:
-            print("ERROR: No cameras found. Use --camera N.")
-            sys.exit(1)
+    # A name or index may come from --camera or [devices] camera; resolving it
+    # to a device that actually delivers video happens at open time.
 
     global interaction_log
     interaction_log = InteractionLogger.from_args(args)

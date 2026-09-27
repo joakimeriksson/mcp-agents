@@ -7,3 +7,6 @@ emotion_model/
 
 # Session transcripts written by --log-dir (on by default in start-candytron.sh)
 logs/
+
+# Opt-in local voice store (biometric data; never commit)
+known_voices/

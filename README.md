@@ -71,6 +71,34 @@ probability, end-of-utterance countdown) and separate in/out oscilloscopes.
 Toggle it with `[debug] audio_panel` in `mcpclient_speech/config.toml` or
 force it on with `--debug-audio`.
 
+### Voice identity (who is actually talking)
+
+With the voice server started with `--speaker ecapa` (the launcher does this),
+every utterance also gets a **speaker embedding**, matched on this machine
+against the visitor in focus. Once a visitor has spoken once, a sentence that
+is clearly someone else's voice is dropped instead of answered — the crowd
+problem the noise gate only halves. Decisions are only made on clips of about
+two seconds or more; shorter ones, an unknown voice, or a server without the
+endpoint all fail open (the robot keeps answering).
+
+Privacy, by construction:
+
+- The voice server keeps no audio and no identities; it returns a vector and
+  forgets the clip. All matching happens in the client.
+- Nothing is written to disk by default. Voiceprints are biometric data, so
+  the store lives in memory and dies with the process.
+- `persist_named = true` in `[voice_id]` keeps voices in
+  `mcpclient_speech/known_voices/` (gitignored) — and only for people who
+  gave a name, never provisional visitors. `./stop-demo.sh --purge` deletes it.
+- Everything runs on `127.0.0.1`; no audio, embedding or transcript leaves
+  the machine. The speaker model is fetched once from HuggingFace into the
+  local cache; set `HF_HUB_OFFLINE=1` for a guaranteed no-network run.
+
+Thresholds in `[voice_id]` (`confirm`, `reject`, `min_seconds`) were
+calibrated on the synthetic Kokoro voices; expect to loosen `confirm` a little
+after a session in a real room. Face enrolments are a separate, older store
+(`face/known_faces/`) and are still written to disk by the tracker.
+
 ### Run with the Face Agent
 
 Alternatively, drive CandyTron from the face agent — it recognizes and

@@ -17,6 +17,18 @@ _DEFAULTS: dict = {
         # False = the old behaviour: wait for recognition/auto-enrollment.
         "talk_to_unknown": True,
     },
+    "voice_id": {
+        # Speaker verification via the LOCAL voice server (/v1/audio/speaker).
+        # An utterance that clearly is not the focused visitor's voice is
+        # dropped instead of answered. Everything stays on this machine; by
+        # default nothing is written to disk (voiceprints are biometric data).
+        "enabled": True,
+        "persist_named": False,      # opt in: keep named people's voices in known_voices/
+        "confirm": 0.65,             # cosine >= this: same person (and learn from it)
+        "reject": 0.40,              # cosine <  this: someone else -> drop the utterance
+        "min_seconds": 2.0,          # shorter clips carry no identity: never decide on them
+        "url": "http://127.0.0.1:8880/v1/audio/speaker",
+    },
     "audio": {
         # A voice must be this many times louder than the room's own noise
         # floor to count as talking to the robot (1.0 = off). Silero rates

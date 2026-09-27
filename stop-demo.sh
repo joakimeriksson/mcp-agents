@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Kill any running candytron_mcp.py / mcpclient_speech_face.py / face agent processes.
-# Add --all to also stop a running kokoro-voice-server.
+# Add --all to also stop a running kokoro-voice-server, --purge to delete the local voice store.
 
 set -uo pipefail
 
@@ -26,5 +26,10 @@ kill_matching 'mcpclient_speech_face.py'
 kill_matching 'face/agent.py\|agent.py --llm-model'
 if [[ "${1:-}" == "--all" ]]; then
     kill_matching 'voice_server.py'
+fi
+if [[ "${1:-}" == "--purge" || "${2:-}" == "--purge" ]]; then
+    # Forget the opt-in voice store (persist_named). Face enrolments live in
+    # face/known_faces/ and are left alone; delete that directory by hand.
+    rm -rf "$(dirname "$0")/mcpclient_speech/known_voices" && echo "[stop-demo] purged mcpclient_speech/known_voices"
 fi
 echo "[stop-demo] done"

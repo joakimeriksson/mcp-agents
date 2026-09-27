@@ -101,6 +101,13 @@ voice_out: VoiceOutput | None = None
 listener: ContinuousListener | None = None
 audio_monitor: AudioMonitor | None = None   # debug panel meters (may be None)
 direct_llm = None   # DirectAudioLLM when --direct-audio (speech straight into gemma4)
+# Voice identity (face/voice_id.py): speaker embeddings from the local voice
+# server, matched on this machine. voice_db is None when disabled/unavailable.
+voice_db = None
+speaker_client = None
+voice_cfg: dict = {}
+_voice_pending = {"future": None}     # embedding of the utterance being processed
+_voice_pool = None
 tracker: FaceTracker | None = None
 model: str | None = None
 
@@ -349,6 +356,11 @@ def on_exit(state):
     if state.get('newstate') == 'exit':
         return
     logger.info("Exit event")
+    if voice_db is not None:
+        try:
+            voice_db.save()      # writes only if persist_named, and only named people
+        except Exception as e:
+            logger.warning("voice db save failed: %s", e)
     _ilog("state_change", **{"from": state.get('currstate'), "to": "exit"})
     state['evtime'] = time.time()
     state['newstate'] = 'exit'
@@ -369,6 +381,8 @@ def on_face_change(id):
             name = extract_value("Name:", info)
             if name:
                 curr_person.name = name
+                if voice_db is not None and prev_face_id:
+                    voice_db.mark_named(prev_face_id)   # eligible for opt-in persistence
             lang = extract_language(info)
             if lang:
                 curr_person.lang = lang
@@ -428,8 +442,44 @@ def on_speech(txt):
         return
     if state['currstate'] == 'listen' and (state['newstate'] is None or state['newstate'] == 'listen'):
         curr_prompt = txt
+        if voice_db is not None and voice_in is not None and voice_in.last_audio is not None:
+            # Fetch the speaker embedding in parallel with everything else the
+            # turn does (LLM, scene fetch); the gate collects it just before
+            # the model is called. ~20 ms on the server, so it is never late.
+            audio = voice_in.last_audio
+            _voice_pending["future"] = _voice_pool.submit(
+                speaker_client.embed, audio, voice_in.sample_rate)
         state['evtime'] = time.time()
         state['newstate'] = 'process'
+
+
+def voice_gate(person_id):
+    """Decide whether the utterance just captured came from *person_id*.
+
+    Returns (accept, match). Fails OPEN on every uncertainty: no embedding,
+    no enrolled voice, a clip too short to judge, or an in-between score all
+    ACCEPT. Only a clear "different" rejects. The first usable utterance from
+    a person enrolls their voice; later "same" verdicts refine it.
+    """
+    fut = _voice_pending.pop("future", None)
+    if voice_db is None or fut is None or not person_id:
+        return True, None
+    try:
+        emb, seconds = fut.result(timeout=1.5)
+    except Exception as e:
+        logger.warning("voice gate: embedding unavailable (%s) — accepting", e)
+        return True, None
+    if not voice_db.has(person_id):
+        if voice_db.enroll(person_id, emb, seconds):
+            _ilog("voice_enrolled", person_id=person_id, seconds=round(seconds, 2))
+            logger.info("voice id: enrolled %s from a %.1fs utterance", person_id, seconds)
+        return True, None
+    m = voice_db.verify(person_id, emb, seconds)
+    _ilog("voice_verify", person_id=person_id, similarity=round(m.similarity, 3),
+          decision=m.decision, seconds=round(seconds, 2), reason=m.reason)
+    if m.decision == "different":
+        return False, m
+    return True, m
 
 def check_statechange(state):
     win.check_events()
@@ -699,7 +749,7 @@ async def main(args):
     global has_name
     global has_init
     global has_exit
-    global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm
+    global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm, voice_db, speaker_client, _voice_pool
     global curr_prompt
 
     # Connect via SSE to the MCP server
@@ -835,6 +885,26 @@ async def main(args):
         voice_in.language_hint = default_lang
         print('Continuous listener started')
 
+        if voice_cfg.get("enabled", True):
+            from concurrent.futures import ThreadPoolExecutor
+            from voice_id import SpeakerClient, VoiceDB
+            speaker_client = SpeakerClient(voice_cfg.get("url", "http://127.0.0.1:8880/v1/audio/speaker"))
+            if speaker_client.available():
+                persist = bool(voice_cfg.get("persist_named", False))
+                voice_db = VoiceDB(
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_voices", "voices.json"),
+                    persist_named=persist,
+                    confirm=float(voice_cfg.get("confirm", 0.65)),
+                    reject=float(voice_cfg.get("reject", 0.40)),
+                    min_seconds=float(voice_cfg.get("min_seconds", 2.0)))
+                _voice_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voice-id")
+                print(f"Voice id: on (local only; {'named people persisted' if persist else 'nothing written to disk'}; "
+                      f"{len(voice_db.people())} known)")
+                _ilog("voice_id", enabled=True, persist_named=persist, known=len(voice_db.people()))
+            else:
+                print("Voice id: server has no --speaker endpoint; running without (fail-open)")
+                _ilog("voice_id", enabled=False, reason="server lacks speaker endpoint")
+
         if args.direct_audio:
             from direct_llm import DirectAudioLLM
             ollama_host = re.sub(r'/v1/?$', '', args.llm_url.rstrip('/'))
@@ -925,6 +995,8 @@ async def main(args):
                         # so the ongoing conversation is NOT restarted.
                         if provisional in persondict:
                             persondict[ev.payload.person_id] = persondict.pop(provisional)
+                        if voice_db is not None:
+                            voice_db.rename(provisional, ev.payload.person_id)
                         focus_state["person_id"] = ev.payload.person_id
                         logger.info("Provisional %s identified as %s",
                                     provisional, ev.payload.person_id)
@@ -1086,6 +1158,17 @@ async def main(args):
                             lang = choose_language(lang, voice_in.detected_language, prompt)
                         curr_prompt = ""
                         prompt_source = "speech"
+                        accept, vm = voice_gate(focus_state.get("person_id"))
+                        if not accept:
+                            # Someone else's voice: not the person we are
+                            # talking to. Drop it and keep listening.
+                            print(f"\n  (ignored: not {focus_state.get('person_id')}'s voice, "
+                                  f"similarity {vm.similarity:.2f})")
+                            _ilog("speech_rejected_voice", person_id=focus_state.get("person_id"),
+                                  similarity=round(vm.similarity, 3))
+                            set_state(state, 'listen')
+                            newstate = False
+                            continue
 
                 if newstate == 'greet':
                     if curr_person and curr_person.lang and curr_person.lang in ['en','sv','de','fr','es']:
@@ -1374,6 +1457,7 @@ def run():
 
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
     talk_to_unknown = cfg["face"].get("talk_to_unknown", True)
+    voice_cfg.update(cfg.get("voice_id", {}))
     if args.debug_audio is None:
         args.debug_audio = cfg["debug"].get("audio_panel", False)
     if args.direct_audio is None:

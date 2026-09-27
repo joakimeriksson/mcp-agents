@@ -8,6 +8,13 @@ direct_audio = true    # speech straight into gemma4 (one call: hear + think + t
 omit_names_and_prefs = true    # skip "vad heter du?" and the per-person distillation LLM call
 talk_to_unknown      = true    # greet visitors the face DB has never seen (no identity needed)
 
+[voice_id]
+enabled       = true     # drop utterances that are clearly not the focused visitor's voice
+persist_named = false    # true: keep NAMED people's voices in mcpclient_speech/known_voices/ (local file)
+confirm       = 0.65     # cosine similarity >= : same person
+reject        = 0.40     # cosine similarity <  : someone else (calibrated on synthetic voices; loosen in a real room)
+min_seconds   = 2.0      # never decide on clips shorter than this
+
 [audio]
 near_field_ratio = 3.0   # voice must be 3x the room noise floor to count (1.0 = off)
 

@@ -118,7 +118,7 @@ The standalone face agent (camera + conversation, no robot) is documented in
 The same thing `start-candytron.sh` does, step by step:
 
 ```bash
-cd ../kokoro-voice-server && uv run python voice_server.py --engine kokoro-svml --voice Stina --port 8880 --whisper base
+cd ../kokoro-voice-server && uv run python voice_server.py --engine kokoro-svml --voice Greta --port 8880 --whisper base
 cd candytron_mcp && uv run candytron_mcp.py --port 7999 --robot-ip 10.10.10.10   # add --camera N for the table camera
 cd mcpclient_speech && uv run mcpclient_speech_face.py --server http://127.0.0.1:7999/sse
 ```

@@ -90,7 +90,7 @@ if [[ $START_VOICE -eq 1 ]]; then
     elif [[ -f "$VOICE_DIR/voice_server.py" && -d "$VOICE_DIR/.venv" ]]; then
         echo "[candytron] starting kokoro-voice-server on :$VOICE_PORT (log: $LOG_DIR/candytron-voice-server.log)"
         (cd "$VOICE_DIR" && PYTORCH_ENABLE_MPS_FALLBACK=1 exec uv run python voice_server.py \
-            --engine kokoro-svml --voice Stina --port "$VOICE_PORT" --langs "$VOICE_LANGS" --whisper base --speaker ecapa) \
+            --engine kokoro-svml --voice Greta --port "$VOICE_PORT" --langs "$VOICE_LANGS" --whisper base --speaker ecapa) \
             >"$LOG_DIR/candytron-voice-server.log" 2>&1 &
         STARTED+=($!)
         # cold start loads Kokoro + Whisper: allow a few minutes

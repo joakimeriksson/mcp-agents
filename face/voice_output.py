@@ -28,6 +28,7 @@ import sounddevice as sd
 from piper import PiperVoice
 
 from events import EventDispatcher
+from reply_language import reply_language
 
 logger = logging.getLogger("voice_output")
 
@@ -299,12 +300,7 @@ class VoiceOutput:
             return
 
         try:
-            # Normalize: no/unknown language means the default language —
-            # otherwise a caller passing None/False/"hi" silently bypasses
-            # the configured TTS server and lands on the default Piper voice.
-            if (not language or (language not in self._tts_servers
-                                 and language not in self._language_models)):
-                language = DEFAULT_LANGUAGE
+            language = self._speak_language(text, language)
             server = self._tts_servers.get(language)
             voice = None
             if server is None:
@@ -350,6 +346,35 @@ class VoiceOutput:
         """Non-blocking TTS: speak in a background thread."""
         threading.Thread(target=self.speak, args=(text, language),
                          daemon=True).start()
+
+    def _speak_language(self, text: str, language: Optional[str],
+                        log: bool = True) -> str:
+        """The language speak() voices *text* in."""
+        # The voice follows the reply text, not the conversation language:
+        # that one is sticky on purpose and lags a language switch (see
+        # reply_language.py). It still decides fragments like "Ja!".
+        detected, conf = reply_language(
+            text, language, set(self._tts_servers) | set(self._language_models))
+        if detected and detected != language:
+            if log:
+                logger.info(f"TTS: reply reads as {detected} ({conf:.2f}), not "
+                            f"{language} — using the {detected} voice")
+            language = detected
+        # Normalize: no/unknown language means the default language —
+        # otherwise a caller passing None/False/"hi" silently bypasses
+        # the configured TTS server and lands on the default Piper voice.
+        if (not language or (language not in self._tts_servers
+                             and language not in self._language_models)):
+            language = DEFAULT_LANGUAGE
+        return language
+
+    def voice_for(self, text: str, language: Optional[str] = None) -> tuple:
+        """(language, voice name) that speak() will use for *text*, for display."""
+        language = self._speak_language(text, language, log=False)
+        server = self._tts_servers.get(language)
+        if server is not None:
+            return language, server.get("voice") or "server default"
+        return language, "Piper"
 
     def _http_synth(self, text: str, language: Optional[str], server: dict):
         """Synthesize via an OpenAI-compatible /v1/audio/speech server.

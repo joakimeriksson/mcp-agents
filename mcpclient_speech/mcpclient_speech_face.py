@@ -1374,6 +1374,9 @@ async def main(args):
                     # Simple TTS: pause mic for the whole utterance, no AEC.
                     # Resume is handled by the state-machine transition below.
                     listener.paused = True
+                    # Show under "Speaking" which language and voice it uses.
+                    tts_lang, tts_voice = voice_out.voice_for(reply_text, lang)
+                    win.txt2.text.set_text(f"{tts_lang} · {tts_voice}")
                     voice_out.speak_async(reply_text, lang)
                     # Give the async thread a moment to flip speaking=True so we
                     # don't fall through (and skip the reverb wait) on a slow start.

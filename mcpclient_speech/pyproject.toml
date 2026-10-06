@@ -24,4 +24,5 @@ dependencies = [
     "soundfile>=0.14.0",
     "ollama>=0.6.2",
     "requests>=2.34.2",
+    "lingua-language-detector>=2.2.0",
 ]

@@ -12,7 +12,7 @@ its tools through voice interaction with a local LLM. Two variants:
 ## Prerequisites
 
 - **Ollama** with a tool-capable model pulled (default
-  `PetrosStav/gemma3-tools:12b`).
+  `gemma4:latest` — audio-capable, also used for native-audio STT).
 - **whisper.cpp** built locally — used by `record.py` for STT in the
   push-to-talk client. Path is hardcoded at the top of `record.py`
   (`whisperdir`); model is `ggml-medium.bin`.
@@ -30,9 +30,13 @@ the built-in defaults in `config.py`. Sections:
 
 ```toml
 [llm]
-model    = "PetrosStav/gemma3-tools:12b"
+model    = "gemma4:latest"
 base_url = "http://localhost:11434/v1/"
 api_key  = "ollama"
+direct_audio = false   # true: speech straight into gemma4 (one call: hear + think + tools)
+
+[debug]
+audio_panel = true   # VU meters + in/out oscilloscopes in the eye window
 
 [face]
 omit_names_and_prefs = false   # set true to skip name/preference distillation
@@ -78,6 +82,8 @@ The MCP server must already be running on SSE before the client starts.
 | Space    | Stop recording, send   | Stop listening, transcribe captured audio |
 | `m`      | —                      | Toggle mute (mic + TTS)             |
 | `s`      | —                      | Arm next recording for saving (press N times for N saves) |
+| `i`      | —                      | Next microphone (live; the active mic is shown top-left) |
+| `v`      | —                      | Next Swedish voice (live; speaks a sample; list in `face/languages.toml` `tts_voices`) |
 | `c`      | Clear conversation     | —                                   |
 | `r`      | Repeat last response   | —                                   |
 | `q`      | Quit                   | Quit                                |

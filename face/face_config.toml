@@ -56,7 +56,7 @@ enroll_frontal_tolerance = 0.18
 # A face must cover at least this fraction of the frame (proximity) and be
 # held steady this many seconds before it can take focus -- filters people
 # passing by in the background. 0 = off (instant, any size).
-focus_min_area_frac = 0.04
+focus_min_area_frac = 0.015   # ~1.3 m at 1080p/78deg (was 0.04 = closer than ~0.85 m)
 focus_dwell_seconds = 1.0
 
 # --- Engagement / "makes contact" gate (Group 3: looking at the camera) ---

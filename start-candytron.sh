@@ -28,6 +28,9 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 VOICE_DIR="${KOKORO_VOICE_SERVER_DIR:-$ROOT/../kokoro-voice-server}"
 VOICE_PORT="${VOICE_PORT:-8880}"
 VOICE_LANGS="${VOICE_LANGS:-sv,en,fr,es,it}"
+# Extra Swedish voice packs not (yet) on HuggingFace, e.g. the VoxCPM2-fitted
+# Vera / Viktor from swedish-kokoro (docs/VOX_VOICES_PLAN.md).
+EXTRA_VOICES="${KOKORO_SV_EXTRA_VOICES:-$ROOT/../swedish-kokoro/data-gen/fitted_voices/extra}"
 PORT=7999
 LOG_DIR="${CANDYTRON_LOG_DIR:-/tmp}"
 # Session transcript (JSONL) of every turn, tool call and VAD capture. On by
@@ -89,8 +92,11 @@ if [[ $START_VOICE -eq 1 ]]; then
         fi
     elif [[ -f "$VOICE_DIR/voice_server.py" && -d "$VOICE_DIR/.venv" ]]; then
         echo "[candytron] starting kokoro-voice-server on :$VOICE_PORT (log: $LOG_DIR/candytron-voice-server.log)"
+        EXTRA_ARGS=()
+        [[ -d "$EXTRA_VOICES" ]] && EXTRA_ARGS=(--extra-voices "$EXTRA_VOICES")
         (cd "$VOICE_DIR" && PYTORCH_ENABLE_MPS_FALLBACK=1 exec uv run python voice_server.py \
-            --engine kokoro-svml --voice Greta --port "$VOICE_PORT" --langs "$VOICE_LANGS" --whisper base --speaker ecapa) \
+            --engine kokoro-svml --voice Greta --port "$VOICE_PORT" --langs "$VOICE_LANGS" --whisper base --speaker ecapa \
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}) \
             >"$LOG_DIR/candytron-voice-server.log" 2>&1 &
         STARTED+=($!)
         # cold start loads Kokoro + Whisper: allow a few minutes
@@ -108,7 +114,7 @@ if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
     exit 1
 fi
 echo "[candytron] starting candytron_mcp on :$PORT ${SERVER_ARGS[*]:-(real robot + camera)}"
-(cd "$ROOT/candytron_mcp" && exec uv run candytron_mcp.py --port "$PORT" "${SERVER_ARGS[@]}") &
+(cd "$ROOT/candytron_mcp" && exec uv run candytron_mcp.py --port "$PORT" ${SERVER_ARGS[@]+"${SERVER_ARGS[@]}"}) &
 SERVER_PID=$!
 STARTED+=("$SERVER_PID")
 for _ in $(seq 1 240); do   # real camera calibration can take a while
@@ -126,12 +132,12 @@ echo "[candytron] candytron_mcp up"
 if [[ $CLIENT == face ]]; then
     echo "[candytron] starting face agent (--service-server)"
     (cd "$ROOT/face" && exec uv run agent.py --llm-model gemma4:latest \
-        --service-server "http://127.0.0.1:$PORT/sse" "${CLIENT_ARGS[@]}") &
+        --service-server "http://127.0.0.1:$PORT/sse" ${CLIENT_ARGS[@]+"${CLIENT_ARGS[@]}"}) &
 else
     echo "[candytron] starting mcpclient_speech_face"
     (cd "$ROOT/mcpclient_speech" && exec uv run mcpclient_speech_face.py \
         --server "http://127.0.0.1:$PORT/sse" --log-dir "$SESSION_LOG_DIR" \
-        "${CLIENT_ARGS[@]}") &
+        ${CLIENT_ARGS[@]+"${CLIENT_ARGS[@]}"}) &
 fi
 CLIENT_PID=$!
 STARTED+=("$CLIENT_PID")

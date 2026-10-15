@@ -29,7 +29,7 @@ VOICE_DIR="${KOKORO_VOICE_SERVER_DIR:-$ROOT/../kokoro-voice-server}"
 VOICE_PORT="${VOICE_PORT:-8880}"
 VOICE_LANGS="${VOICE_LANGS:-sv,en,fr,es,it}"
 # Extra Swedish voice packs not (yet) on HuggingFace, e.g. the VoxCPM2-fitted
-# Vera / Viktor from swedish-kokoro (docs/VOX_VOICES_PLAN.md).
+# Klara / Viktor from swedish-kokoro (docs/VOX_VOICES_PLAN.md).
 EXTRA_VOICES="${KOKORO_SV_EXTRA_VOICES:-$ROOT/../swedish-kokoro/data-gen/fitted_voices/extra}"
 PORT=7999
 LOG_DIR="${CANDYTRON_LOG_DIR:-/tmp}"

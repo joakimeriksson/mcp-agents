@@ -148,6 +148,7 @@ class VoiceOutput:
         self._stop_event = threading.Event()
         self._interrupted = False
         self._lock = threading.Lock()
+        self._filler_playing = threading.Event()
         self._dispatcher = EventDispatcher(owner="voice_output")
         # Rolling window of the last ~1s of played samples, for scope views.
         # Resized to the active stream's sample rate at playback time so the
@@ -302,11 +303,15 @@ class VoiceOutput:
         Can be interrupted mid-playback via ``stop_speaking()``.
         After returning, check ``interrupted`` to know if it was cut short.
         """
-        if not self._lock.acquire(timeout=0.5):
-            preview = text if isinstance(text, str) else "(sentence stream)"
-            self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(preview))
-            logger.warning(f"TTS busy, rejected: {preview}")
-            return
+        # While a thinking filler plays, the first sentence is synthesized
+        # meanwhile and played the moment the filler ends; otherwise the
+        # lock is taken now, so a second concurrent speak() is turned away.
+        held = False
+        if not self._filler_playing.is_set():
+            if not self._lock.acquire(timeout=0.5):
+                self._busy(text)
+                return
+            held = True
 
         try:
             sentences = iter(split_sentences(text) if isinstance(text, str) else text)
@@ -323,33 +328,35 @@ class VoiceOutput:
             language = self._speak_language(first, language)
             server = self._tts_servers.get(language)
             voice = None
-            if server is None:
-                voice = self._get_voice(language)
-                if voice is None:
-                    logger.warning(f"TTS not ready, would say: {first} ...")
-                    return
-            self._speaking = True
-            self._interrupted = False
-            self._stop_event.clear()
             start = time.time()
             self._emit(TtsEventType.TTS_STARTED, TtsStartedPayload(first, None))
+            first_audio = None
             if server is not None:
                 # Pronunciation replacements are piper-specific phonetic hacks —
                 # the HTTP server (Kokoro, real g2p) gets the raw text instead.
                 try:
-                    audio, sr = self._http_synth(first, language, server)
+                    first_audio = self._http_synth(first, language, server)
                 except Exception as e:
                     logger.warning(
                         f"HTTP TTS ({server['url']}) failed: {e} — "
                         f"falling back to piper")
-                    voice = self._get_voice(language)
-                    if voice is None:
-                        logger.warning(f"TTS not ready, would say: {first} ...")
-                        return
-                    self._play(itertools.chain([first], rest()), voice, language)
-                else:
-                    self._play_stream(first, itertools.chain(
-                        [audio], self._http_rest(rest(), language, server, sr)), sr)
+            if first_audio is None:
+                voice = self._get_voice(language)
+                if voice is None:
+                    logger.warning(f"TTS not ready, would say: {first} ...")
+                    return
+            if not held:   # wait for the filler (they are ~1-2 s)
+                if not self._lock.acquire(timeout=3.0):
+                    self._busy(text)
+                    return
+                held = True
+            self._speaking = True
+            self._interrupted = False
+            self._stop_event.clear()
+            if first_audio is not None:
+                audio, sr = first_audio
+                self._play_stream(first, itertools.chain(
+                    [audio], self._http_rest(rest(), language, server, sr)), sr)
             else:
                 self._play(itertools.chain([first], rest()), voice, language)
             duration = time.time() - start
@@ -358,13 +365,70 @@ class VoiceOutput:
         except Exception as e:
             logger.error(f"TTS playback failed: {e}")
         finally:
-            self._speaking = False
-            self._lock.release()
+            if held:
+                self._speaking = False
+                self._lock.release()
 
-    def speak_async(self, text, language: Optional[str] = None):
-        """Non-blocking TTS: speak in a background thread."""
-        threading.Thread(target=self.speak, args=(text, language),
-                         daemon=True).start()
+    def _busy(self, text):
+        preview = text if isinstance(text, str) else "(sentence stream)"
+        self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(preview))
+        logger.warning(f"TTS busy, rejected: {preview}")
+
+    def speak_async(self, text, language: Optional[str] = None) -> threading.Thread:
+        """Non-blocking TTS: speak in a background thread (returned, so the
+        caller can wait for the whole reply, filler hand-over included)."""
+        thread = threading.Thread(target=self.speak, args=(text, language), daemon=True)
+        thread.start()
+        return thread
+
+    def filler(self, language: Optional[str] = None) -> bool:
+        """Start a short "Hmm…" / "Mm, vänta lite…" in the background, to fill
+        the silence while the reply is being thought up. Returns at once;
+        False if nothing plays: the voice has no fillers on the server
+        (kokoro-voice-server serves them for its --vox-voice voices), the
+        language is not served over HTTP, or something is already playing.
+        A speak() that comes along waits for the filler to finish.
+        """
+        import io
+        import wave
+        import requests
+
+        language = language if language in self._tts_servers else DEFAULT_LANGUAGE
+        server = self._tts_servers.get(language)
+        if server is None or not server["url"].endswith("/v1/audio/speech") \
+                or not self._lock.acquire(blocking=False):
+            return False
+        try:
+            url = server["url"][:-len("speech")] + "filler"
+            resp = requests.get(url, params={"voice": server.get("voice") or "",
+                                             "language": language}, timeout=0.3)
+            if resp.status_code != 200 or not resp.content:
+                self._lock.release()
+                return False
+            with wave.open(io.BytesIO(resp.content)) as wf:
+                sr = wf.getframerate()
+                pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+        except Exception as e:
+            logger.debug(f"no filler: {e}")
+            self._lock.release()
+            return False
+        audio = pcm.astype("float32") / 32768.0
+        self._filler_playing.set()
+
+        def play():
+            try:
+                self._speaking = True
+                self._stop_event.clear()
+                self._play_stream("(filler)", iter([audio]), sr, events=False)
+            except Exception as e:
+                logger.warning(f"filler playback failed: {e}")
+            finally:
+                self._speaking = False
+                self._filler_playing.clear()
+                self._lock.release()
+
+        threading.Thread(target=play, daemon=True).start()
+        return True
 
     def _http_rest(self, sentences, language, server, sr):
         """Audio for the sentences after the first, one request each. A
@@ -459,7 +523,7 @@ class VoiceOutput:
 
         self._play_stream(first, chunks(), voice.config.sample_rate)
 
-    def _play_stream(self, text: str, chunks, sr: int):
+    def _play_stream(self, text: str, chunks, sr: int, events: bool = True):
         if len(self.out_waveform) != sr:
             # keep the scope window at exactly 1s for this stream's rate
             self.out_waveform = np.zeros(sr, dtype=np.float32)
@@ -497,7 +561,7 @@ class VoiceOutput:
 
         def _maybe_emit_audio_start():
             nonlocal emitted
-            if not emitted and "t" in first_audio:
+            if events and not emitted and "t" in first_audio:
                 ts = first_audio["t"]
                 self._emit(TtsEventType.TTS_AUDIO_START,
                            TtsAudioStartPayload(text, ts - play_start, ts))

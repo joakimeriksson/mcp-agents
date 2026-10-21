@@ -189,6 +189,10 @@ def parse_args():
                              'one call does hearing + reasoning + tool calls. The transcript '
                              'for the history/log is produced in the background. '
                              '(default from config [llm] direct_audio)')
+    parser.add_argument('--filler-delay', type=float, default=0.5,
+                        help='Seconds into a turn with nothing said yet before a thinking filler '
+                             '("Hmm…", "Mm, vänta lite…") plays; only voices the TTS server has '
+                             'fillers for (its --vox-voice voices). Negative = never.')
     parser.add_argument('--detect-fps', type=int, default=6,
                         help='Max face-detection rate (Hz). Lower = far less memory '
                              '(InsightFace/onnxruntime leaks ~40MB per inference on this build).')
@@ -1177,6 +1181,16 @@ async def main(args):
                     else:
                         lang = default_lang
 
+                # Nothing said yet after a moment: "Hmm…" while the scene is
+                # fetched and the reply thought up. Cancelled as soon as the
+                # reply starts; a reply that comes later waits for it.
+                filler_timer = None
+                if (newstate == 'process' and not muted and voice_out is not None
+                        and args.filler_delay >= 0):
+                    filler_timer = threading.Timer(args.filler_delay, voice_out.filler, args=(lang,))
+                    filler_timer.daemon = True
+                    filler_timer.start()
+
                 if voice_in is not None and lang:
                     voice_in.language_hint = lang   # prior for the next STT call
                 if curr_person is not None and lang in KNOWN_LANGS:
@@ -1232,12 +1246,14 @@ async def main(args):
 
                     def _on_sentence(sentence, s_lang, lang=lang):
                         if not stream_lang:
+                            if filler_timer:
+                                filler_timer.cancel()
                             listener.paused = True
                             stream_lang["lang"] = (
                                 choose_language(lang, s_lang, sentence)
                                 if s_lang in KNOWN_LANGS and s_lang != lang else lang)
-                            voice_out.speak_async(iter(sentence_q.get, None),
-                                                  stream_lang["lang"])
+                            stream_lang["thread"] = voice_out.speak_async(
+                                iter(sentence_q.get, None), stream_lang["lang"])
                         sentence_q.put(sentence)
                     try:
                         reply_text, tag_lang = await asyncio.to_thread(
@@ -1385,6 +1401,8 @@ async def main(args):
                     messages.append(response.choices[0].message)
                     reply_text = response.choices[0].message.content or ""
                 print(f'\n  Response: {reply_text}  (lang={lang})')
+                if filler_timer:
+                    filler_timer.cancel()
                 set_win_state('talk')
                 if not reply_text:
                     _ilog("tts_speak", text="", lang=lang, status="empty")
@@ -1397,15 +1415,12 @@ async def main(args):
                     # Show under "Speaking" which language and voice it uses.
                     tts_lang, tts_voice = voice_out.voice_for(reply_text, lang)
                     win.txt2.text.set_text(f"{tts_lang} · {tts_voice}")
-                    if not tts_streamed:   # a streamed reply is already playing
+                    # A streamed reply is already playing (or waiting for the
+                    # filler to end); otherwise speak the whole reply now.
+                    tts_thread = stream_lang.get("thread") if tts_streamed else \
                         voice_out.speak_async(reply_text, lang)
-                    # Give the async thread a moment to flip speaking=True so we
-                    # don't fall through (and skip the reverb wait) on a slow start.
-                    deadline = time.monotonic() + 0.2
-                    while not voice_out.speaking and time.monotonic() < deadline:
-                        await asyncio.sleep(0.01)
-                    if voice_out.speaking:
-                        while voice_out.speaking:
+                    if tts_thread is not None:
+                        while tts_thread.is_alive():
                             win.check_events()
                             await asyncio.sleep(0.05)
                         if not voice_out.interrupted:
@@ -1414,6 +1429,11 @@ async def main(args):
                           text=reply_text,
                           lang=lang,
                           status="interrupted" if getattr(voice_out, "interrupted", False) else "spoken")
+                # Nothing to say (noise, a muted turn) but a filler started:
+                # the mic must not reopen on our own "Hmm…".
+                while voice_out is not None and voice_out.speaking:
+                    win.check_events()
+                    await asyncio.sleep(0.05)
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
                 else:

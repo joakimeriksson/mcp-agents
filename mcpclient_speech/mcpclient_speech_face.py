@@ -11,6 +11,7 @@ from fastmcp.client.transports import SSETransport
 import json
 import logging
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -1217,23 +1218,42 @@ async def main(args):
                           lang=lang)
                     messages.append(greetprompt)
 
+                tts_streamed = False
                 if direct_turn:
                     # One multimodal call: hear + persona + live scene + tools.
                     history = _text_history(messages[:-1], messages_trunclen)
                     t0 = time.time()
                     _ilog("direct_request", lang=lang, history_turns=len(history),
                           tool_count=len(direct_llm._tools))
+                    # Speak each sentence as gemma4 finishes it: the first one
+                    # plays while the rest is still being written and voiced.
+                    sentence_q = queue.Queue()
+                    stream_lang = {}
+
+                    def _on_sentence(sentence, s_lang, lang=lang):
+                        if not stream_lang:
+                            listener.paused = True
+                            stream_lang["lang"] = (
+                                choose_language(lang, s_lang, sentence)
+                                if s_lang in KNOWN_LANGS and s_lang != lang else lang)
+                            voice_out.speak_async(iter(sentence_q.get, None),
+                                                  stream_lang["lang"])
+                        sentence_q.put(sentence)
                     try:
                         reply_text, tag_lang = await asyncio.to_thread(
                             direct_llm.respond, turn_audio,
                             language_hint=lang,
                             service_prompt=sysprompt['content'],
                             augmentation=augprompt['content'] if augprompt else None,
-                            history=history)
+                            history=history,
+                            on_sentence=None if muted else _on_sentence)
                     except Exception as e:
                         logger.exception("direct-audio turn failed")
                         _ilog("llm_error", error_class=type(e).__name__, error_message=str(e))
                         reply_text, tag_lang = "", lang
+                    finally:
+                        sentence_q.put(None)   # end of the reply for speak()
+                    tts_streamed = bool(stream_lang)
                     if tag_lang in KNOWN_LANGS and tag_lang != lang:
                         # The model heard a language switch; trust it only on a
                         # real sentence (the tag misfires on short turns).
@@ -1377,7 +1397,8 @@ async def main(args):
                     # Show under "Speaking" which language and voice it uses.
                     tts_lang, tts_voice = voice_out.voice_for(reply_text, lang)
                     win.txt2.text.set_text(f"{tts_lang} · {tts_voice}")
-                    voice_out.speak_async(reply_text, lang)
+                    if not tts_streamed:   # a streamed reply is already playing
+                        voice_out.speak_async(reply_text, lang)
                     # Give the async thread a moment to flip speaking=True so we
                     # don't fall through (and skip the reverb wait) on a slow start.
                     deadline = time.monotonic() + 0.2

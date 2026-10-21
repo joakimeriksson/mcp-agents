@@ -31,6 +31,8 @@ from typing import Callable, Optional
 import numpy as np
 import soundfile as sf
 
+from sentences import SentenceStream, split_sentences
+
 logger = logging.getLogger("direct_llm")
 
 # System prompt: the face-agent identity + the service role, with the rules the
@@ -96,6 +98,11 @@ def _split_lang(text: str, default: str) -> tuple:
     if not m:
         return default, (text or "").strip()
     return m.group(1).lower(), text[m.end():].strip()
+
+
+def _is_claim(text: str) -> bool:
+    """The robot saying it did something physical (see _ACTION_CLAIM)."""
+    return bool(_ACTION_CLAIM.search(text)) and not _NOT_A_CLAIM.search(text)
 
 
 def _has_words(text: str) -> bool:
@@ -212,6 +219,38 @@ class DirectAudioLLM:
                     f"Call move_between again with one of those as src.")
         return None
 
+    def _chat(self, messages: list, tools: Optional[list], say, default_lang: str):
+        """One model call; returns its message. With *say* set it streams and
+        hands every sentence to ``say(sentence, language)`` as soon as it is
+        written, the leading language tag stripped."""
+        if say is None:
+            return self._client.chat(model=self._model, messages=messages,
+                                     tools=tools, options=self._options,
+                                     think=False, stream=False)["message"]
+        import ollama
+        content, calls = "", []
+        lang, fed = None, 0   # language once the tag is read; chars fed so far
+        cutter = SentenceStream()
+        for part in self._client.chat(model=self._model, messages=messages,
+                                      tools=tools, options=self._options,
+                                      think=False, stream=True):
+            msg = part["message"]
+            calls += msg.get("tool_calls") or []
+            content += msg.get("content") or ""
+            if lang is None:
+                head = content.lstrip()
+                if head.startswith("[") and "]" not in head and len(head) < 10:
+                    continue   # the language tag is still being written
+                lang, body = _split_lang(content, default_lang)
+                fed = len(content) - len(body)
+            for sentence in cutter.feed(content[fed:]):
+                say(sentence, lang)
+            fed = len(content)
+        for sentence in cutter.flush():
+            say(sentence, lang or default_lang)
+        return ollama.Message(role="assistant", content=content,
+                              tool_calls=calls or None)
+
     # --- Hot path ---
 
     _LANG_NAMES = {"en": "English", "sv": "Swedish", "de": "German",
@@ -222,10 +261,19 @@ class DirectAudioLLM:
                 language_hint: str = "en",
                 service_prompt: Optional[str] = None,
                 augmentation: Optional[str] = None,
-                history: Optional[list] = None) -> tuple[str, str]:
+                history: Optional[list] = None,
+                on_sentence: Optional[Callable[[str, str], None]] = None,
+                ) -> tuple[str, str]:
         """Audio in, (reply_text, language) out. Blocking; one to a few
         model calls depending on tool use. Transcription for memory is the
         caller's job, in the background (see agent._on_heard_audio).
+
+        With *on_sentence* the model streams and each sentence is handed to
+        ``on_sentence(sentence, language)`` the moment it is written, to be
+        spoken while the rest is still coming. A sentence claiming a physical
+        action is held back until a tool has actually run; whatever the turn
+        finally settles on and was not yet handed over follows at the end.
+        The returned reply is then exactly what was handed over.
 
         *service_prompt* / *augmentation* override the constructor's persona
         and the augmentation provider for this turn (clients that already
@@ -273,13 +321,19 @@ class DirectAudioLLM:
         scene = parse_scene_positions(aug)
         reply, used_tools = "", False
         texts: list[str] = []   # every piece of prose the model produced
+        spoken: list[str] = []  # sentences already handed to on_sentence
+        say = None
+        if on_sentence is not None:
+            def say(sentence: str, lang: str):
+                # "Här får du en Plopp!" before the arm has moved could be a
+                # lie; the end of the turn decides whether it is said.
+                if self._tools and not self.last_tool_calls and _is_claim(sentence):
+                    return
+                spoken.append(sentence)
+                on_sentence(sentence, lang)
 
         for round_no in range(_MAX_TOOL_ROUNDS):
-            resp = self._client.chat(model=self._model, messages=messages,
-                                     tools=self._tools or None,
-                                     options=self._options,
-                                     think=False, stream=False)
-            msg = resp["message"]
+            msg = self._chat(messages, self._tools or None, say, language_hint or "en")
             calls = msg.get("tool_calls") or []
             content = (msg.get("content") or "").strip()
             if content:
@@ -318,8 +372,7 @@ class DirectAudioLLM:
         # the visitor is being told it did. Give the model exactly one chance
         # to make good on it, with the tools still attached.
         if (self._tools and not self.last_tool_calls
-                and reply and _ACTION_CLAIM.search(reply)
-                and not _NOT_A_CLAIM.search(reply)):
+                and reply and _is_claim(reply)):
             logger.warning(f"direct: action claimed without a tool call: {reply[:70]!r}"
                            " — retrying")
             messages.append({"role": "assistant", "content": reply})
@@ -331,11 +384,9 @@ class DirectAudioLLM:
                              "sentence starting with the ISO language code "
                              "in brackets."})
             for _ in range(2):
-                resp = self._client.chat(model=self._model, messages=messages,
-                                         tools=self._tools or None,
-                                         options=self._options,
-                                         think=False, stream=False)
-                m2 = resp["message"]
+                # Not streamed: its words count only if a tool ran (below),
+                # so the end of the turn decides what of it is said.
+                m2 = self._chat(messages, self._tools or None, None, language_hint or "en")
                 calls2 = m2.get("tool_calls") or []
                 content2 = (m2.get("content") or "").strip()
                 if not calls2:
@@ -377,11 +428,17 @@ class DirectAudioLLM:
                              "Tell the person in ONE short sentence what you "
                              "just did, in their spoken language, starting "
                              "with its ISO code in brackets."})
-            resp = self._client.chat(model=self._model, messages=messages,
-                                     options=self._options,
-                                     think=False, stream=False)
-            language, reply = _split_lang(
-                (resp["message"].get("content") or "").strip(), language)
+            msg = self._chat(messages, None, say, language)
+            language, reply = _split_lang((msg.get("content") or "").strip(), language)
+        if on_sentence is not None:
+            # What the turn settled on but was not said yet: held claims that
+            # turned out true (or stand after a failed retry), a fallback to
+            # earlier prose. Then report what was actually said.
+            for sentence in split_sentences(reply):
+                if sentence not in spoken:
+                    spoken.append(sentence)
+                    on_sentence(sentence, language)
+            reply = " ".join(spoken)
         elapsed = time.time() - start
 
         logger.info(f"direct: reply in {elapsed:.2f}s lang={language}: {reply}")

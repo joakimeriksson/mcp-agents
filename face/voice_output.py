@@ -12,6 +12,7 @@ Can be run standalone:
 """
 
 import collections
+import itertools
 import os
 import re
 import time
@@ -29,6 +30,7 @@ from piper import PiperVoice
 
 from events import EventDispatcher
 from reply_language import reply_language
+from sentences import split_sentences
 
 logger = logging.getLogger("voice_output")
 
@@ -286,66 +288,100 @@ class VoiceOutput:
         """Interrupt the current TTS playback. Safe to call from any thread."""
         self._stop_event.set()
 
-    def speak(self, text: str, language: Optional[str] = None):
-        """Blocking TTS: synthesize and play. Thread-safe.
+    def speak(self, text, language: Optional[str] = None):
+        """Blocking TTS: synthesize and play, one sentence at a time. Thread-safe.
 
-        *language* selects the voice model (e.g. ``"fr"``, ``"de"``).
+        *text* is a string or an iterable of sentences that may still be
+        arriving (e.g. a queue fed by a streaming LLM). Either way each
+        sentence is its own TTS request, made while the previous one plays,
+        so speech starts as soon as the first sentence exists.
+
+        *language* selects the voice model (e.g. ``"fr"``, ``"de"``); the
+        first sentence decides it for the whole reply.
         Falls back to the default (English) if the language is unknown.
         Can be interrupted mid-playback via ``stop_speaking()``.
         After returning, check ``interrupted`` to know if it was cut short.
         """
         if not self._lock.acquire(timeout=0.5):
-            self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(text))
-            logger.warning(f"TTS busy, rejected: {text}")
+            preview = text if isinstance(text, str) else "(sentence stream)"
+            self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(preview))
+            logger.warning(f"TTS busy, rejected: {preview}")
             return
 
         try:
-            language = self._speak_language(text, language)
+            sentences = iter(split_sentences(text) if isinstance(text, str) else text)
+            first = next(sentences, None)
+            if not first:
+                return
+            spoken = [first]
+
+            def rest():
+                for sentence in sentences:
+                    spoken.append(sentence)
+                    yield sentence
+
+            language = self._speak_language(first, language)
             server = self._tts_servers.get(language)
             voice = None
             if server is None:
                 voice = self._get_voice(language)
                 if voice is None:
-                    logger.warning(f"TTS not ready, would say: {text}")
+                    logger.warning(f"TTS not ready, would say: {first} ...")
                     return
             self._speaking = True
             self._interrupted = False
             self._stop_event.clear()
-            # Pronunciation replacements are piper-specific phonetic hacks —
-            # the HTTP server (Kokoro, real g2p) gets the raw text instead.
-            tts_text = text if server is not None \
-                else self._apply_pronunciations(text, language)
             start = time.time()
-            self._emit(TtsEventType.TTS_STARTED,
-                       TtsStartedPayload(text, tts_text if tts_text != text else None))
+            self._emit(TtsEventType.TTS_STARTED, TtsStartedPayload(first, None))
             if server is not None:
+                # Pronunciation replacements are piper-specific phonetic hacks —
+                # the HTTP server (Kokoro, real g2p) gets the raw text instead.
                 try:
-                    audio, sr = self._http_synth(tts_text, language, server)
-                    self._play_stream(text, iter([audio]), sr)
+                    audio, sr = self._http_synth(first, language, server)
                 except Exception as e:
                     logger.warning(
                         f"HTTP TTS ({server['url']}) failed: {e} — "
                         f"falling back to piper")
                     voice = self._get_voice(language)
                     if voice is None:
-                        logger.warning(f"TTS not ready, would say: {text}")
+                        logger.warning(f"TTS not ready, would say: {first} ...")
                         return
-                    self._play(self._apply_pronunciations(text, language), voice)
+                    self._play(itertools.chain([first], rest()), voice, language)
+                else:
+                    self._play_stream(first, itertools.chain(
+                        [audio], self._http_rest(rest(), language, server, sr)), sr)
             else:
-                self._play(tts_text, voice)
+                self._play(itertools.chain([first], rest()), voice, language)
             duration = time.time() - start
             self._emit(TtsEventType.TTS_FINISHED,
-                       TtsFinishedPayload(text, duration))
+                       TtsFinishedPayload(" ".join(spoken), duration))
         except Exception as e:
             logger.error(f"TTS playback failed: {e}")
         finally:
             self._speaking = False
             self._lock.release()
 
-    def speak_async(self, text: str, language: Optional[str] = None):
+    def speak_async(self, text, language: Optional[str] = None):
         """Non-blocking TTS: speak in a background thread."""
         threading.Thread(target=self.speak, args=(text, language),
                          daemon=True).start()
+
+    def _http_rest(self, sentences, language, server, sr):
+        """Audio for the sentences after the first, one request each. A
+        sentence that fails is skipped: the stream is already playing at
+        *sr*, so piper (another rate) cannot step in mid-reply."""
+        for sentence in sentences:
+            if self._stop_event.is_set():
+                return
+            try:
+                audio, rate = self._http_synth(sentence, language, server)
+            except Exception as e:
+                logger.warning(f"HTTP TTS failed on {sentence!r}: {e} — skipped")
+                continue
+            if rate != sr:
+                logger.warning(f"HTTP TTS answered at {rate} Hz, not {sr} — skipped")
+                continue
+            yield audio
 
     def _speak_language(self, text: str, language: Optional[str],
                         log: bool = True) -> str:
@@ -411,12 +447,17 @@ class VoiceOutput:
             pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
         return pcm.astype("float32") / 32768.0, sr
 
-    def _play(self, text: str, voice: PiperVoice):
-        self._play_stream(
-            text,
-            (chunk.audio_float_array for chunk in voice.synthesize(text)),
-            voice.config.sample_rate,
-        )
+    def _play(self, sentences, voice: PiperVoice, language: Optional[str]):
+        sentences = iter(sentences)
+        first = next(sentences, "")
+
+        def chunks():
+            for sentence in itertools.chain([first], sentences):
+                text = self._apply_pronunciations(sentence, language)
+                for chunk in voice.synthesize(text):
+                    yield chunk.audio_float_array
+
+        self._play_stream(first, chunks(), voice.config.sample_rate)
 
     def _play_stream(self, text: str, chunks, sr: int):
         if len(self.out_waveform) != sr:

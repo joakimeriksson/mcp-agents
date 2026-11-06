@@ -30,7 +30,7 @@ from voice_input import VoiceInput, AudioMonitor, ContinuousListener, EchoDetect
 from voice_output import VoiceOutput
 from people_memory import PeopleMemory
 from llm import ConversationLLM
-from languages_config import get_goodbye
+from languages_config import get_goodbye, get_default_language
 
 logger = logging.getLogger("agent")
 
@@ -146,12 +146,16 @@ class Agent:
                  min_frames_before_ask: int = 3,
                  auto_ask: bool = True,
                  auto_greet: bool = True,
-                 speak_mode: SpeakMode = SpeakMode.SIMPLE):
+                 speak_mode: SpeakMode = SpeakMode.SIMPLE,
+                 direct_llm=None):
         self.tracker = tracker
         self.voice_in = voice_input
         self.voice_out = voice_output
         self.memory = memory
         self.llm = llm
+        # Direct-audio mode (see direct_llm.py): speech goes straight into the
+        # multimodal LLM; voice_input must run the "raw" backend.
+        self.direct_llm = direct_llm
 
         self._greeting_cooldown = greeting_cooldown_s
         self._ask_cooldown = ask_name_cooldown_s
@@ -582,6 +586,11 @@ class Agent:
         if self._busy or not text:
             return
 
+        from voice_input import RAW_AUDIO_TEXT
+        if self.direct_llm and text == RAW_AUDIO_TEXT:
+            self._on_heard_audio()
+            return
+
         with self._busy_lock:
             if self._busy:
                 return
@@ -631,6 +640,75 @@ class Agent:
                 threading.Thread(target=self._extract_facts,
                                  args=(tid, text),
                                  daemon=True).start()
+
+        finally:
+            self._clear_busy()
+            self.state = "LISTENING"
+            self.resume_listening()
+
+    def _on_heard_audio(self):
+        """Direct-audio turn: the raw utterance goes straight into the
+        multimodal LLM (no STT on the critical path). Memory still gets a
+        transcript — produced in the background after the reply."""
+        audio = self.voice_in.last_audio
+        if audio is None or not len(audio):
+            return
+
+        with self._busy_lock:
+            if self._busy:
+                return
+            self._set_busy("heard_audio")
+
+        try:
+            self.pause_listening()
+
+            primary = self.tracker.get_primary_face()
+            tid = primary.track_id if primary else None
+            person = self.memory.get(tid) if tid else None
+            name = person.name if person else None
+            context = (self.memory.get_context_for_llm(tid, max_dialogues=5)
+                       if tid else "Unknown person.")
+            lang_hint = self.voice_in.detected_language or "en"
+
+            self.state = "THINKING"
+            response, lang = self.direct_llm.respond(
+                audio, context=context, language_hint=lang_hint)
+            # Keep downstream consumers (goodbyes, next hint) consistent
+            self.voice_in.detected_language = lang
+
+            self._emit(AgentEventType.RESPONDING, RespondingPayload(
+                track_id=tid, name=name, heard="[audio]",
+                response=response, language=lang,
+            ))
+
+            if tid:
+                self.memory.add_dialogue(tid, "system", response, language=lang)
+            self.state = "TALKING"
+            self.speak(response, language=lang)
+
+            # Off the critical path: transcribe for memory (reachy-style —
+            # folding the transcript into the reply call degrades gemma4's
+            # reply/tool/transcript quality all at once, so keep it separate),
+            # then reuse the normal name-learning and fact-extraction flows.
+            def _memorize(audio=audio, tid=tid, person=person, lang=lang):
+                try:
+                    segments, info = \
+                        self.direct_llm.transcriber.transcribe(audio)
+                    text = "".join(s.text for s in segments).strip()
+                    lang = info.language or lang
+                    logger.info(f"[direct] background transcript: {text}")
+                except Exception as e:
+                    logger.warning(f"background transcription failed: {e}")
+                    return
+                if not text:
+                    return
+                if tid:
+                    self.memory.add_dialogue(tid, "person", text, language=lang)
+                    if person and not person.is_identified:
+                        self._try_learn_name(tid, text)
+                    if person:
+                        self._extract_facts(tid, text)
+            threading.Thread(target=_memorize, daemon=True).start()
 
         finally:
             self._clear_busy()
@@ -835,7 +913,8 @@ def main():
     parser = argparse.ArgumentParser(description="Standalone agent")
     parser.add_argument("--db-dir", default=os.path.join(_SOURCE_DIR, "known_faces"))
     parser.add_argument("--people-dir", default=os.path.join(_SOURCE_DIR, "people"))
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=-1,
+                        help="Camera index; -1 (default) auto-picks the first that delivers video")
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--no-auto-ask", action="store_true")
     parser.add_argument("--no-auto-greet", action="store_true")
@@ -847,6 +926,11 @@ def main():
                         help="Path to MCP servers JSON config (default: mcp_servers.json)")
     parser.add_argument("--mcp-server", action="append", default=[],
                         help="MCP server SSE URL (can be repeated)")
+    parser.add_argument("--service-server", default=None,
+                        help="SSE URL of a service MCP server (e.g. candytron_mcp): "
+                             "its tools are added like --mcp-server, and its "
+                             "persona prompt, name, and init/exit lifecycle are "
+                             "adopted (see ServiceHost in mcp_client.py)")
     parser.add_argument("--agent-name", default="Face Agent",
                         help="Name the agent uses to describe itself")
     parser.add_argument("--smart-greeting", action="store_true",
@@ -854,6 +938,11 @@ def main():
                              "Default is canned templates — instant.")
     parser.add_argument("--shell", action="store_true",
                         help="Start an interactive debug shell alongside the agent")
+    parser.add_argument("--direct-audio", action="store_true",
+                        help="Experimental: send captured speech straight into the "
+                             "multimodal LLM (one call: hear+think+tools) instead of "
+                             "STT->text->LLM. Needs an audio-capable model (gemma4). "
+                             "Memory transcripts are produced in the background.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -868,7 +957,7 @@ def main():
     tracker = FaceTracker(db=face_db, emotion_detector=emotion_detector,
                           **build_tracker_kwargs())
 
-    voice_in = VoiceInput()
+    voice_in = VoiceInput(stt_backend="raw" if args.direct_audio else "gemma4")
     voice_out = VoiceOutput(model_name=args.en_voice)
     print("Loading speech models...")
     voice_in.load_sync()
@@ -883,17 +972,39 @@ def main():
     memory = PeopleMemory(storage_dir=args.people_dir)
     memory.load()
 
-    from mcp_client import load_servers
+    from mcp_client import load_servers, ServiceHost
+    server_urls = list(args.mcp_server)
+    if args.service_server:
+        server_urls.append(args.service_server)
     mcp_servers, mcp_descriptions = load_servers(
-        config_path=args.mcp_config, server_urls=args.mcp_server)
+        config_path=args.mcp_config, server_urls=server_urls)
+
+    # A service server (candytron_mcp etc.) also provides a persona, a
+    # display name, and init/exit lifecycle — adopt what it offers.
+    service = ServiceHost(args.service_server) if args.service_server else None
+    agent_name = args.agent_name
+    service_prompt = None
+    if service:
+        if not service.init():
+            print(f"ERROR: service_init failed at {args.service_server}",
+                  file=sys.stderr)
+            sys.exit(1)
+        name = service.fetch_name()
+        if name and args.agent_name == "Face Agent":  # not overridden by CLI
+            agent_name = name
+        service_prompt = service.fetch_prompt(get_default_language())
+        logger.info(f"Service: name={name!r}, "
+                    f"persona={'yes' if service_prompt else 'no'}")
 
     llm = ConversationLLM(
         model_name=args.llm_model,
         ollama_url=args.ollama_url,
         mcp_servers=mcp_servers,
         mcp_descriptions=mcp_descriptions,
-        agent_name=args.agent_name,
+        agent_name=agent_name,
         smart_greetings=args.smart_greeting,
+        service_prompt=service_prompt,
+        augmentation_provider=service.fetch_augmentation if service else None,
     )
     try:
         llm.validate()
@@ -901,6 +1012,22 @@ def main():
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     logger.info(f"LLM: {args.llm_model} via {args.ollama_url}")
+
+    direct_llm = None
+    if args.direct_audio:
+        from direct_llm import DirectAudioLLM
+        ollama_host = args.ollama_url.replace("/v1", "").rstrip("/")
+        direct_llm = DirectAudioLLM(
+            model=args.llm_model,
+            host=ollama_host,
+            agent_name=agent_name,
+            service_prompt=service_prompt,
+            augmentation_provider=service.fetch_augmentation if service else None,
+            tools_url=args.service_server,
+        )
+        direct_llm.transcriber.check()  # fail fast if the model can't hear
+        logger.info("Direct-audio mode: speech goes straight into "
+                    f"{args.llm_model} (background transcripts for memory)")
 
     monitor = AudioMonitor()
     monitor.start()
@@ -914,6 +1041,7 @@ def main():
         audio_monitor=monitor,
         auto_ask=not args.no_auto_ask,
         auto_greet=not args.no_auto_greet,
+        direct_llm=direct_llm,
     )
 
     # Log agent events
@@ -936,6 +1064,10 @@ def main():
 
     agent.subscribe(on_agent_event)
 
+    # Per-turn voice latency: speech-end -> assistant-audio-start (STT/LLM/TTS).
+    from latency import LatencyTracker
+    LatencyTracker(voice_in, voice_out)
+
     print("Models loaded. Starting agent.\n")
 
     agent.start()
@@ -948,9 +1080,10 @@ def main():
         ).start()
 
     import cv2
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        logger.error(f"Could not open camera {args.camera}")
+    from camera_utils import open_camera
+    cap, cam_idx = open_camera(args.camera)
+    if cap is None:
+        logger.error("Could not open a working camera (all black/unavailable)")
         return
 
     cv2.namedWindow("Agent", cv2.WINDOW_NORMAL)
@@ -1042,6 +1175,8 @@ def main():
 
     print("\nShutting down...")
     try:
+        if service:
+            service.exit()
         agent.stop()
         monitor.stop()
         cap.release()

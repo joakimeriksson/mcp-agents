@@ -38,6 +38,7 @@ Server types:
   stdio — launch an MCP server as a subprocess (stdin/stdout)
 """
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -48,6 +49,71 @@ from pydantic_ai.mcp import MCPServerSSE, MCPServerStdio
 logger = logging.getLogger("mcp_client")
 
 DEFAULT_CONFIG = "mcp_servers.json"
+
+
+class ServiceHost:
+    """A 'service' MCP server (like candytron_mcp) that, besides tools,
+    publishes a persona and lifecycle for its client:
+
+      - resource ``url://get_service_name``  — the service's display name
+      - prompt   ``get_service_prompt(lang)`` — persona/system prompt snippet
+      - resource ``url://service_init``      — call once before using tools
+      - resource ``url://service_exit``      — call on shutdown
+
+    All of these are optional — a server that lacks one simply returns None
+    and the agent keeps its defaults. Each call opens a short-lived SSE
+    session, so no connection is held between calls.
+    """
+
+    def __init__(self, url: str):
+        self._url = url
+
+    def _run(self, coro, label: str):
+        try:
+            return asyncio.run(coro)
+        except Exception as e:
+            logger.warning(f"service {label} failed ({self._url}): {e}")
+            return None
+
+    async def _read_resource(self, uri: str):
+        from fastmcp import Client
+        from fastmcp.client.transports import SSETransport
+        async with Client(transport=SSETransport(self._url)) as client:
+            res = await client.read_resource(uri)
+            return res[0].text
+
+    async def _get_prompt(self, name: str, lang: str):
+        from fastmcp import Client
+        from fastmcp.client.transports import SSETransport
+        async with Client(transport=SSETransport(self._url)) as client:
+            prompts = {p.name: p for p in await client.list_prompts()}
+            if name not in prompts:
+                return None
+            args = {}
+            if any(a.name == "lang" for a in prompts[name].arguments or []):
+                args["lang"] = lang
+            pr = await client.get_prompt(name, args)
+            return pr.messages[0].content.text
+
+    def fetch_name(self) -> Optional[str]:
+        return self._run(self._read_resource("url://get_service_name"), "name")
+
+    def fetch_prompt(self, lang: str) -> Optional[str]:
+        return self._run(self._get_prompt("get_service_prompt", lang), "prompt")
+
+    def fetch_augmentation(self, lang: str) -> Optional[str]:
+        """Per-turn state from the service (e.g. candytron's current candy
+        positions from the vision system), to inject before the user prompt."""
+        return self._run(self._get_prompt("get_service_augmentation", lang),
+                         "augmentation")
+
+    def init(self) -> bool:
+        return self._run(self._read_resource("url://service_init"),
+                         "init") is not None
+
+    def exit(self) -> bool:
+        return self._run(self._read_resource("url://service_exit"),
+                         "exit") is not None
 
 
 def load_servers(

@@ -128,7 +128,7 @@ class CameraManager:
             display_frame = annotated_frame
             if w > 1280:
                 display_frame = cv2.resize(annotated_frame, (w // 2, h // 2))
-            cv2.imshow('YOLO Detection', display_frame)
+            cv2.imshow(f'CandyTron 4000 - Table camera {self.camera_index} (YOLO)', display_frame)
             if self._open_window_count == 0:
                 cv2.moveWindow('YOLO Detection', 200, 50)
             self._open_window_count += 1

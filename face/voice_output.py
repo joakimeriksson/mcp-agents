@@ -12,6 +12,7 @@ Can be run standalone:
 """
 
 import collections
+import itertools
 import os
 import re
 import time
@@ -23,10 +24,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Callable, Union
 
+import numpy as np
 import sounddevice as sd
 from piper import PiperVoice
 
 from events import EventDispatcher
+from reply_language import reply_language
+from sentences import split_sentences
 
 logger = logging.getLogger("voice_output")
 
@@ -37,11 +41,13 @@ PIPER_MODEL_NAME = "en_US-lessac-medium"
 
 from languages_config import (
     get_language_models, get_language_pronunciations, get_default_language,
+    get_language_tts_servers,
 )
 
 LANGUAGE_MODELS = get_language_models()
 DEFAULT_LANGUAGE = get_default_language()
 LANG_PRONUNCIATIONS = get_language_pronunciations()
+LANGUAGE_TTS_SERVERS = get_language_tts_servers()
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +59,7 @@ class TtsEventType(Enum):
     MODEL_READY = auto()
     MODEL_LOAD_FAILED = auto()
     TTS_STARTED = auto()
+    TTS_AUDIO_START = auto()  # first real audio sample reached the output device
     TTS_FINISHED = auto()
     TTS_BUSY = auto()       # speak() called while already speaking
 
@@ -80,6 +87,13 @@ class TtsStartedPayload:
 
 
 @dataclass(frozen=True)
+class TtsAudioStartPayload:
+    text: str
+    synth_latency_s: float   # speak() start -> first audible sample
+    audio_start_ts: float    # absolute time.time() of the first audible sample
+
+
+@dataclass(frozen=True)
 class TtsFinishedPayload:
     text: str
     duration_s: float
@@ -92,7 +106,7 @@ class TtsBusyPayload:
 
 TtsEventPayload = Union[
     ModelLoadingPayload, ModelReadyPayload, ModelLoadFailedPayload,
-    TtsStartedPayload, TtsFinishedPayload, TtsBusyPayload,
+    TtsStartedPayload, TtsAudioStartPayload, TtsFinishedPayload, TtsBusyPayload,
 ]
 
 
@@ -123,6 +137,7 @@ class VoiceOutput:
         self._model_dir = model_dir
         self._default_model = model_name
         self._language_models = dict(language_models or LANGUAGE_MODELS)
+        self._tts_servers = dict(LANGUAGE_TTS_SERVERS)
         self._lang_pron = LANG_PRONUNCIATIONS
         # Loaded PiperVoice instances keyed by model name
         self._voices: dict[str, PiperVoice] = {}
@@ -133,7 +148,13 @@ class VoiceOutput:
         self._stop_event = threading.Event()
         self._interrupted = False
         self._lock = threading.Lock()
+        self._filler_playing = threading.Event()
         self._dispatcher = EventDispatcher(owner="voice_output")
+        # Rolling window of the last ~1s of played samples, for scope views.
+        # Resized to the active stream's sample rate at playback time so the
+        # buffer always spans exactly one second regardless of engine.
+        self.out_waveform = np.zeros(24000, dtype=np.float32)
+        self.out_last_write = 0.0   # time.time() of the last playback write
 
     # --- Event API ---
 
@@ -230,6 +251,23 @@ class VoiceOutput:
                 self._load_model(model_name)
         return self._voices.get(model_name)
 
+    # --- Server voice selection ---
+
+    def server_voice(self, language: str) -> Optional[str]:
+        """Voice name used on the TTS server for *language* (None = server default)."""
+        return self._tts_servers.get(language, {}).get("voice")
+
+    def server_voices(self, language: str) -> list:
+        """Selectable server voices for *language* (from languages.toml tts_voices)."""
+        return list(self._tts_servers.get(language, {}).get("voices", []))
+
+    def set_server_voice(self, language: str, voice: str):
+        """Switch the server voice for *language* live (next utterance uses it)."""
+        if language not in self._tts_servers:
+            raise ValueError(f"no TTS server configured for language {language!r}")
+        self._tts_servers[language]["voice"] = voice
+        logger.info(f"TTS voice for {language} -> {voice}")
+
     # --- Pronunciation ---
 
     def _apply_pronunciations(self, text: str, language: Optional[str]) -> str:
@@ -251,57 +289,257 @@ class VoiceOutput:
         """Interrupt the current TTS playback. Safe to call from any thread."""
         self._stop_event.set()
 
-    def speak(self, text: str, language: Optional[str] = None):
-        """Blocking TTS: synthesize and play. Thread-safe.
+    def speak(self, text, language: Optional[str] = None):
+        """Blocking TTS: synthesize and play, one sentence at a time. Thread-safe.
 
-        *language* selects the voice model (e.g. ``"fr"``, ``"de"``).
+        *text* is a string or an iterable of sentences that may still be
+        arriving (e.g. a queue fed by a streaming LLM). Either way each
+        sentence is its own TTS request, made while the previous one plays,
+        so speech starts as soon as the first sentence exists.
+
+        *language* selects the voice model (e.g. ``"fr"``, ``"de"``); the
+        first sentence decides it for the whole reply.
         Falls back to the default (English) if the language is unknown.
         Can be interrupted mid-playback via ``stop_speaking()``.
         After returning, check ``interrupted`` to know if it was cut short.
         """
-        if not self._lock.acquire(timeout=0.5):
-            self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(text))
-            logger.warning(f"TTS busy, rejected: {text}")
-            return
+        # While a thinking filler plays, the first sentence is synthesized
+        # meanwhile and played the moment the filler ends; otherwise the
+        # lock is taken now, so a second concurrent speak() is turned away.
+        held = False
+        if not self._filler_playing.is_set():
+            if not self._lock.acquire(timeout=0.5):
+                self._busy(text)
+                return
+            held = True
 
         try:
-            voice = self._get_voice(language)
-            if voice is None:
-                logger.warning(f"TTS not ready, would say: {text}")
+            sentences = iter(split_sentences(text) if isinstance(text, str) else text)
+            first = next(sentences, None)
+            if not first:
                 return
+            spoken = [first]
+
+            def rest():
+                for sentence in sentences:
+                    spoken.append(sentence)
+                    yield sentence
+
+            language = self._speak_language(first, language)
+            server = self._tts_servers.get(language)
+            voice = None
+            start = time.time()
+            self._emit(TtsEventType.TTS_STARTED, TtsStartedPayload(first, None))
+            first_audio = None
+            if server is not None:
+                # Pronunciation replacements are piper-specific phonetic hacks —
+                # the HTTP server (Kokoro, real g2p) gets the raw text instead.
+                try:
+                    first_audio = self._http_synth(first, language, server)
+                except Exception as e:
+                    logger.warning(
+                        f"HTTP TTS ({server['url']}) failed: {e} — "
+                        f"falling back to piper")
+            if first_audio is None:
+                voice = self._get_voice(language)
+                if voice is None:
+                    logger.warning(f"TTS not ready, would say: {first} ...")
+                    return
+            if not held:   # wait for the filler (they are ~1-2 s)
+                if not self._lock.acquire(timeout=3.0):
+                    self._busy(text)
+                    return
+                held = True
             self._speaking = True
             self._interrupted = False
             self._stop_event.clear()
-            tts_text = self._apply_pronunciations(text, language)
-            start = time.time()
-            self._emit(TtsEventType.TTS_STARTED,
-                       TtsStartedPayload(text, tts_text if tts_text != text else None))
-            self._play(tts_text, voice)
+            if first_audio is not None:
+                audio, sr = first_audio
+                self._play_stream(first, itertools.chain(
+                    [audio], self._http_rest(rest(), language, server, sr)), sr)
+            else:
+                self._play(itertools.chain([first], rest()), voice, language)
             duration = time.time() - start
             self._emit(TtsEventType.TTS_FINISHED,
-                       TtsFinishedPayload(text, duration))
+                       TtsFinishedPayload(" ".join(spoken), duration))
         except Exception as e:
             logger.error(f"TTS playback failed: {e}")
         finally:
-            self._speaking = False
+            if held:
+                self._speaking = False
+                self._lock.release()
+
+    def _busy(self, text):
+        preview = text if isinstance(text, str) else "(sentence stream)"
+        self._emit(TtsEventType.TTS_BUSY, TtsBusyPayload(preview))
+        logger.warning(f"TTS busy, rejected: {preview}")
+
+    def speak_async(self, text, language: Optional[str] = None) -> threading.Thread:
+        """Non-blocking TTS: speak in a background thread (returned, so the
+        caller can wait for the whole reply, filler hand-over included)."""
+        thread = threading.Thread(target=self.speak, args=(text, language), daemon=True)
+        thread.start()
+        return thread
+
+    def filler(self, language: Optional[str] = None) -> bool:
+        """Start a short "Hmm…" / "Mm, vänta lite…" in the background, to fill
+        the silence while the reply is being thought up. Returns at once;
+        False if nothing plays: the voice has no fillers on the server
+        (kokoro-voice-server serves them for its --vox-voice voices), the
+        language is not served over HTTP, or something is already playing.
+        A speak() that comes along waits for the filler to finish.
+        """
+        import io
+        import wave
+        import requests
+
+        language = language if language in self._tts_servers else DEFAULT_LANGUAGE
+        server = self._tts_servers.get(language)
+        if server is None or not server["url"].endswith("/v1/audio/speech") \
+                or not self._lock.acquire(blocking=False):
+            return False
+        try:
+            url = server["url"][:-len("speech")] + "filler"
+            resp = requests.get(url, params={"voice": server.get("voice") or "",
+                                             "language": language}, timeout=0.3)
+            if resp.status_code != 200 or not resp.content:
+                self._lock.release()
+                return False
+            with wave.open(io.BytesIO(resp.content)) as wf:
+                sr = wf.getframerate()
+                pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+        except Exception as e:
+            logger.debug(f"no filler: {e}")
             self._lock.release()
+            return False
+        audio = pcm.astype("float32") / 32768.0
+        self._filler_playing.set()
 
-    def speak_async(self, text: str, language: Optional[str] = None):
-        """Non-blocking TTS: speak in a background thread."""
-        threading.Thread(target=self.speak, args=(text, language),
-                         daemon=True).start()
+        def play():
+            try:
+                self._speaking = True
+                self._stop_event.clear()
+                self._play_stream("(filler)", iter([audio]), sr, events=False)
+            except Exception as e:
+                logger.warning(f"filler playback failed: {e}")
+            finally:
+                self._speaking = False
+                self._filler_playing.clear()
+                self._lock.release()
 
-    def _play(self, text: str, voice: PiperVoice):
-        sr = voice.config.sample_rate
+        threading.Thread(target=play, daemon=True).start()
+        return True
+
+    def _http_rest(self, sentences, language, server, sr):
+        """Audio for the sentences after the first, one request each. A
+        sentence that fails is skipped: the stream is already playing at
+        *sr*, so piper (another rate) cannot step in mid-reply."""
+        for sentence in sentences:
+            if self._stop_event.is_set():
+                return
+            try:
+                audio, rate = self._http_synth(sentence, language, server)
+            except Exception as e:
+                logger.warning(f"HTTP TTS failed on {sentence!r}: {e} — skipped")
+                continue
+            if rate != sr:
+                logger.warning(f"HTTP TTS answered at {rate} Hz, not {sr} — skipped")
+                continue
+            yield audio
+
+    def _speak_language(self, text: str, language: Optional[str],
+                        log: bool = True) -> str:
+        """The language speak() voices *text* in."""
+        # The voice follows the reply text, not the conversation language:
+        # that one is sticky on purpose and lags a language switch (see
+        # reply_language.py). It still decides fragments like "Ja!".
+        detected, conf = reply_language(
+            text, language, set(self._tts_servers) | set(self._language_models))
+        if detected and detected != language:
+            if log:
+                logger.info(f"TTS: reply reads as {detected} ({conf:.2f}), not "
+                            f"{language} — using the {detected} voice")
+            language = detected
+        # Normalize: no/unknown language means the default language —
+        # otherwise a caller passing None/False/"hi" silently bypasses
+        # the configured TTS server and lands on the default Piper voice.
+        if (not language or (language not in self._tts_servers
+                             and language not in self._language_models)):
+            language = DEFAULT_LANGUAGE
+        return language
+
+    def voice_for(self, text: str, language: Optional[str] = None) -> tuple:
+        """(language, voice name) that speak() will use for *text*, for display."""
+        language = self._speak_language(text, language, log=False)
+        server = self._tts_servers.get(language)
+        if server is not None:
+            return language, server.get("voice") or "server default"
+        return language, "Piper"
+
+    def _http_synth(self, text: str, language: Optional[str], server: dict):
+        """Synthesize via an OpenAI-compatible /v1/audio/speech server.
+
+        Returns (float32 mono numpy array, sample_rate). Raises on any
+        network/decode error so the caller can fall back to piper.
+        """
+        import io
+        import wave
+        import numpy as np
+        import requests
+
+        body = {"input": text, "response_format": "wav"}
+        if server.get("voice"):
+            body["voice"] = server["voice"]
+        if server.get("speed"):
+            body["speed"] = server["speed"]
+        # Advisory, not authoritative: the client's per-turn language
+        # detection is flaky (a Swedish turn mislabeled 'it' would make the
+        # server speak Swedish text through the Italian pipeline). The server
+        # detects the language from the reply text itself — lingua restricted
+        # to its allow-list, with this hint only breaking low-confidence ties
+        # (the machinery debugged in reachy_mini_conversation_app).
+        if language:
+            body["language_hint"] = language
+        resp = requests.post(server["url"], json=body, timeout=60)
+        resp.raise_for_status()
+        with wave.open(io.BytesIO(resp.content)) as wf:
+            if wf.getsampwidth() != 2 or wf.getnchannels() != 1:
+                raise ValueError(
+                    f"expected mono PCM16 wav, got {wf.getnchannels()}ch "
+                    f"{wf.getsampwidth() * 8}-bit")
+            sr = wf.getframerate()
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+        return pcm.astype("float32") / 32768.0, sr
+
+    def _play(self, sentences, voice: PiperVoice, language: Optional[str]):
+        sentences = iter(sentences)
+        first = next(sentences, "")
+
+        def chunks():
+            for sentence in itertools.chain([first], sentences):
+                text = self._apply_pronunciations(sentence, language)
+                for chunk in voice.synthesize(text):
+                    yield chunk.audio_float_array
+
+        self._play_stream(first, chunks(), voice.config.sample_rate)
+
+    def _play_stream(self, text: str, chunks, sr: int, events: bool = True):
+        if len(self.out_waveform) != sr:
+            # keep the scope window at exactly 1s for this stream's rate
+            self.out_waveform = np.zeros(sr, dtype=np.float32)
         buffer = collections.deque()
         finished = threading.Event()
         stop = self._stop_event
+        play_start = time.time()
+        first_audio = {}   # 't' set (in the audio thread) at the first audible sample
 
         def callback(outdata, frames, time_info, status):
             if stop.is_set():
                 outdata[:, 0] = 0
                 raise sd.CallbackStop
             if buffer:
+                if "t" not in first_audio:        # first real sample leaving the device
+                    first_audio["t"] = time.time()
                 chunk = buffer.popleft()
                 if len(chunk) < frames:
                     outdata[:len(chunk), 0] = chunk
@@ -314,18 +552,34 @@ class VoiceOutput:
                 outdata[:, 0] = 0
                 if finished.is_set():
                     raise sd.CallbackStop
+            n = min(frames, len(self.out_waveform))
+            self.out_waveform = np.roll(self.out_waveform, -n)
+            self.out_waveform[-n:] = outdata[-n:, 0]
+            self.out_last_write = time.time()
+
+        emitted = False
+
+        def _maybe_emit_audio_start():
+            nonlocal emitted
+            if events and not emitted and "t" in first_audio:
+                ts = first_audio["t"]
+                self._emit(TtsEventType.TTS_AUDIO_START,
+                           TtsAudioStartPayload(text, ts - play_start, ts))
+                emitted = True
 
         stream = sd.OutputStream(
             samplerate=sr, channels=1, dtype="float32",
             blocksize=4096, callback=callback,
         )
         stream.start()
-        for audio_chunk in voice.synthesize(text):
+        for audio_chunk in chunks:
             if stop.is_set():
                 break
-            buffer.append(audio_chunk.audio_float_array)
+            buffer.append(audio_chunk)
+            _maybe_emit_audio_start()
         finished.set()
         while stream.active:
+            _maybe_emit_audio_start()
             if stop.is_set():
                 stream.abort()
                 break

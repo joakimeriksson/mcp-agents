@@ -65,12 +65,14 @@ def _git_commit_short() -> str | None:
         return None
 
 default_lang = "sv"
-messages_trunclen = 8
+messages_trunclen = 3   # short: long histories made gemma4 copy its own bad turns
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
 omit_names_and_prefs = False
 talk_to_unknown = True   # greet faces the DB doesn't know yet
 expressive = False       # [voice] expressive: style tags + jokes (VoxCPM2)
+cfg_ear = "gemma4"       # [llm] ear: gemma4 | whisper
+express_tool = False     # [voice] express_tool: mood via an express() tool, not inline tags
 
 muted = False
 
@@ -200,6 +202,13 @@ def parse_args():
     parser.add_argument('--expressive', dest='expressive', action='store_true', default=None,
                         help='Playful voice: style tags ([skrattar], [glad] ...) acted out by '
                              'VoxCPM2, light jokes (default from config [voice] expressive)')
+    parser.add_argument('--ear', choices=['gemma4', 'whisper'], default=None,
+                        help='Direct-audio: who hears the speech. whisper = Whisper (MLX, GPU) '
+                             'transcribes and gemma4 answers the text; gemma4 = audio into gemma4 '
+                             '(default from config [llm] ear)')
+    parser.add_argument('--express-tool', dest='express_tool', action='store_true', default=None,
+                        help='Expressive mood via a local express(mood) tool call instead of '
+                             'inline [tags] (direct-audio only; default from config [voice] express_tool)')
     parser.add_argument('--no-expressive', dest='expressive', action='store_false',
                         help='Plain voice, no style tags or jokes')
     parser.add_argument('--detect-fps', type=int, default=6,
@@ -637,6 +646,8 @@ def _text_history(mlst, max_turns):
             content = m.get('content')
         else:
             role, content = getattr(m, 'role', None), getattr(m, 'content', None)
+        if role == 'assistant' and content and _TOOL_TEXT.search(str(content)):
+            continue   # a tool call written as text: never let the model copy it
         if role in ('user', 'assistant') and content:
             out.append({'role': role, 'content': str(content)})
     users = [i for i, m in enumerate(out) if m['role'] == 'user']
@@ -711,10 +722,17 @@ def _direct_transcribe(audio, user_msg, lang, turn_lines=(), turn_info=None):
     in the wrong order, sometimes in the middle of the next turn."""
     info = None
     try:
-        tr = direct_llm.transcriber
-        tr.language_hint = lang
-        segs, info = tr.transcribe(audio)
-        text = "".join(seg.text for seg in segs).strip()
+        heard = (turn_info or {}).get("whisper_heard")
+        if heard is not None:
+            # Whisper already transcribed it for the reply: that IS what was heard.
+            from types import SimpleNamespace
+            text = heard.text or f"({heard.reason})"
+            info = SimpleNamespace(language=heard.language or lang)
+        else:
+            tr = direct_llm.transcriber
+            tr.language_hint = lang
+            segs, info = tr.transcribe(audio)
+            text = "".join(seg.text for seg in segs).strip()
     except Exception as e:
         logger.warning("background transcription failed: %s", e)
         text = ""
@@ -824,6 +842,53 @@ def greet_prompt():
     else:
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. {pref} It was {duration} minutes since you last met. Produce a suitable greeting.'}
 
+
+# gemma4 sometimes WRITES a tool call as text ("movebetween{dst: O0,src: C1}
+# [sv] Här är din Snickers.") instead of calling it. The arm never moved, the
+# text went into the history, and every later turn copied it. Execute such a
+# call for real and keep only the prose (same recovery as face/direct_llm.py).
+from direct_llm import (_TOOL_TEXT, _text_tool_calls, _strip_tool_text,
+                        _split_lang, parse_scene_positions)
+from types import SimpleNamespace
+
+
+def recover_text_tool_calls(message, tools):
+    """(message-like, history-entry) with text-written calls made real."""
+    content = message.content or ""
+    if message.tool_calls or not tools or not _TOOL_TEXT.search(content):
+        return message, message
+    names = [t["function"]["name"] for t in tools]
+    calls, seen = [], set()
+    for c in _text_tool_calls(content, names):
+        key = (c["function"]["name"], json.dumps(c["function"]["arguments"], sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            calls.append(c)
+    text = _split_lang(_strip_tool_text(content), "")[1]
+    logger.warning(f"classic: model wrote tool call(s) as text: {content[:80]!r} -> {calls}")
+    tcs = [SimpleNamespace(id=f"textcall_{i}", type="function",
+                           function=SimpleNamespace(name=c["function"]["name"],
+                                                    arguments=json.dumps(c["function"]["arguments"])))
+           for i, c in enumerate(calls)]
+    msg = SimpleNamespace(content=text, tool_calls=tcs or None)
+    hist = {"role": "assistant", "content": text}
+    if tcs:
+        hist["tool_calls"] = [{"id": t.id, "type": "function",
+                               "function": {"name": t.function.name,
+                                            "arguments": t.function.arguments}} for t in tcs]
+    return msg, hist
+
+
+def empty_square_refusal(name, args, scene):
+    """Reason to refuse a move from a square the camera sees as empty."""
+    if name != "move_between" or not scene or not isinstance(args, dict):
+        return None
+    src = str(args.get("src", "")).upper().strip()
+    if src and src not in scene:
+        known = ", ".join(f"{p} ({d.split(',')[0]})" for p, d in sorted(scene.items()))
+        return f"Position {src} is EMPTY, nothing was moved. Candy is at: {known}."
+    return None
+
 def compose_messages(sysp, mlst, augs):
     n = 0
     i1 = 0
@@ -911,9 +976,9 @@ async def main(args):
             elif res.name == 'service_exit':
                 has_exit = True
         
-        prompts = await client.list_prompts()
+        mcp_prompt_list = await client.list_prompts()
         print("\nAvailable prompts:")
-        for prompt in prompts:
+        for prompt in mcp_prompt_list:
             print(prompt)
             if prompt.name == 'get_service_prompt':
                 has_sysprompt = True
@@ -1058,6 +1123,17 @@ async def main(args):
             direct_llm.transcriber.check()   # fail fast if the model can't hear
             print(f'Loading {args.llm_model} into memory (kept loaded for the whole session)...')
             await asyncio.to_thread(direct_llm.warm)
+            try:
+                # Whisper on the GPU picks the reply language (gemma4's ear
+                # takes short Swedish for English). Falls back silently.
+                from lang_id import LanguageID
+                direct_llm.lang_id = LanguageID()
+                direct_llm.lang_id.warm()
+                direct_llm.ear = args.ear or cfg_ear
+                print(f'Ear: {direct_llm.ear}')
+                print(f'Language id: {direct_llm.lang_id._repo} (loading in the background)')
+            except Exception as e:  # noqa: BLE001
+                print(f'Language id unavailable ({e}); gemma4 picks the language itself')
             if not direct_llm._tools:
                 print('WARNING: direct-audio mode loaded no tools from the server')
             print(f'Direct-audio mode: speech goes straight into {args.llm_model} '
@@ -1165,15 +1241,37 @@ async def main(args):
               f"{f' ({cam_name})' if cam_name else ''}")
         _ilog("camera_selected", requested=args.camera, index=cam_index, name=cam_name)
 
+        cam_ref = {"cap": cap}
+
+        def _reopen_camera(reason):
+            # The iPhone camera drops out now and then, and one bad frame used
+            # to kill this loop for good. Reopen instead of dying.
+            logger.warning("people camera: %s -- reopening", reason)
+            _ilog("camera_reopen", reason=reason)
+            try:
+                cam_ref["cap"].release()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1.0)
+            new_cap, idx, name = resolve_camera(args.camera)
+            if new_cap is not None:
+                cam_ref["cap"] = new_cap
+                logger.info("people camera reopened: %s %s", idx, name or "")
+
         def _camera_loop():
             detect_interval = 1.0 / max(1, args.detect_fps)
             last_detect = [0.0]
-            try:
-                while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
-                    ret, frame = cap.read()
-                    if not ret:
+            last_ok, errors = time.time(), 0
+            while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
+              try:
+                    ret, frame = cam_ref["cap"].read()
+                    if not ret or frame is None:
+                        if time.time() - last_ok > 3.0:
+                            _reopen_camera("no frames for 3 s")
+                            last_ok = time.time()
                         time.sleep(0.05)
                         continue
+                    last_ok = time.time()
                     # Throttle detection to DETECT_FPS. onnxruntime retains
                     # ~40 MB per InsightFace inference on this build (a known
                     # leak, provider-independent), so running it at full camera
@@ -1207,10 +1305,20 @@ async def main(args):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     cam_win.set_camera_frame(rgb)
-            except Exception:
-                logger.exception("camera_loop crashed")
-            finally:
-                cap.release()
+                    errors = 0
+              except Exception as e:  # noqa: BLE001
+                    errors += 1
+                    logger.exception("camera_loop error (%d in a row)", errors)
+                    _ilog("camera_error", error_class=type(e).__name__,
+                          error_message=str(e), in_a_row=errors)
+                    if errors >= 5:
+                        _reopen_camera(f"{errors} errors in a row")
+                        errors = 0
+                    time.sleep(0.2)
+            try:
+                cam_ref["cap"].release()
+            except Exception:  # noqa: BLE001
+                pass
 
         threading.Thread(target=_camera_loop, daemon=True).start()
         print('Face tracker started')
@@ -1352,7 +1460,11 @@ async def main(args):
                 if prompts.is_overridden("persona"):   # edited live in the launcher
                     sysprompt["content"] = prompts.get("persona")
                 if expressive:
-                    sysprompt["content"] += "\n" + prompts.get("expressive")
+                    use_tool = express_tool and direct_llm is not None
+                    if direct_llm is not None:
+                        direct_llm.express_tool = use_tool
+                    sysprompt["content"] += "\n" + prompts.get(
+                        "expressive_tool" if use_tool else "expressive")
                 # Direct-audio: the scene in English (with Swedish names kept).
                 # A Swedish scene list pulled gemma4 into answering English and
                 # German speakers in Swedish (measured: 9/16 -> 12/15 right).
@@ -1455,6 +1567,7 @@ async def main(args):
                                         for n, _a, r in _done)
                     messages.append({"role": "assistant", "content": reply_text})
                     _ilog("direct_response", content=reply_text, lang=lang,
+                          lang_id=list(getattr(direct_llm, "last_lid", (None, 0.0))),
                           tool_calls=[{"name": n, "arguments": a}
                                       for n, a, _ in getattr(direct_llm, "last_tool_calls", [])],
                           seconds=round(time.time() - t0, 2))
@@ -1473,6 +1586,7 @@ async def main(args):
                         "reply_seconds": round(time.time() - t0, 2),
                         "actions": _calls(getattr(direct_llm, "last_tool_calls", [])),
                         "rejected": _calls(getattr(direct_llm, "rejected_tool_calls", [])),
+                        "whisper_heard": getattr(direct_llm, "last_heard", None),
                     })
                 elif greet_stream:
                     # Greeting: streamed, short, no tools -- first words well
@@ -1539,14 +1653,22 @@ async def main(args):
                           content=response.choices[0].message.content,
                           tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
 
-                    tool_calls = response.choices[0].message.tool_calls
-                    while tool_calls:
-                        messages.append(response.choices[0].message)
+                    rmsg, rhist = recover_text_tool_calls(response.choices[0].message, tools)
+                    tool_calls = rmsg.tool_calls
+                    turn_scene_pos = parse_scene_positions(augprompt['content'] if augprompt else None)
+                    while tool_calls and iteration < 4:
+                        messages.append(rhist)
                         for tool_call in tool_calls:
                             try:
                                 args_parsed = json.loads(tool_call.function.arguments)
                             except (TypeError, ValueError):
                                 args_parsed = None
+                            refusal = empty_square_refusal(tool_call.function.name, args_parsed, turn_scene_pos)
+                            if refusal:
+                                logger.warning(f"classic: refused {tool_call.function.name}({args_parsed}): {refusal}")
+                                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                                 "content": json.dumps({"result": refusal})})
+                                continue
                             try:
                                 result = await client.call_tool(tool_call.function.name,
                                                                 json.loads(tool_call.function.arguments))
@@ -1612,11 +1734,14 @@ async def main(args):
                               iteration=iteration,
                               content=response.choices[0].message.content,
                               tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
-                        tool_calls = response.choices[0].message.tool_calls
+                        rmsg, rhist = recover_text_tool_calls(response.choices[0].message, tools)
+                        tool_calls = rmsg.tool_calls
 
-                    # No tool calls, just print the response.
-                    messages.append(response.choices[0].message)
-                    reply_text = response.choices[0].message.content or ""
+                    # No tool calls, just print the response. Never speak or
+                    # store leftover tool syntax.
+                    reply_text = _strip_tool_text(rmsg.content or "") if _TOOL_TEXT.search(rmsg.content or "") else (rmsg.content or "")
+                    reply_text = _split_lang(reply_text, "")[1]
+                    messages.append({"role": "assistant", "content": reply_text})
                 if not direct_turn:
                     emit_turn([turn_scene, turn_user_line, f"  Agent:  ({lang}) {reply_text}",
                                *actions_block(classic_calls)],
@@ -1682,7 +1807,7 @@ async def main(args):
         print('Exiting')
 
 def run():
-    global omit_names_and_prefs, talk_to_unknown, expressive
+    global omit_names_and_prefs, talk_to_unknown, expressive, express_tool
 
     args = parse_args()
 
@@ -1736,6 +1861,10 @@ def run():
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
     talk_to_unknown = cfg["face"].get("talk_to_unknown", True)
     expressive = cfg["voice"].get("expressive", False) if args.expressive is None else args.expressive
+    global cfg_ear
+    cfg_ear = cfg["llm"].get("ear", "gemma4")
+    express_tool = (cfg["voice"].get("express_tool", False)
+                    if args.express_tool is None else args.express_tool)
     voice_cfg.update(cfg.get("voice_id", {}))
     if args.debug_audio is None:
         args.debug_audio = cfg["debug"].get("audio_panel", False)

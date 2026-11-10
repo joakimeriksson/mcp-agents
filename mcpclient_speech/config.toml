@@ -3,6 +3,7 @@ model    = "gemma4:latest"
 base_url = "http://localhost:11434/v1/"
 api_key  = "ollama"
 direct_audio = true    # speech straight into gemma4 (one call: hear + think + tools)
+ear = "whisper"        # whisper: Whisper (MLX) transcribes, gemma4 answers the text; gemma4: audio into gemma4
 
 [face]
 omit_names_and_prefs = true    # skip "vad heter du?" and the per-person distillation LLM call
@@ -27,6 +28,7 @@ camera     = "macbook"   # the built-in laptop camera, never the iPhone
 
 [voice]
 expressive = true    # experiment: playful CandyTron that laughs now and then (VoxCPM2 tags)
+express_tool = true  # mood via an express() tool call instead of inline [tags] (inline tags made gemma4 write arm calls as text)
 
 [debug]
 audio_panel = true   # VU meters + oscilloscope in the eye window

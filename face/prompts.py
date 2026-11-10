@@ -66,12 +66,23 @@ Haha, du har god smak. Här kommer en Dumle."
 - Tags are ONLY for how a sentence sounds. Moving candy is done with the tool
   (function call), never by writing a tag or the call as text."""
 
+EXPRESSIVE_TOOL = """Your voice can laugh, whisper and show feelings. Be warm and playful. Now and
+then, when it fits, make a light, friendly joke about candy, robots or the
+moment.
+To set how your reply sounds, call the express tool (mood: laugh, happy,
+whisper or thinking) together with your reply. Most replies need no mood at
+all. Use laugh ONLY after something actually funny. express never replaces
+another tool: if the person wants candy, you still call move_between.
+Your spoken text is always plain sentences: no tags, no brackets except the
+leading language code."""
+
 GREETING = ("Greet them in ONE short sentence (at most 12 words) and ask which candy they would like. Do not describe yourself, the exhibition or the technology unless they ask.")
 
 DEFAULTS = {
     "rules": RULES,
     "persona": "",   # empty: the service's own persona (candytron_mcp get_service_prompt)
     "expressive": EXPRESSIVE,
+    "expressive_tool": EXPRESSIVE_TOOL,
     "greeting": GREETING,
 }
 
@@ -79,6 +90,7 @@ LABELS = {
     "rules": "Rules (direct audio)",
     "persona": "Persona",
     "expressive": "Expressive voice",
+    "expressive_tool": "Expressive voice (express tool)",
     "greeting": "Greeting",
 }
 
@@ -87,6 +99,7 @@ HELP = {
              "{name}, {service} (persona + scene) and {lang_rule} are filled in per turn.",
     "persona": "Who the robot is. Empty = the persona from candytron_mcp.",
     "expressive": "Added when expressive mode is on: the [skrattar]/[glad]/[viskar]/[tänker] tags.",
+    "expressive_tool": "Used instead of the above with [voice] express_tool = true: mood via the express() tool.",
     "greeting": "Instruction for the greeting when a visitor steps up.",
 }
 

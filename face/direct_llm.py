@@ -88,14 +88,91 @@ _ACTION_CLAIM = re.compile(
 # Braces never occur in speech, so "name{...}" is always a written-out call --
 # with or without a [toolcall] / <|tool_call> prefix (the bare form
 # "movebetween{dst: O0 ,src: C1 }" and "showdemomove{}" were read out loud).
-_TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|<\|\"\|>|\w+\s*\{[^{}]*\}|[{}]",
+# Also "movebetween(src='B2', dst='O0')" -- parentheses, but only for known
+# tool names (ordinary speech has parentheses too).
+_KNOWN_CALL = r"(?:move_?between|show_?demo_?move|default_?action|express)\s*\([^()]*\)"
+_TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|<\|\"\|>|\w+\s*\{[^{}]*\}|[{}]|" + _KNOWN_CALL,
                         re.IGNORECASE)
-_TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)?\s*(?:call:)?\s*([a-z_]+)\s*\{([^{}]*)\}",
+_TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)?\s*(?:call:)?\s*"
+                             r"(?:([a-z_]+)\s*\{([^{}]*)\}|"
+                             r"(move_?between|show_?demo_?move|default_?action|express)\s*\(([^()]*)\))",
                              re.IGNORECASE)
 # Any known tool written as text is executed as if it had been called --
 # except ones that act at random or do nothing, which are just dropped.
 _NOT_RECOVERED = {"show_demo_move", "default_action"}
-_TOOL_TEXT_ARG = re.compile(r"(\w+)\s*:\s*(?:<\|\"\|>(.*?)<\|\"\|>|\"([^\"]*)\"|([^,}\s]+))")
+_TOOL_TEXT_ARG = re.compile(r"(\w+)\s*[:=]\s*(?:<\|\"\|>(.*?)<\|\"\|>|\"([^\"]*)\"|'([^']*)'|([^,})\s]+))")
+
+
+# Optional local tool: the model sets the voice style with a real function
+# call instead of writing "[glad]" tags inline (inline [tag] markup is what
+# made gemma4 start writing its arm calls as text). Never sent to the MCP
+# server; it only prefixes the matching style tag to the next spoken sentence.
+EXPRESS_TAGS = {"laugh": "[skrattar]", "happy": "[glad]",
+                "whisper": "[viskar]", "thinking": "[tänker]"}
+EXPRESS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "express",
+        "description": ("Optional: set HOW your spoken reply sounds. Call at most once, "
+                        "together with any other tool call, never instead of one. "
+                        "laugh = after something actually funny; happy = excited; "
+                        "whisper = telling a secret; thinking = thinking out loud."),
+        "parameters": {"type": "object",
+                       "properties": {"mood": {"type": "string",
+                                               "enum": list(EXPRESS_TAGS)}},
+                       "required": ["mood"]},
+    },
+}
+
+
+# No Kokoro voice for these: a style tag routes the sentence to VoxCPM2 on
+# the voice server, which speaks them properly (a Swedish Kokoro voice read
+# Dutch as broken Swedish).
+VOX_LANGS = ("nl", "pt", "da")
+VOX_NEUTRAL_TAG = "[speaking naturally]"
+
+
+def _express_tag(call) -> str:
+    args = call["function"].get("arguments") or {}
+    return EXPRESS_TAGS.get(str(args.get("mood", "")).lower().strip(), "")
+
+
+_MOOD_WORDS = {"laugh": "laugh", "laughing": "laugh", "skrattar": "laugh",
+               "happy": "happy", "glad": "happy", "excited": "happy",
+               "whisper": "whisper", "viskar": "whisper",
+               "thinking": "thinking", "tänker": "thinking", "think": "thinking"}
+# express() written as text: "express(mood: laugh)", "[express:happy]", "express{mood:happy}"
+_EXPRESS_TEXT = re.compile(r"\[?\s*express\s*[(:{\[]\s*(?:mood\s*[:=]\s*)?[\"']?(\w+)[\"']?\s*[)}\]]?\]?",
+                           re.IGNORECASE)
+# Other markup gemma4 leaks next to tool calls: "[tool: ]", "[defaultaction]", a mid-text "[en]".
+_JUNK_TAG = re.compile(r"\[\s*(?:tool[^\]]*|default_?action|show_?demo_?move|move_?between|[a-z]{2})\s*\]",
+                       re.IGNORECASE)
+_BRACKET_MOOD = re.compile(r"\[\s*(\w+)\s*\]")
+
+
+def _clean_spoken(sentence: str) -> tuple:
+    """(text safe to speak, mood or '') -- for express-tool mode, where the
+    model sometimes writes the mood (or other tool syntax) instead of calling it."""
+    mood = ""
+    m = _EXPRESS_TEXT.search(sentence)
+    if m:
+        mood = _MOOD_WORDS.get(m.group(1).lower(), "")
+        sentence = _EXPRESS_TEXT.sub(" ", sentence)
+    def _bm(mm):
+        nonlocal mood
+        w = _MOOD_WORDS.get(mm.group(1).lower())
+        if w:
+            mood = mood or w
+            return " "
+        return mm.group(0)
+    sentence = _BRACKET_MOOD.sub(_bm, sentence)
+    sentence = _JUNK_TAG.sub(" ", sentence)
+    sentence = re.sub(r"\*+([^*]+)\*+", r"\1", sentence).replace("*", "")
+    sentence = re.sub(r"\s+", " ", sentence).strip()
+    sentence = re.sub(r"^[!?.,;:\s]+", "", sentence)
+    if mood:   # "express(mood: laugh) en Why did..." leaves a bare language code
+        sentence = re.sub(r"^(?:sv|en|de|fr|es|it)\b[:\s]*", "", sentence)
+    return sentence, mood
 
 
 def _text_tool_calls(content: str, tool_names: list) -> list:
@@ -103,11 +180,12 @@ def _text_tool_calls(content: str, tool_names: list) -> list:
     norm = {n.replace("_", "").lower(): n for n in tool_names}
     calls = []
     for m in _TOOL_TEXT_CALL.finditer(content or ""):
-        name = norm.get(m.group(1).replace("_", "").lower())
+        raw_name, raw_args = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        name = norm.get(raw_name.replace("_", "").lower())
         if not name or name in _NOT_RECOVERED:
             continue
         args = {}
-        for a in _TOOL_TEXT_ARG.finditer(m.group(2)):
+        for a in _TOOL_TEXT_ARG.finditer(raw_args):
             args[a.group(1)] = next(v for v in a.groups()[1:] if v is not None)
         calls.append({"function": {"name": name, "arguments": args}})
     return calls
@@ -134,7 +212,7 @@ _MOVE_OK = re.compile(r"^(Started moving|Queued|Successfully demonstrated)", re.
 # it was refused, failed, or did nothing.
 _NOT_DONE = re.compile(r"^\s*(refused|failed|error|did nothing|tool \S+ failed|unknown)",
                        re.IGNORECASE)
-_NO_OP_TOOLS = {"default_action"}
+_NO_OP_TOOLS = {"default_action", "express"}
 
 
 def parse_scene_positions(augmentation: Optional[str]) -> dict:
@@ -154,12 +232,26 @@ KEEP_ALIVE = -1
 SHORT_UTTERANCE_S = 1.0
 
 
+_LEAD_TAGS = re.compile(r"^\s*(?:\[[^\[\]]{1,24}\]\s*)+")
+
+
 def _split_lang(text: str, default: str) -> tuple:
-    """('sv', 'Hej!') from '[sv] Hej!'; the tag is never spoken."""
-    m = _LANG_TAG.match(text or "")
-    if not m:
-        return default, (text or "").strip()
-    return m.group(1).lower(), text[m.end():].strip()
+    """('sv', 'Hej!') from '[sv] Hej!'; the tag is never spoken. The language
+    tag may come after a mood tag ("[glad] [en] Here...") -- the mood tag is
+    kept, only the language tag is removed."""
+    text = text or ""
+    m = _LANG_TAG.match(text)
+    if m:
+        return m.group(1).lower(), text[m.end():].strip()
+    lead = _LEAD_TAGS.match(text)
+    if lead:
+        tags = re.findall(r"\[([^\[\]]{1,24})\]", lead.group(0))
+        for t in tags:
+            if re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", t.strip(), re.IGNORECASE):
+                rest = [f"[{x}]" for x in tags if x is not t]
+                body = (" ".join(rest) + " " + text[lead.end():]).strip()
+                return t.strip().lower(), body
+    return default, text.strip()
 
 
 def _is_claim(text: str) -> bool:
@@ -282,6 +374,18 @@ class DirectAudioLLM:
         self._tools_url = tools_url
         self._sample_rate = sample_rate
         self._tools: list = []
+        self.express_tool = False   # offer the local express(mood) tool
+        self.lang_id = None         # lang_id.LanguageID: Whisper decides the reply language
+        self.last_lid = (None, 0.0)
+        self.last_mood = ""         # style tag the model chose this turn
+        # "gemma4": the audio goes into gemma4. "whisper": Whisper (MLX, GPU)
+        # transcribes it and gemma4 answers the TEXT.
+        self.ear = "gemma4"
+        self.last_heard = None      # lang_id.Heard of this turn (ear == "whisper")
+        # Languages the VOICE can speak: Kokoro's six + what VoxCPM2 speaks well
+        # (tested Nov 2026 by synthesizing and transcribing back: nl/pt/da
+        # good, fi garbled). Anything else gets a reply in English.
+        self.speakable = ("en", "sv", "de", "fr", "es", "it") + VOX_LANGS
         if tools_url:
             self._tools = self._load_tools(tools_url)
 
@@ -463,18 +567,27 @@ class DirectAudioLLM:
         import ollama
         content, calls = "", []
         lang, fed = None, 0   # language once the tag is read; chars fed so far
+
         cutter = SentenceStream()
         for part in self._client.chat(model=self._model, messages=messages,
                                       tools=tools, options=self._options,
                                       think=False, stream=True,
                                       keep_alive=KEEP_ALIVE):
             msg = part["message"]
+            for c in msg.get("tool_calls") or []:
+                if c["function"]["name"] == "express":
+                    self.last_mood = self.last_mood or _express_tag(c)
             calls += msg.get("tool_calls") or []
             content += msg.get("content") or ""
             if lang is None:
                 head = content.lstrip()
-                if head.startswith("[") and "]" not in head and len(head) < 10:
-                    continue   # the language tag is still being written
+                if head.startswith("[") and len(head) < 40:
+                    # the leading tags are still being written: wait until the
+                    # text after them has started ("[glad] [en] Here")
+                    lead = _LEAD_TAGS.match(head)
+                    if (lead is None or lead.end() >= len(head)
+                            or head[lead.end():].lstrip().startswith("[")):
+                        continue
                 lang, body = _split_lang(content, default_lang)
                 fed = len(content) - len(body)
             for sentence in cutter.feed(content[fed:]):
@@ -551,6 +664,30 @@ class DirectAudioLLM:
         logger.info(f"direct: greeting in {time.time() - start:.2f}s lang={lang}: {reply}")
         return reply, lang
 
+    def _styled(self, sentence: str, spoken: list, lang: str = "") -> str:
+        """The express() style tag goes on the FIRST spoken sentence only;
+        what is recorded (spoken / history) stays untagged. A language with
+        no Kokoro voice gets a neutral tag on every sentence (-> VoxCPM2)."""
+        if self.last_mood and len(spoken) == 1:
+            return f"{self.last_mood} {sentence}"
+        if lang in VOX_LANGS and not sentence.lstrip().startswith("["):
+            return f"{VOX_NEUTRAL_TAG} {sentence}"
+        return sentence
+
+    def _lang_order(self, code: str) -> str:
+        """The LANGUAGE rule for a detected spoken language."""
+        from lang_id import language_name
+        tail = (" The language only changes your words: if they ask for candy, you "
+                "still call move_between FIRST, exactly as you would in English.\n")
+        if code not in self.speakable:
+            heard = language_name(code)
+            return (f"- LANGUAGE: the person is speaking {heard}, which your voice cannot "
+                    f"speak. Reply in simple English, starting with [en].{tail}")
+        name = language_name(code)
+        return (f"- LANGUAGE: the person is speaking {name}. Reply in {name}, starting "
+                f"with [{code}] -- whatever language the earlier turns or the "
+                f"information above are in.{tail}")
+
     def _moves_ok(self) -> int:
         """Moves the arm really started or queued this turn (a refused call,
         e.g. "arm busy", does not count)."""
@@ -597,13 +734,64 @@ class DirectAudioLLM:
             lang_rule = (f"- This utterance is very short ({seconds:.1f} s). Reply in "
                          f"{lname} (the conversation's language) unless the person "
                          f"clearly asked you to switch language.\n")
+        self.last_lid = (None, 0.0)
+        self.last_heard = None
+        heard = None
+        if self.ear == "whisper" and self.lang_id is not None and self.lang_id.available:
+            from lang_id import language_name
+            # Both names: "Licorice (Lakrits)" -> Licorice, Lakrits.
+            kinds = sorted({n.strip() for d in parse_scene_positions(aug).values()
+                            for n in re.split(r"[()]", d.split(",")[0]) if n.strip()})
+            heard = self.lang_id.transcribe(audio, ", ".join(kinds))
+            self.last_heard = heard
+            if not heard.text:
+                # Noise, a cough, crowd babble: say nothing rather than answer it.
+                logger.info(f"direct: whisper heard nothing usable ({heard.reason})")
+                self.last_tool_calls, self.rejected_tool_calls = [], []
+                return "", language_hint or "en"
+            code = heard.language
+            prob = 1.0
+            if code and code != language_hint:
+                # A SWITCH needs a confident language id (~0.12 s, only on a
+                # switch): accented speech gave Dutch -> "Norwegian" at 0.37
+                # and Finnish -> "Swedish" at 0.45. Unsure: gemma4 decides
+                # from the text itself.
+                code2, prob = self.lang_id.detect(audio)
+                if code2 != code:
+                    prob = min(prob, 0.5)
+            self.last_lid = (code, prob)
+            # Stickiness: a 1-2 word utterance only switches language when
+            # Whisper agrees with the conversation anyway.
+            if code and prob >= 0.6 and (len(heard.text.split()) >= 3 or code == language_hint):
+                lang_rule = self._lang_order(code)
+            logger.info(f"direct: whisper heard [{code}] {heard.text!r}")
+        elif self.lang_id is not None:
+            # gemma4's ear guesses short Swedish as English; Whisper's language
+            # head does not (~0.12 s on the GPU). A confident answer becomes an
+            # ORDER in the prompt. Unsure (noise, a mumble): leave it to gemma4.
+            from lang_id import language_name
+            code, prob = self.lang_id.detect(audio)
+            self.last_lid = (code, prob)
+            if code and prob >= 0.6 and (seconds >= SHORT_UTTERANCE_S or prob >= 0.9
+                                         or code == language_hint):
+                lang_rule = self._lang_order(code)
+            logger.info(f"direct: lang-id {code} p={prob:.2f} -> "
+                        f"{'ordered' if lang_rule and code and code in lang_rule else 'model decides'}")
         system = self._system(service_prompt, aug, language_hint, context, lang_rule)
+        if heard is not None:
+            system = system.replace("their speech is attached\nas audio",
+                                    "their speech reaches you as text from speech recognition")
 
         messages = [{"role": "system", "content": system}]
         messages += _history_messages(history)
-        messages.append({"role": "user",
-                         "content": "(user speech attached as audio)",
-                         "images": [wav]})
+        if heard is not None:
+            messages.append({"role": "user", "content":
+                             f'The person said (speech recognition, may contain small '
+                             f'errors): "{heard.text}"'})
+        else:
+            messages.append({"role": "user",
+                             "content": "(user speech attached as audio)",
+                             "images": [wav]})
 
         start = time.time()
         # What this turn actually called: [(name, args, result)]. The caller
@@ -619,21 +807,41 @@ class DirectAudioLLM:
         say = None
         if on_sentence is not None:
             def say(sentence: str, lang: str):
+                if self.express_tool:
+                    sentence, mood = _clean_spoken(sentence)
+                    if mood and not self.last_mood and not spoken:
+                        self.last_mood = EXPRESS_TAGS[mood]
+                    if not _has_words(sentence):
+                        return
                 # "Här får du en Plopp!" before the arm has moved could be a
                 # lie; the end of the turn decides whether it is said.
                 if self._tools and not self._moves_ok() and _is_claim(sentence):
                     return
                 spoken.append(sentence)
-                on_sentence(sentence, lang)
+                on_sentence(self._styled(sentence, spoken, lang), lang)
 
+        self.last_mood = ""
+        tools = list(self._tools or [])
+        if self.express_tool:
+            tools.append(EXPRESS_TOOL)
         for round_no in range(_MAX_TOOL_ROUNDS):
-            msg = self._chat(messages, self._tools or None, say, language_hint or "en")
+            msg = self._chat(messages, tools or None, say, language_hint or "en")
             calls = msg.get("tool_calls") or []
             content = (msg.get("content") or "").strip()
             if not calls and self._tools and _TOOL_TEXT.search(content):
                 calls = self._recover_text_calls(content, scene)
                 content = _strip_tool_text(content)
                 msg = {"role": "assistant", "content": content, "tool_calls": calls}
+            # express() is local: it only styles the voice, never costs a round.
+            moods = [c for c in calls if c["function"]["name"] == "express"]
+            if moods:
+                self.last_mood = self.last_mood or _express_tag(moods[0])
+                calls = [c for c in calls if c["function"]["name"] != "express"]
+                msg = {"role": "assistant", "content": content, "tool_calls": calls or None}
+                if not calls and not content:
+                    # Only a mood, no words yet: ask again, without the tool.
+                    tools = [t for t in tools if t is not EXPRESS_TOOL]
+                    continue
             if content:
                 texts.append(content)
             if not calls:
@@ -780,7 +988,21 @@ class DirectAudioLLM:
                 logger.warning("direct: retry made no move — the claim stands "
                                "but the arm did not move")
 
+        raw_reply_for_lang = reply or ""
         language, reply = _split_lang(reply, language_hint or "en")
+        if not re.search(r"\[[a-z]{2}\]", raw_reply_for_lang, re.IGNORECASE) and _has_words(reply):
+            # No language tag at all ("Hello there, ..." in a Swedish
+            # conversation): judge from the words, or the conversation never
+            # switches and the fillers stay Swedish while it talks English.
+            try:
+                from reply_language import reply_language
+                detected, _conf = reply_language(re.sub(r"\[[^\]]*\]", " ", reply),
+                                                 language, self._LANG_NAMES.keys())
+                language = detected or language
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"direct: language detection failed: {e}")
+        if self.express_tool:
+            reply = _clean_spoken(reply)[0]
 
         # Never go silent, especially right after moving the arm: a visitor
         # who gets candy and hears nothing assumes it is broken. Checked on
@@ -799,7 +1021,7 @@ class DirectAudioLLM:
             for sentence in split_sentences(reply):
                 if sentence not in spoken:
                     spoken.append(sentence)
-                    on_sentence(sentence, language)
+                    on_sentence(self._styled(sentence, spoken, language), language)
             reply = " ".join(spoken)
         elapsed = time.time() - start
 

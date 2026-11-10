@@ -10,6 +10,9 @@ _DEFAULTS: dict = {
         # Speech straight into the (audio-capable) model: one call for
         # hearing + reasoning + tools; transcript in the background.
         "direct_audio": False,
+        # Who hears the speech in direct-audio mode: "gemma4" (audio in) or
+        # "whisper" (Whisper on the GPU transcribes, gemma4 answers the text).
+        "ear": "gemma4",
     },
     "face": {
         "omit_names_and_prefs": False,
@@ -47,6 +50,9 @@ _DEFAULTS: dict = {
         # [viskar], [tänker]) and joke now and then. The voice server acts
         # them out with VoxCPM2 for voices that have a --vox-voice reference.
         "expressive": False,
+        # With expressive on (direct-audio): the model picks the mood with an
+        # express(mood) tool call instead of writing [tags] inline.
+        "express_tool": False,
     },
     "debug": {
         # Audio debug panel in the eye window: VU meters (mic/VAD/silence

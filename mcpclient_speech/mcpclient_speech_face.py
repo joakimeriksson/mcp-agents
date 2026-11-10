@@ -633,6 +633,44 @@ def _text_history(mlst, max_turns):
 
 _print_lock = threading.Lock()
 
+# Console transcript, one block per turn:
+#   User:   (sv, 2.1s) Kan jag få en Dumle?
+#   Agent:  (sv) Här är din Dumle!   [0.62s]
+#   Action: move between D1 and O0  (started)
+
+def action_line(name, args, result=None, refused=None) -> str:
+    """One 'Action:' line for a tool call and what the arm said about it."""
+    args = args if isinstance(args, dict) else {}
+    if name == "default_action":
+        return "  Action: <no action>"
+    if name == "move_between":
+        what = f"move between {args.get('src', '?')} and {args.get('dst', '?')}"
+    elif name == "show_demo_move":
+        what = "demo move (random candy)"
+    else:
+        what = f"{name} {json.dumps(args, ensure_ascii=False)}"
+    r = (refused or result or "").strip()
+    if refused or r.startswith("Refused"):
+        outcome = "REFUSED: " + r.removeprefix("Refused:").strip()[:90]
+    elif r.startswith(("Started", "Successfully")):
+        outcome = "started"
+    elif r.startswith("Queued"):
+        m = re.search(r"after (\d+)", r)
+        outcome = f"queued after {m.group(1)} earlier move(s)" if m else "queued"
+    else:
+        outcome = r[:90] or "no answer"
+    return f"  Action: {what}  ({outcome})"
+
+def actions_block(calls=(), rejected=()) -> list:
+    lines = [action_line(n, a, refused=r) for n, a, r in rejected]
+    lines += [action_line(n, a, result=r) for n, a, r in calls]
+    return lines or ["  Action: <no action>"]
+
+def scene_line(text) -> str:
+    """'Scene: A1 Dumle · A3 Marianne ...' from the vision system's report."""
+    items = re.findall(r"^\s*([A-Z]\d)\s*:\s*([^,\n]+)", text or "", re.M)
+    return "  Scene:  " + (" · ".join(f"{p} {c.strip()}" for p, c in items) or "no candy seen")
+
 def _direct_transcribe(audio, user_msg, lang, turn_lines=()):
     """Background: transcribe the utterance for the history/log (the reply
     was already produced straight from the audio), then print the whole turn
@@ -652,7 +690,7 @@ def _direct_transcribe(audio, user_msg, lang, turn_lines=()):
     heard_lang = (getattr(info, "language", "") if text else "") or lang
     seconds = len(audio) / 16000.0
     with _print_lock:
-        print(f"\n  User: ({heard_lang}, {seconds:.1f}s) {text or '(unintelligible)'}")
+        print(f"\n  User:   ({heard_lang}, {seconds:.1f}s) {text or '(unintelligible)'}")
         for line in turn_lines:
             print(line)
     _ilog("user_transcript", content=text, lang=heard_lang)
@@ -1263,6 +1301,7 @@ async def main(args):
                 # reply starts; a reply that comes later waits for it.
                 filler_timer = None
                 pending_transcript = None   # (audio, msg, lang, lines), run after speaking
+                classic_actions = []        # Action: lines of a non-direct turn
                 if (newstate == 'process' and not muted and voice_out is not None
                         and args.filler_delay >= 0):
                     filler_timer = threading.Timer(args.filler_delay, voice_out.filler, args=(lang,))
@@ -1283,8 +1322,7 @@ async def main(args):
                 augprompt = await augmentation_message(client, 'en' if direct_llm is not None else lang)
                 augpromptlist = []
                 if augprompt:
-                    print("\n  Augmentation:")
-                    print(augprompt['content'])
+                    print("\n" + scene_line(augprompt['content']))
                     augpromptlist.append(augprompt)
                 augpromptlist.append(langprompt)
                 turn_audio = curr_audio if newstate == 'process' else None
@@ -1302,7 +1340,7 @@ async def main(args):
                     pending_user_msg = {"role": "user", "content": "(audio — transcribing)"}
                     messages.append(pending_user_msg)
                 elif newstate == 'process':
-                    print("\n  User: (", lang, ") ", prompt)
+                    print(f"\n  User:   ({lang}, typed) {prompt}")
                     _ilog("user_turn", kind=prompt_source or "unknown", content=prompt, lang=lang)
                     prompt_source = None
                     messages.append(user_message(prompt))
@@ -1311,7 +1349,7 @@ async def main(args):
                         greetprompt = greet_prompt_noname()
                     else:
                         greetprompt = greet_prompt()
-                    print("\n  Greeting:", greetprompt['content'])
+                    print("\n  User:   (visitor stepped up — greeting)")
                     _ilog("user_turn",
                           kind="greet_noname" if omit_names_and_prefs else "greet",
                           content=greetprompt['content'],
@@ -1368,17 +1406,17 @@ async def main(args):
                         # conversation to Spanish at the fair).
                         lang = choose_language(lang, tag_lang, reply_text)
                     for _tn, _ta, _tr in getattr(direct_llm, "rejected_tool_calls", []):
-                        turn_lines.append(f"  Rejected: {_tn} ( {json.dumps(_ta)} )  Reason: {_tr[:90]}")
                         _ilog("tool_call_rejected", name=_tn, arguments=_ta, reason=_tr)
                     for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
-                        turn_lines.append(f"  Function: {_tn} ( {json.dumps(_ta)} )  ->  {_tr}")
                         _ilog("tool_call", name=_tn, arguments=_ta, result=_tr)
                     messages.append({"role": "assistant", "content": reply_text})
                     _ilog("direct_response", content=reply_text, lang=lang,
                           tool_calls=[{"name": n, "arguments": a}
                                       for n, a, _ in getattr(direct_llm, "last_tool_calls", [])],
                           seconds=round(time.time() - t0, 2))
-                    turn_lines.append(f"  Robot: ({lang}) {reply_text}   [{time.time() - t0:.2f}s]")
+                    turn_lines.append(f"  Agent:  ({lang}) {reply_text}   [{time.time() - t0:.2f}s]")
+                    turn_lines += actions_block(getattr(direct_llm, "last_tool_calls", []),
+                                                getattr(direct_llm, "rejected_tool_calls", []))
                     # NOT now: the transcript is another gemma4 call, and running
                     # it while VoxCPM2 voices the first sentence made that
                     # sentence 3-4x slower (1.1 s -> 3.6-4.9 s, measured). It
@@ -1471,8 +1509,8 @@ async def main(args):
                                     }),
                                     "tool_call_id": tool_call.id
                                 }
-                                print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                                print(  "  Result:   ", resulttxt)
+                                classic_actions.append(action_line(
+                                    tool_call.function.name, args_parsed, result=resulttxt))
                                 _ilog("mcp_tool_call",
                                       name=tool_call.function.name,
                                       arguments=tool_call.function.arguments,
@@ -1488,7 +1526,7 @@ async def main(args):
                                     }),
                                     "tool_call_id": tool_call.id
                                 }
-                                print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
+                                classic_actions.append(f"  Action: unknown function {tool_call.function.name} {tool_call.function.arguments}")
                                 _ilog("mcp_tool_call",
                                       name=tool_call.function.name,
                                       arguments=tool_call.function.arguments,
@@ -1529,7 +1567,9 @@ async def main(args):
                     messages.append(response.choices[0].message)
                     reply_text = response.choices[0].message.content or ""
                 if not direct_turn:
-                    print(f'\n  Response: {reply_text}  (lang={lang})')
+                    print(f"  Agent:  ({lang}) {reply_text}")
+                    for line in (classic_actions or ["  Action: <no action>"]):
+                        print(line)
                 if filler_timer:
                     filler_timer.cancel()
                 set_win_state('talk')

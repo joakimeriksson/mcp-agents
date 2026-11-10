@@ -93,6 +93,8 @@ class Person:
 persondict = {}
 
 curr_person = None
+last_greeting_at = 0.0     # time.time() of the last greeting
+REGREET_SECONDS = 20.0     # no new greeting this soon after the last one
 
 curr_prompt = ""
 curr_audio = None   # the utterance that started the current turn (direct-audio)
@@ -450,6 +452,13 @@ def on_face_change(id):
             _ilog("face_change", face_id=id, status="new", name=None, lang=None, last_seen_seconds_ago=None)
         state['evtime'] = time.time()
         if curr_person.lasttime and state['evtime'] - curr_person.lasttime < 60:
+            state['newstate'] = 'listen'
+        elif state['evtime'] - last_greeting_at < REGREET_SECONDS:
+            # Focus jumped to another face (or the same face got a new track)
+            # seconds after a greeting: greeting again sounds broken. A group
+            # standing together gets one greeting; just keep listening.
+            logger.info("Focus changed %.0fs after a greeting: listening, not re-greeting",
+                        state['evtime'] - last_greeting_at)
             state['newstate'] = 'listen'
         else:
             state['newstate'] = 'greet'
@@ -881,7 +890,7 @@ async def main(args):
     global has_init
     global has_exit
     global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm, voice_db, speaker_client, _voice_pool
-    global curr_prompt, curr_audio
+    global curr_prompt, curr_audio, last_greeting_at
 
     # Connect via SSE to the MCP server
     async with Client(transport=SSETransport(args.server)) as client:
@@ -1457,6 +1466,7 @@ async def main(args):
                     # Greeting: streamed, short, no tools -- first words well
                     # under a second after contact.
                     t0 = time.time()
+                    last_greeting_at = t0
                     sentence_q = queue.Queue()
                     stream_lang = {}
 

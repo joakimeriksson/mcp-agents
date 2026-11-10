@@ -76,10 +76,10 @@ MARIANNE = {"function": {"name": "move_between", "arguments": {"src": "A3", "dst
 SCENE = "De senast observerade positionerna:\nA1 : Dumle, kola.\nA3 : Marianne, mint."
 
 
-def run_scene(llm):
+def run_scene(llm, scene=None):
     heard = []
     reply, lang = llm.respond(np.zeros(32000, np.float32), language_hint="sv",
-                              augmentation=SCENE,
+                              augmentation=scene or SCENE,
                               on_sentence=lambda s, l: heard.append((s, l, len(llm.moves))))
     return reply, lang, heard
 
@@ -168,3 +168,50 @@ def test_demo_turn_text_calls_then_the_real_answer():
                               on_sentence=lambda s, l: heard.append((s, l)))
     assert llm.moves == [{"dst": "O0", "src": "A1"}]          # ONE Dumle, not four
     assert heard == [("Here is a Dumle for you.", "en")]       # no tool text spoken
+
+
+NO_MARIANNE = "Positions:\nA1 : Dumle, red.\nC2 : Plopp, red rectangular."
+
+
+def test_absent_candy_claim_is_not_retried_and_not_said():
+    # Demo: "Here is your Marianne" with no Marianne on the table.
+    llm = make([("[en] Here is your Marianne.", None),
+                ("[en] Sorry, there is no Marianne on the table, but I have Dumle and Plopp.", None)])
+    reply, lang, heard = run_scene(llm, NO_MARIANNE)
+    assert llm.moves == []
+    assert [s for s, _, _ in heard] == ["Sorry, there is no Marianne on the table, but I have Dumle and Plopp."]
+
+
+def test_honest_reply_falls_back_when_the_model_claims_again():
+    llm = make([("[sv] Här är din Marianne.", None), ("[sv] Här är din Marianne!", None)])
+    reply, lang, heard = run_scene(llm, NO_MARIANNE)
+    assert llm.moves == [] and "Här är" not in reply and reply.startswith("Förlåt")
+
+
+def test_retry_may_not_hand_over_a_different_candy():
+    # Demo: the retry for a promised candy moved a Plopp instead.
+    PLOPP = {"function": {"name": "move_between", "arguments": {"src": "C2", "dst": "O0"}}}
+    llm = make([("[en] Here is your Dumle.", None),     # claim, no tool
+                ("[en]", [PLOPP]),                      # retry grabs the wrong candy
+                ("[en]", None),                         # retry round 2: nothing
+                ("[en] Sorry, that did not work. Which candy would you like?", None)])
+    reply, lang, heard = run_scene(llm, NO_MARIANNE)
+    assert llm.moves == []                              # the Plopp move was refused
+    assert all("Here is your Dumle" not in s for s, _, _ in heard)
+
+
+def test_bare_text_tool_call_is_executed_and_not_spoken():
+    # Demo: "movebetween{dst: O0 ,src: C1 } [sv] Här är din Snickers." was read out.
+    scene = "Positions:\nC1 : Snickers, brown.\nA1 : Dumle, red."
+    llm = make([('movebetween{dst:<|"|>O0<|"|>,src:<|"|>C1<|"|>} [sv] Här är din Snickers.', None),
+                ("[sv] Här är din Snickers.", None)])
+    reply, lang, heard = run_scene(llm, scene)
+    assert llm.moves == [{"dst": "O0", "src": "C1"}]
+    assert all("{" not in s and "movebetween" not in s for s, _, _ in heard)
+
+
+def test_written_demo_move_is_dropped_not_executed_or_spoken():
+    llm = make([("showdemomove{}", None), ("[sv] Vill du se vad jag kan?", None)])
+    reply, lang, heard = run_scene(llm)
+    assert llm.moves == []
+    assert all("showdemomove" not in s for s, _, _ in heard)

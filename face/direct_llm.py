@@ -85,10 +85,16 @@ _ACTION_CLAIM = re.compile(
 # (seen at the demo with the expressive prompt, which teaches "[tag]" syntax).
 # The arm then never moved and the voice read the gibberish out. Such text is
 # never spoken, and the call in it is executed as if it had been made.
-_TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|\bcall:\s*\w+\s*\{|<\|\"\|>",
+# Braces never occur in speech, so "name{...}" is always a written-out call --
+# with or without a [toolcall] / <|tool_call> prefix (the bare form
+# "movebetween{dst: O0 ,src: C1 }" and "showdemomove{}" were read out loud).
+_TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|<\|\"\|>|\w+\s*\{[^{}]*\}|[{}]",
                         re.IGNORECASE)
-_TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)\s*(?:call:)?\s*([a-z_]+)\s*\{([^{}]*)\}",
+_TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)?\s*(?:call:)?\s*([a-z_]+)\s*\{([^{}]*)\}",
                              re.IGNORECASE)
+# Recovered from text only when concrete and checkable: a demo move (random)
+# or "do nothing" written as text is dropped, never executed.
+_RECOVERABLE = {"move_between"}
 _TOOL_TEXT_ARG = re.compile(r"(\w+)\s*:\s*(?:<\|\"\|>(.*?)<\|\"\|>|\"([^\"]*)\"|([^,}\s]+))")
 
 
@@ -98,7 +104,7 @@ def _text_tool_calls(content: str, tool_names: list) -> list:
     calls = []
     for m in _TOOL_TEXT_CALL.finditer(content or ""):
         name = norm.get(m.group(1).replace("_", "").lower())
-        if not name:
+        if not name or name not in _RECOVERABLE:
             continue
         args = {}
         for a in _TOOL_TEXT_ARG.finditer(m.group(2)):
@@ -111,7 +117,7 @@ def _strip_tool_text(content: str) -> str:
     """The prose around written-out tool calls, without them. The real answer
     often comes AFTER the calls ("[toolcall] ...{...} [en] Here is a Dumle")."""
     text = _TOOL_TEXT_CALL.sub(" ", content or "")
-    text = re.sub(r"<\|tool_call>|<tool_call\|>|\[tool_?call\]|<\|\"\|>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\|tool_call>|<tool_call\|>|\[tool_?call\]|<\|\"\|>|[{}]", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     # a language tag left in the middle moves to the front, where it is read
     m = re.match(r"^(.*?)\s*(\[[a-z]{2}\])\s*(.*)$", text)
@@ -179,9 +185,14 @@ def _candy_aliases(scene: dict) -> dict:
 
 def _claimed_candies(text: str, scene: dict) -> int:
     """How many different candies the CLAIM sentences of *text* hand over."""
+    return len(_claimed_kinds(text, scene))
+
+
+def _claimed_kinds(text: str, scene: dict) -> set:
+    """The candies ON THE TABLE that the claim sentences of *text* name."""
     aliases = _candy_aliases(scene)
     if not aliases:
-        return 0
+        return set()
     seen = set()
     for sentence in split_sentences(text or ""):
         if not _is_claim(sentence):
@@ -189,7 +200,7 @@ def _claimed_candies(text: str, scene: dict) -> int:
         low = sentence.lower()
         seen.update(h for h, names in aliases.items()
                     if any(re.search(r"\b" + re.escape(n) + r"\b", low) for n in names))
-    return len(seen)
+    return seen
 
 
 def _history_messages(history) -> list:
@@ -303,6 +314,33 @@ class DirectAudioLLM:
         except Exception as e:
             logger.warning(f"direct: tool {name}({args}) failed: {e}")
             return f"Tool {name} failed: {e}"
+
+    _NOTHING_MOVED = {
+        "sv": "[sv] Förlåt, det gick inte. Vilket godis vill du ha?",
+        "en": "[en] Sorry, that didn't work. Which candy would you like?",
+        "de": "[de] Entschuldigung, das hat nicht geklappt. Welche Süßigkeit möchtest du?",
+        "fr": "[fr] Désolé, ça n'a pas marché. Quel bonbon veux-tu ?",
+        "es": "[es] Lo siento, no ha funcionado. ¿Qué caramelo quieres?",
+        "it": "[it] Scusa, non ha funzionato. Quale caramella vuoi?",
+    }
+
+    def _honest_reply(self, messages: list, language: str) -> str:
+        """A truthful one-liner after a claimed hand-out that did not happen:
+        say so, and if the candy is not on the table, what is."""
+        messages = messages + [{"role": "user", "content":
+            "Nothing was handed over: no move happened, so the person did NOT "
+            "get anything. Do not say they did. In ONE short sentence in the "
+            "person's language, starting with its ISO code in brackets, say so "
+            "honestly. If what they asked for is not on the table, say that and "
+            "name one or two candies that are."}]
+        try:
+            text = (self._chat(messages, None, None, language).get("content") or "").strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"direct: honest reply failed: {e}")
+            text = ""
+        if not _has_words(text) or _is_claim(text) or _TOOL_TEXT.search(text):
+            text = self._NOTHING_MOVED.get(language, self._NOTHING_MOVED["en"])
+        return text
 
     def _recover_text_calls(self, content: str, scene: dict) -> list:
         """Execute what the model wrote as a tool call instead of making one.
@@ -578,9 +616,19 @@ class DirectAudioLLM:
         # Claimed an action without calling the tool: the arm never moved and
         # the visitor is being told it did. Give the model exactly one chance
         # to make good on it, with the tools still attached.
-        claimed = _claimed_candies(" ".join(texts + [reply]), scene_at_start) if reply else 0
+        claimed_kinds = _claimed_kinds(" ".join(texts + [reply]), scene_at_start) if reply else set()
+        claimed = len(claimed_kinds)
         moved = self._moves_ok()
-        if self._tools and reply and _is_claim(reply) and (moved == 0 or claimed > moved):
+        if (self._tools and reply and _is_claim(reply) and moved == 0 and not claimed
+                and scene_at_start):
+            # It "handed over" something that is not on the table (at the demo:
+            # "Here is your Marianne" with no Marianne). A retry then grabbed
+            # whatever was there -- a Plopp. Do not retry; say it honestly.
+            logger.warning(f"direct: claimed a candy that is not on the table: {reply[:70]!r}"
+                           " — no retry, honest answer")
+            reply = self._honest_reply(messages + [{"role": "assistant", "content": reply}],
+                                       language_hint or "en")
+        elif self._tools and reply and _is_claim(reply) and (moved == 0 or claimed > moved):
             if moved == 0:
                 logger.warning(f"direct: action claimed without a move: {reply[:70]!r}"
                                " — retrying")
@@ -621,6 +669,13 @@ class DirectAudioLLM:
                     fn = call["function"]
                     args = dict(fn["arguments"])
                     refusal = self._reject_bad_move(fn["name"], args, scene)
+                    if not refusal and fn["name"] == "move_between" and claimed_kinds:
+                        src = str(args.get("src", "")).upper().strip()
+                        kind = (scene_at_start.get(src) or "").split(",")[0].strip().lower()
+                        if kind not in claimed_kinds:
+                            refusal = (f"Refused: you promised {', '.join(sorted(claimed_kinds))}, "
+                                       f"but {src} holds {kind or 'nothing'}. Never hand over a "
+                                       f"different candy than the one promised.")
                     if refusal:
                         self.rejected_tool_calls.append((fn["name"], args, refusal))
                         messages.append({"role": "tool", "tool_name": fn["name"],
@@ -638,7 +693,14 @@ class DirectAudioLLM:
                 # round 1 is now TRUE, so keeping it beats going silent.
                 if _has_words(content2):
                     reply = content2
-            if self._moves_ok() == had_moves:
+            if self._moves_ok() == had_moves == 0:
+                # Never tell the visitor they got something they did not. At
+                # the demo "Here is your Marianne" was said with no Marianne on
+                # the table and nothing moved.
+                logger.warning("direct: retry made no move — replacing the claim "
+                               "with an honest answer")
+                reply = self._honest_reply(messages, language_hint or "en")
+            elif self._moves_ok() == had_moves:
                 logger.warning("direct: retry made no move — the claim stands "
                                "but the arm did not move")
 

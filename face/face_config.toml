@@ -40,7 +40,7 @@ recognition_k = 3
 # Grace period (seconds) before a missing face becomes FACE_DISAPPEARED.
 # Brief head-turns / occlusions within this window emit FACE_OCCLUDED /
 # FACE_RECOVERED instead, and the face keeps its identity on return.
-max_missing_seconds = 8.0
+max_missing_seconds = 3.0   # was 8.0: the robot kept talking to an empty space for 8 s after people left
 
 # --- Enrollment quality gate (Group 1: stop poisoning the DB) ---
 # Auto-enrollment only fires when the face passes all of these.

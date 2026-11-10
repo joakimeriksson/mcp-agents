@@ -42,6 +42,12 @@ _DEFAULTS: dict = {
         # stable across replugging; indices are not.
         "camera": None,
     },
+    "voice": {
+        # Let the model mark sentences with style tags ([skrattar], [glad],
+        # [viskar], [tänker]) and joke now and then. The voice server acts
+        # them out with VoxCPM2 for voices that have a --vox-voice reference.
+        "expressive": False,
+    },
     "debug": {
         # Audio debug panel in the eye window: VU meters (mic/VAD/silence
         # countdown) + in/out oscilloscope. Widens the window slightly.

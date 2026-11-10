@@ -70,6 +70,7 @@ messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
 omit_names_and_prefs = False
 talk_to_unknown = True   # greet faces the DB doesn't know yet
+expressive = False       # [voice] expressive: style tags + jokes (VoxCPM2)
 
 muted = False
 
@@ -94,6 +95,7 @@ persondict = {}
 curr_person = None
 
 curr_prompt = ""
+curr_audio = None   # the utterance that started the current turn (direct-audio)
 
 win: EyeWindow | None = None
 cam_win: CameraWindow | None = None
@@ -193,6 +195,11 @@ def parse_args():
                         help='Seconds into a turn with nothing said yet before a thinking filler '
                              '("Hmm…", "Mm, vänta lite…") plays; only voices the TTS server has '
                              'fillers for (its --vox-voice voices). Negative = never.')
+    parser.add_argument('--expressive', dest='expressive', action='store_true', default=None,
+                        help='Playful voice: style tags ([skrattar], [glad] ...) acted out by '
+                             'VoxCPM2, light jokes (default from config [voice] expressive)')
+    parser.add_argument('--no-expressive', dest='expressive', action='store_false',
+                        help='Plain voice, no style tags or jokes')
     parser.add_argument('--detect-fps', type=int, default=6,
                         help='Max face-detection rate (Hz). Lower = far less memory '
                              '(InsightFace/onnxruntime leaks ~40MB per inference on this build).')
@@ -237,7 +244,9 @@ def extract_language(info):
                  "Francaise": "fr",
                  "Spanish": "es",
                  "Espanol": "es",
-                 "Español": "es"}
+                 "Español": "es",
+                 "Italian": "it",
+                 "Italiano": "it"}
     s = extract_value("Language:", info)
     if s:
         for l in languages:
@@ -446,14 +455,22 @@ def on_face_change(id):
             state['newstate'] = 'greet'
 
 def on_speech(txt):
-    global curr_prompt, state
+    global curr_prompt, curr_audio, state
     if muted:
         return
     logger.info("Speech event")
     if state['newstate'] == 'exit':
         return
+    if curr_person is None:
+        # Nobody in focus (they walked away, or never came): whoever is
+        # talking in the room is not our visitor.
+        logger.info("Speech ignored: nobody in focus")
+        return
     if state['currstate'] == 'listen' and (state['newstate'] is None or state['newstate'] == 'listen'):
         curr_prompt = txt
+        # Keep THIS utterance for the turn. Reading voice_in.last_audio later,
+        # when the turn is processed, can pick up a different capture.
+        curr_audio = voice_in.last_audio if voice_in is not None else None
         if voice_db is not None and voice_in is not None and voice_in.last_audio is not None:
             # Fetch the speaker embedding in parallel with everything else the
             # turn does (LLM, scene fetch); the gate collects it just before
@@ -514,6 +531,11 @@ def set_state(state, newstate):
     if prev != newstate:
         _ilog("state_change", **{"from": prev, "to": newstate})
 
+def visitor_left() -> bool:
+    """True once the person this turn is for walked away or someone else took
+    focus: stop talking to them instead of finishing the reply."""
+    return state.get('newstate') in ('wait', 'greet', 'exit')
+
 def set_win_state(newstate):
     win.set_state('muted' if muted else newstate)
     win.check_events()
@@ -551,6 +573,23 @@ def map_tool_definition(f):
             },
         }
         return tool_param
+
+# [voice] expressive: the voice server acts out style tags with VoxCPM2, so
+# the robot can laugh and whisper instead of reading everything flat.
+EXPRESSIVE_PROMPT = """
+Your voice can laugh, whisper and show feelings. Be warm and playful. Now and
+then, when it fits, make a light, friendly joke about candy, robots or the
+moment.
+To set how a sentence sounds, START that sentence with ONE of these tags:
+[skrattar] laughing, [glad] happy and excited, [viskar] whispering (a secret),
+[tänker] thinking out loud. Example: "[sv] [glad] Vad roligt att du kom! [skrattar]
+Haha, du har god smak. Här kommer en Dumle."
+- Use [skrattar] ONLY right after something that is actually funny, at most in
+  one reply out of three. A greeting or a plain answer gets no laugh.
+- Most replies need no tag at all; never more than one tagged sentence per reply.
+- Tags are never read aloud and never go in the middle of a sentence.
+- Never let a joke delay or replace a tool call."""
+
 
 async def system_message(client, lang):
     if has_sysprompt:
@@ -590,9 +629,15 @@ def _text_history(mlst, max_turns):
             out.append({'role': role, 'content': str(content)})
     return out[-2 * max_turns:]
 
-def _direct_transcribe(audio, user_msg, lang):
+_print_lock = threading.Lock()
+
+def _direct_transcribe(audio, user_msg, lang, turn_lines=()):
     """Background: transcribe the utterance for the history/log (the reply
-    was already produced straight from the audio)."""
+    was already produced straight from the audio), then print the whole turn
+    in reading order -- what was heard, what the arm did, what was said.
+    Printing the reply first and the transcript whenever it arrived put them
+    in the wrong order, sometimes in the middle of the next turn."""
+    info = None
     try:
         tr = direct_llm.transcriber
         tr.language_hint = lang
@@ -602,10 +647,16 @@ def _direct_transcribe(audio, user_msg, lang):
         logger.warning("background transcription failed: %s", e)
         text = ""
     user_msg['content'] = text or "(unintelligible audio)"
-    print(f"\n  Heard: ({info.language or lang if text else '?'}) {text}")
-    _ilog("user_transcript", content=text, lang=(info.language if text else "") or lang)
+    heard_lang = (getattr(info, "language", "") if text else "") or lang
+    seconds = len(audio) / 16000.0
+    with _print_lock:
+        print(f"\n  User: ({heard_lang}, {seconds:.1f}s) {text or '(unintelligible)'}")
+        for line in turn_lines:
+            print(line)
+    _ilog("user_transcript", content=text, lang=heard_lang)
 
 KNOWN_LANGS = ('en', 'sv', 'de', 'fr', 'es', 'it')
+SWITCH_MIN_SECONDS = 1.6    # a shorter utterance can't switch the conversation language
 LANG_SWITCH_MIN_WORDS = 4   # a shorter utterance can't flip the conversation language
 LANG_SWITCH_TURNS = 2       # ...and it takes this many consecutive turns to flip
 # Pending language switch: {lang, count}. Module state so a single stray turn
@@ -665,25 +716,32 @@ def choose_language(current, detected, text):
 def language_message(lang):
     languages = { "en": "English",
                   "sv": "Swedish",
-                  "de": "Deutch",
+                  "de": "German",
                   "fr": "French",
-                  "es": "Spanish"}
+                  "es": "Spanish",
+                  "it": "Italian"}
     if not lang in languages:
         lang = 'en'
     reply_language = languages[lang]
     msg = f"Reply in {reply_language}!"
     return {"role": "system", "content": msg}
 
+# Greetings must be SHORT: the visitor is waiting, and a long introduction of
+# the whole exhibition was the first thing people heard at the fair.
+GREET_RULE = (" Greet them in ONE short sentence (at most 12 words) and ask which "
+              "candy they would like. Do not describe yourself, the exhibition or "
+              "the technology unless they ask.")
+
 def greet_prompt_noname():
     if curr_person.lasttime is None:
-        return {'role':'user', 'content':'There is a new person in front of you. Produce a suitable greeting.'}
+        return {'role':'user', 'content':'A new person just stepped up to you.' + GREET_RULE}
     else:
         duration = int((time.time() - curr_person.lasttime) / 60)
-        return {'role':'user', 'content': f'A person has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
+        return {'role':'user', 'content': f'A person you met {duration} minutes ago just came back.' + GREET_RULE}
    
 def greet_prompt():
     if not curr_person.name and not curr_person.lasttime:
-        return {'role':'user', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
+        return {'role':'user', 'content':'A new person just stepped up to you. Greet them in ONE short sentence and ask for their name.'}
     if curr_person.lasttime is None: # This alternative was added by Claude but it should actually never happen
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
     duration = int((time.time() - curr_person.lasttime) / 60)
@@ -762,7 +820,7 @@ async def main(args):
     global has_init
     global has_exit
     global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm, voice_db, speaker_client, _voice_pool
-    global curr_prompt
+    global curr_prompt, curr_audio
 
     # Connect via SSE to the MCP server
     async with Client(transport=SSETransport(args.server)) as client:
@@ -891,9 +949,8 @@ async def main(args):
         if not voice_in.ready:
             print('Failed to load whisper model')
             return False
-        listener = ContinuousListener(voice_in)
+        listener = ContinuousListener(voice_in, start_paused=True)   # passive until a visitor is in focus
         listener.start()
-        listener.paused = True
         voice_in.language_hint = default_lang
         print('Continuous listener started')
 
@@ -926,6 +983,8 @@ async def main(args):
                 DirectAudioLLM, model=args.llm_model, host=ollama_host,
                 agent_name=name, tools_url=args.server)
             direct_llm.transcriber.check()   # fail fast if the model can't hear
+            print(f'Loading {args.llm_model} into memory (kept loaded for the whole session)...')
+            await asyncio.to_thread(direct_llm.warm)
             if not direct_llm._tools:
                 print('WARNING: direct-audio mode loaded no tools from the server')
             print(f'Direct-audio mode: speech goes straight into {args.llm_model} '
@@ -1185,7 +1244,7 @@ async def main(args):
                             continue
 
                 if newstate == 'greet':
-                    if curr_person and curr_person.lang and curr_person.lang in ['en','sv','de','fr','es']:
+                    if curr_person and curr_person.lang and curr_person.lang in KNOWN_LANGS:
                         lang = curr_person.lang
                     else:
                         lang = default_lang
@@ -1206,20 +1265,27 @@ async def main(args):
                     curr_person.lang = lang
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
-                augprompt = await augmentation_message(client, lang)
+                if expressive:
+                    sysprompt["content"] += EXPRESSIVE_PROMPT
+                # Direct-audio: the scene in English (with Swedish names kept).
+                # A Swedish scene list pulled gemma4 into answering English and
+                # German speakers in Swedish (measured: 9/16 -> 12/15 right).
+                augprompt = await augmentation_message(client, 'en' if direct_llm is not None else lang)
                 augpromptlist = []
                 if augprompt:
                     print("\n  Augmentation:")
                     print(augprompt['content'])
                     augpromptlist.append(augprompt)
                 augpromptlist.append(langprompt)
+                turn_audio = curr_audio if newstate == 'process' else None
                 direct_turn = (direct_llm is not None and newstate == 'process'
-                               and prompt == RAW_AUDIO_TEXT
-                               and voice_in is not None and voice_in.last_audio is not None)
+                               and prompt == RAW_AUDIO_TEXT and turn_audio is not None)
+                greet_stream = direct_llm is not None and newstate == 'greet'
+                turn_lines = []   # direct turns print as one block once the transcript is in
                 if direct_turn:
-                    turn_audio = voice_in.last_audio
+                    # Consumed: never reuse this utterance for a later turn (#26).
+                    curr_audio = None
                     voice_in.last_audio = None
-                    print("\n  User: (", lang, ") [audio, %.1fs]" % (len(turn_audio) / voice_in.sample_rate))
                     _ilog("user_turn", kind="speech_audio", content="",
                           lang=lang, seconds=round(len(turn_audio) / voice_in.sample_rate, 2))
                     prompt_source = None
@@ -1255,13 +1321,17 @@ async def main(args):
                     stream_lang = {}
 
                     def _on_sentence(sentence, s_lang, lang=lang):
+                        if visitor_left():
+                            return   # they walked away: say nothing more
                         if not stream_lang:
                             if filler_timer:
                                 filler_timer.cancel()
                             listener.paused = True
-                            stream_lang["lang"] = (
-                                choose_language(lang, s_lang, sentence)
-                                if s_lang in KNOWN_LANGS and s_lang != lang else lang)
+                            # The voice must match the language the reply is
+                            # actually written in, or a Swedish voice reads
+                            # Spanish. (Whether the CONVERSATION switches is
+                            # decided separately, with stickiness, below.)
+                            stream_lang["lang"] = s_lang if s_lang in KNOWN_LANGS else lang
                             stream_lang["thread"] = voice_out.speak_async(
                                 iter(sentence_q.get, None), stream_lang["lang"])
                         sentence_q.put(sentence)
@@ -1280,27 +1350,62 @@ async def main(args):
                     finally:
                         sentence_q.put(None)   # end of the reply for speak()
                     tts_streamed = bool(stream_lang)
-                    if tag_lang in KNOWN_LANGS and tag_lang != lang:
+                    turn_seconds = len(turn_audio) / float(voice_in.sample_rate)
+                    if (tag_lang in KNOWN_LANGS and tag_lang != lang
+                            and turn_seconds >= SWITCH_MIN_SECONDS):
                         # The model heard a language switch; trust it only on a
-                        # real sentence (the tag misfires on short turns).
+                        # real utterance (a "yeah" or a noise blip flipped the
+                        # conversation to Spanish at the fair).
                         lang = choose_language(lang, tag_lang, reply_text)
                     for _tn, _ta, _tr in getattr(direct_llm, "rejected_tool_calls", []):
-                        print(f"\n  Rejected: {_tn} ( {json.dumps(_ta)} )")
-                        print(f"  Reason:   {_tr[:90]}")
+                        turn_lines.append(f"  Rejected: {_tn} ( {json.dumps(_ta)} )  Reason: {_tr[:90]}")
                         _ilog("tool_call_rejected", name=_tn, arguments=_ta, reason=_tr)
                     for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
-                        print(f"\n  Function: {_tn} ( {json.dumps(_ta)} )")
-                        print(f"  Result:   {_tr}")
+                        turn_lines.append(f"  Function: {_tn} ( {json.dumps(_ta)} )  ->  {_tr}")
                         _ilog("tool_call", name=_tn, arguments=_ta, result=_tr)
                     messages.append({"role": "assistant", "content": reply_text})
                     _ilog("direct_response", content=reply_text, lang=lang,
                           tool_calls=[{"name": n, "arguments": a}
                                       for n, a, _ in getattr(direct_llm, "last_tool_calls", [])],
                           seconds=round(time.time() - t0, 2))
-                    print(f"  (direct-audio turn: {time.time() - t0:.2f}s)")
+                    turn_lines.append(f"  Robot: ({lang}) {reply_text}   [{time.time() - t0:.2f}s]")
                     threading.Thread(target=_direct_transcribe,
-                                     args=(turn_audio, pending_user_msg, lang),
+                                     args=(turn_audio, pending_user_msg, lang, turn_lines),
                                      daemon=True).start()
+                elif greet_stream:
+                    # Greeting: streamed, short, no tools -- first words well
+                    # under a second after contact.
+                    t0 = time.time()
+                    sentence_q = queue.Queue()
+                    stream_lang = {}
+
+                    def _on_greet_sentence(sentence, s_lang, lang=lang):
+                        if visitor_left():
+                            return
+                        if not stream_lang:
+                            listener.paused = True
+                            stream_lang["lang"] = s_lang if s_lang in KNOWN_LANGS else lang
+                            stream_lang["thread"] = voice_out.speak_async(
+                                iter(sentence_q.get, None), stream_lang["lang"])
+                        sentence_q.put(sentence)
+                    try:
+                        reply_text, _glang = await asyncio.to_thread(
+                            direct_llm.greet, messages[-1]['content'],
+                            language=lang,
+                            service_prompt=sysprompt['content'],
+                            augmentation=augprompt['content'] if augprompt else None,
+                            history=_text_history(messages[:-1], messages_trunclen),
+                            on_sentence=None if muted else _on_greet_sentence)
+                    except Exception as e:
+                        logger.exception("greeting failed")
+                        _ilog("llm_error", error_class=type(e).__name__, error_message=str(e))
+                        reply_text = ""
+                    finally:
+                        sentence_q.put(None)
+                    tts_streamed = bool(stream_lang)
+                    messages.append({"role": "assistant", "content": reply_text})
+                    _ilog("greet_response", content=reply_text, lang=lang,
+                          seconds=round(time.time() - t0, 2))
                 else:
                     iteration = 0
                     msg = compose_messages(sysprompt, messages, augpromptlist)
@@ -1410,12 +1515,16 @@ async def main(args):
                     # No tool calls, just print the response.
                     messages.append(response.choices[0].message)
                     reply_text = response.choices[0].message.content or ""
-                print(f'\n  Response: {reply_text}  (lang={lang})')
+                if not direct_turn:
+                    print(f'\n  Response: {reply_text}  (lang={lang})')
                 if filler_timer:
                     filler_timer.cancel()
                 set_win_state('talk')
                 if not reply_text:
                     _ilog("tts_speak", text="", lang=lang, status="empty")
+                elif visitor_left() and not tts_streamed:
+                    # They walked away while the reply was being thought up.
+                    _ilog("tts_speak", text=reply_text, lang=lang, status="visitor_left")
                 elif muted:
                     _ilog("tts_speak", text=reply_text, lang=lang, status="muted_suppressed")
                 else:
@@ -1431,6 +1540,8 @@ async def main(args):
                         voice_out.speak_async(reply_text, lang)
                     if tts_thread is not None:
                         while tts_thread.is_alive():
+                            if visitor_left():
+                                voice_out.stop_speaking()   # they walked away mid-reply
                             win.check_events()
                             await asyncio.sleep(0.05)
                         if not voice_out.interrupted:
@@ -1442,6 +1553,8 @@ async def main(args):
                 # Nothing to say (noise, a muted turn) but a filler started:
                 # the mic must not reopen on our own "Hmm…".
                 while voice_out is not None and voice_out.speaking:
+                    if visitor_left():
+                        voice_out.stop_speaking()
                     win.check_events()
                     await asyncio.sleep(0.05)
                 if state['newstate'] is None or state['newstate']=='listen':
@@ -1458,7 +1571,7 @@ async def main(args):
         print('Exiting')
 
 def run():
-    global omit_names_and_prefs, talk_to_unknown
+    global omit_names_and_prefs, talk_to_unknown, expressive
 
     args = parse_args()
 
@@ -1511,6 +1624,7 @@ def run():
 
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
     talk_to_unknown = cfg["face"].get("talk_to_unknown", True)
+    expressive = cfg["voice"].get("expressive", False) if args.expressive is None else args.expressive
     voice_cfg.update(cfg.get("voice_id", {}))
     if args.debug_audio is None:
         args.debug_audio = cfg["debug"].get("audio_panel", False)

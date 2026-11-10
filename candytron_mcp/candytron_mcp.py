@@ -11,7 +11,8 @@ import threading
 
 from camera import CameraManager
 from robotarm import (init_ned, exit_ned, ned_move_between,
-                      ned_is_busy, ned_known_positions)
+                      ned_known_positions, ned_pending_moves, ned_moves_waiting,
+                      MAX_QUEUED_MOVES)
 from transtable import transhead, transtable
 from scene_state import SceneState
 from scene_logger import SceneLogger
@@ -69,6 +70,10 @@ def scene_message(scene, lang):
         for k in scene:
             if scene[k] in transtable:
                 obj,cha = transtable[scene[k]][lang]
+                sv_obj = transtable[scene[k]]['sv'][0]
+                if lang != 'sv' and sv_obj.lower() != obj.lower():
+                    # Swedish visitors ask for "Lakrits", not "Licorice".
+                    obj = f"{obj} ({sv_obj})"
                 content += "\n" + k + " : " + obj + ", " + cha + "."
     else:
         content += "No candies observed"
@@ -78,7 +83,9 @@ def scene_message(scene, lang):
 def get_service_augmentation(lang: str) -> str:
     """Return extra information on the current state, to insert before the user prompt"""
     scene = scene_state.get_scene()
-    message = scene_message(scene, lang)
+    # Tell the model about the board as it will be: a candy already queued for
+    # hand-out is not offered again.
+    message = scene_message(planned_scene(), lang)
     if scene_logger is not None:
         frame = cam.get_last_frame() if cam else None
         raw_frame = cam.get_last_raw_frame() if cam else None
@@ -95,13 +102,15 @@ def show_demo_move() -> str:
     must never be used to fetch, give or move a specific candy — use
     move_between for that.
     """
-    scene = scene_state.get_scene()
+    if ned_moves_waiting():
+        return "Refused: the arm is busy handing out candy; show the demo afterwards."
+    scene = planned_scene()
     scenepos = list(scene.keys())
     emptypos = [k for k in cam.camera_positions() if k not in scenepos] if cam else []
     if len(scenepos) and len(emptypos):
         p1 = random.choice(scenepos)
         p2 = random.choice(emptypos)
-        if ned_move_between(p1, p2):
+        if ned_move_between(p1, p2) is not None:
             return "Successfully demonstrated a move with the robot arm from " + p1 + " to " + p2
         else:
             return "Failed to move"
@@ -118,12 +127,16 @@ def move_between(src: str, dst: str) -> str:
         logger.warning("Refused move %r -> %r: %s", src, dst, refusal)
         return refusal
     src, dst = src.strip().upper(), dst.strip().upper()
-    if ned_move_between(src, dst):
-        # The worker runs the move asynchronously, so this is "started", not
-        # "finished" -- saying otherwise makes the robot announce a success it
-        # cannot yet know about (and that a collision may still cancel).
+    ahead = ned_move_between(src, dst)
+    if ahead is None:
+        return "Failed to move"
+    # The worker runs moves asynchronously, so this is "started"/"queued", not
+    # "finished" -- saying otherwise makes the robot announce a success it
+    # cannot yet know about (and that a collision may still cancel).
+    if ahead == 0:
         return f"Started moving the candy from {src} to {dst}; the arm is moving now."
-    return "Failed to move"
+    return (f"Queued: moving the candy from {src} to {dst} after {ahead} earlier "
+            f"move(s); the arm will do it right after.")
 
 
 # Positions the arm is calibrated for, as a last-resort allow-list for when the
@@ -152,18 +165,32 @@ def _refuse_move(src: str, dst: str) -> str | None:
     if src_n == dst_n:
         return f"Refused: src and dst are both {src_n}; nothing to do."
 
-    scene = scene_state.get_scene()
+    if ned_moves_waiting() >= MAX_QUEUED_MOVES:
+        return (f"Refused: the arm already has {MAX_QUEUED_MOVES} moves queued. "
+                f"Tell the person to wait a moment, then try again.")
+    scene = planned_scene()
     if scene:                      # only trust these when the vision system sees something
         if src_n not in scene:
             occupied = ", ".join(f"{p} ({c})" for p, c in sorted(scene.items()))
-            return (f"Refused: there is no candy at {src_n}, so the arm would grip "
-                    f"nothing. Candy is at: {occupied}.")
-        if dst_n in scene:
+            return (f"Refused: there is no candy at {src_n} (or it is already being "
+                    f"moved), so the arm would grip nothing. Candy is at: {occupied}.")
+        if dst_n in scene and dst_n != "O0":
             return (f"Refused: {dst_n} already holds {scene[dst_n]}; moving there would "
                     f"drop one candy on top of another. Pick a free position.")
-    if ned_is_busy():
-        return "Refused: the arm is still finishing the previous move. Try again in a moment."
     return None
+
+
+def planned_scene() -> dict:
+    """The board as it will be once the queued moves are done: the camera's
+    view with every queued, running or just-finished move applied. A second
+    move in the same breath ("a Dumle and a Marianne") is checked against
+    this, not against a picture that still shows the first candy in place."""
+    scene = scene_state.get_scene()
+    for s, d in ned_pending_moves():
+        candy = scene.pop(s, None)
+        if candy is not None and d != "O0":
+            scene[d] = candy
+    return scene
 
 @mcp.tool()
 def default_action() -> str:

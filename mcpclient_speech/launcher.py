@@ -467,6 +467,7 @@ class Launcher:
         self.tiles = []
         blank = ImageTk.PhotoImage(Image.new("RGB", (THUMB_W, THUMB_H), (40, 40, 40)))
         self._blank = blank
+        self._last_thumb: dict = {}   # camera index -> its last good picture (RGB thumb)
         for i in range(N_CAMS):
             f = tk.Frame(camf, highlightthickness=4, highlightbackground="#dddddd", bd=0)
             f.grid(row=0, column=i, padx=4, pady=4)
@@ -632,6 +633,16 @@ class Launcher:
         return self.proc is not None and self.proc.poll() is None
 
     # ------------------------------------------------------------ cameras
+    @staticmethod
+    def _frozen(thumb, label: str):
+        """A dimmed copy of a camera's last picture with *label* on it."""
+        out = (thumb.astype(np.float32) * 0.45).astype(np.uint8).copy()
+        h, w = out.shape[:2]
+        cv2.rectangle(out, (0, h - 26), (w, h), (0, 0, 0), -1)
+        cv2.putText(out, label[:42], (6, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        return out
+
     def _tile_click(self, i, people=False):
         if self.running():
             return
@@ -664,20 +675,38 @@ class Launcher:
                 PEOPLE_COLOR if i == p else "#dddddd"
             f.configure(highlightbackground=border, highlightcolor=border)
             r = self.cams.get(i)
-            if running:
-                txt = f"#{i}  (released — in use by the stack)"
-            elif r is None:
-                txt = f"#{i}  opening…" if self.cams.opening else f"#{i}  no camera"
-                if img.cget("image") != str(self._blank):
+            if running or r is None:
+                # No live picture (released to the stack, reopening, or the
+                # camera vanished): keep showing its LAST picture, dimmed and
+                # labelled, so it stays obvious which number was which.
+                role = ("TABLE" if i == t and not self.sim_camera.get()
+                        else "PEOPLE" if i == p else "")
+                if running:
+                    why = f"in use by the stack{' as ' + role if role else ''}"
+                elif self.cams.opening:
+                    why = "reopening…"
+                else:
+                    why = "GONE (unplugged / iPhone left?)" if i in self._last_thumb else "no camera"
+                txt = f"#{i}  {why}" if i not in self._last_thumb else f"#{i}  last picture — {why}"
+                key = (i, why)
+                if i in self._last_thumb:
+                    if getattr(img, "_frozen_key", None) != key:
+                        ph = ImageTk.PhotoImage(Image.fromarray(self._frozen(self._last_thumb[i], why)))
+                        img.configure(image=ph)
+                        img._ph, img._frozen_key = ph, key
+                elif img.cget("image") != str(self._blank):
                     img.configure(image=self._blank)
+                    img._frozen_key = None
             else:
                 st = r.state()
                 with r.lock:
                     thumb = r.thumb
                 if thumb is not None:
+                    if st == "ok":
+                        self._last_thumb[i] = thumb
                     ph = ImageTk.PhotoImage(Image.fromarray(thumb))
                     img.configure(image=ph)
-                    img._ph = ph
+                    img._ph, img._frozen_key = ph, None
                 w, h = r.size
                 txt = {"ok": f"#{i}  {w}x{h}", "black": f"#{i}  BLACK (idle iPhone?)",
                        "waiting": f"#{i}  waiting for picture…",

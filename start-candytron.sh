@@ -22,12 +22,19 @@
 #
 # Run ./setup.sh once first. Ctrl-C stops everything this script started
 # (a voice server that was already running is left alone).
+# CANDYTRON_KEEP_VOICE_SERVER=1 (set by launch-candytron.sh) starts the voice
+# server detached so it survives a restart of the rest of the stack.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 VOICE_DIR="${KOKORO_VOICE_SERVER_DIR:-$ROOT/../kokoro-voice-server}"
 VOICE_PORT="${VOICE_PORT:-8880}"
-VOICE_LANGS="${VOICE_LANGS:-sv,en,fr,es,it}"
+VOICE_LANGS="${VOICE_LANGS:-sv,en,de,fr,es,it}"
+VOICE_DEFAULT="${VOICE_DEFAULT:-Klara}"
+# Expressive VoxCPM2 voices (styled lines + thinking fillers), cloned from
+# these reference clips. A voice is only enabled if its clip exists.
+VOX_REFS="${VOX_REFS_DIR:-$ROOT/../swedish-kokoro/data-gen/refs}"
+VOX_VOICES=("Klara=$VOX_REFS/vox_female_ref.wav" "Viktor=$VOX_REFS/vox_male2_ref.wav")
 # Extra Swedish voice packs not (yet) on HuggingFace, e.g. the VoxCPM2-fitted
 # Klara / Viktor from swedish-kokoro (docs/VOX_VOICES_PLAN.md).
 EXTRA_VOICES="${KOKORO_SV_EXTRA_VOICES:-$ROOT/../swedish-kokoro/data-gen/fitted_voices/extra}"
@@ -50,7 +57,7 @@ while [[ $# -gt 0 ]]; do
         --robot-camera)     SERVER_ARGS+=(--camera "$2"); shift 2 ;;
         --no-voice-server)  START_VOICE=0; shift ;;
         --face-agent)       CLIENT=face; shift ;;
-        -h|--help)          sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help)          sed -n '2,27p' "$0"; exit 0 ;;
         *)                  CLIENT_ARGS+=("$1"); shift ;;
     esac
 done
@@ -81,6 +88,8 @@ if ! up http://localhost:11434/api/tags; then
     echo "[candytron] Ollama not running — starting"
     nohup ollama serve >"$LOG_DIR/candytron-ollama.log" 2>&1 &
     wait_for http://localhost:11434/api/tags "ollama" 30
+else
+    echo "[candytron] ollama already running"
 fi
 
 # ---------- 1. Voice server ----------
@@ -93,14 +102,33 @@ if [[ $START_VOICE -eq 1 ]]; then
     elif [[ -f "$VOICE_DIR/voice_server.py" && -d "$VOICE_DIR/.venv" ]]; then
         echo "[candytron] starting kokoro-voice-server on :$VOICE_PORT (log: $LOG_DIR/candytron-voice-server.log)"
         EXTRA_ARGS=()
-        [[ -d "$EXTRA_VOICES" ]] && EXTRA_ARGS=(--extra-voices "$EXTRA_VOICES")
+        [[ -d "$EXTRA_VOICES" ]] && EXTRA_ARGS+=(--extra-voices "$EXTRA_VOICES")
+        for vv in "${VOX_VOICES[@]}"; do
+            if [[ -f "${vv#*=}" ]]; then
+                EXTRA_ARGS+=(--vox-voice "$vv")
+            else
+                echo "[candytron] note: no reference clip ${vv#*=} - VoxCPM2 voice ${vv%%=*} disabled" >&2
+            fi
+        done
+        if [[ "${CANDYTRON_KEEP_VOICE_SERVER:-0}" == 1 ]]; then
+            set -m   # own process group: a Ctrl-C / stop of the stack doesn't reach it
+        fi
         (cd "$VOICE_DIR" && PYTORCH_ENABLE_MPS_FALLBACK=1 exec uv run python voice_server.py \
-            --engine kokoro-svml --voice Greta --port "$VOICE_PORT" --langs "$VOICE_LANGS" --whisper base --speaker ecapa \
+            --engine kokoro-svml --voice "$VOICE_DEFAULT" --port "$VOICE_PORT" --langs "$VOICE_LANGS" \
+            --whisper base --speaker ecapa \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}) \
             >"$LOG_DIR/candytron-voice-server.log" 2>&1 &
-        STARTED+=($!)
-        # cold start loads Kokoro + Whisper: allow a few minutes
-        wait_for "http://127.0.0.1:$VOICE_PORT/health" "voice server" 240 || {
+        VOICE_PID=$!
+        if [[ "${CANDYTRON_KEEP_VOICE_SERVER:-0}" == 1 ]]; then
+            set +m
+            disown "$VOICE_PID"
+            echo "[candytron] voice server pid $VOICE_PID runs detached (kept when the stack stops)"
+        else
+            STARTED+=("$VOICE_PID")
+        fi
+        # cold start loads Kokoro + Whisper (+ VoxCPM2 and its fillers in the
+        # background): allow a few minutes
+        wait_for "http://127.0.0.1:$VOICE_PORT/health" "voice server" 300 || {
             echo "[candytron] continuing with Piper voices only" >&2
         }
     else
@@ -117,8 +145,9 @@ echo "[candytron] starting candytron_mcp on :$PORT ${SERVER_ARGS[*]:-(real robot
 (cd "$ROOT/candytron_mcp" && exec uv run candytron_mcp.py --port "$PORT" ${SERVER_ARGS[@]+"${SERVER_ARGS[@]}"}) &
 SERVER_PID=$!
 STARTED+=("$SERVER_PID")
-for _ in $(seq 1 240); do   # real camera calibration can take a while
-    nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
+# Calibration waits for a person to put 4 candies in the corners, so there is
+# no timeout: wait as long as candytron_mcp is alive (it prints its progress).
+until nc -z 127.0.0.1 "$PORT" 2>/dev/null; do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "[candytron] candytron_mcp exited before becoming ready (robot/camera problem?)" >&2
         exit 1

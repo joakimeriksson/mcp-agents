@@ -40,6 +40,10 @@ class CameraManager:
         self._last_frame = None
         self._last_raw_frame = None
         self._last_frame_lock = threading.Lock()
+        # Calibration diagnostics, for progress/status lines in main():
+        self.last_detection_count: int = 0      # candies seen by the last calibrate attempt
+        self.calibration_warnings: list[str] = []  # sanity-check findings of the last success
+        self._frame_size: tuple[int, int] = (640, 480)  # (w, h) of the last frame
 
     @staticmethod
     def list_cameras(max_index: int = 10) -> list[dict]:
@@ -117,6 +121,7 @@ class CameraManager:
         if not ret:
             logger.error("Failed to read frame from camera")
             return []
+        self._frame_size = (fr.shape[1], fr.shape[0])
         res = self.yolomodel(fr, verbose=False)[0]
         annotated_frame = res.plot()
         with self._last_frame_lock:
@@ -137,23 +142,41 @@ class CameraManager:
                  (bx.xyxy[0][0] + bx.xyxy[0][2]) / 2,
                  (bx.xyxy[0][1] + bx.xyxy[0][3]) / 2) for bx in res.boxes]
 
-    def check_event(self, wait_ms: int = 50) -> bool:
+    def poll_key(self, wait_ms: int = 50) -> str | None:
         """Pump the GUI event loop and pace the caller.
 
         Always sleeps ``wait_ms`` ms (via ``cv2.waitKey`` when a window is
-        shown, otherwise ``time.sleep``). Returns True if the user pressed 'q'.
+        shown, otherwise ``time.sleep``). Returns the key pressed in the
+        table-camera window as a one-character string, or None.
         """
         if self.has_camera() and self.show_window:
-            return cv2.waitKey(wait_ms) & 0xFF == ord('q')
+            k = cv2.waitKey(wait_ms) & 0xFF
+            return None if k == 0xFF else chr(k)
         if wait_ms > 0:
             time.sleep(wait_ms / 1000.0)
-        return False
+        return None
+
+    def check_event(self, wait_ms: int = 50) -> bool:
+        """Like poll_key(); returns True if the user pressed 'q'."""
+        return self.poll_key(wait_ms) == 'q'
+
+    # Board corner -> tag. calibrate_positions() maps the image corners
+    # (top-left, bottom-left, top-right, bottom-right) onto these board spots.
+    _CORNER_TAGS = {'tl': 'D1', 'bl': 'A1', 'tr': 'D3', 'br': 'A3'}
 
     def calibrate_positions(self, n: int, m: int) -> bool:
+        """One calibration attempt: needs EXACTLY 4 detections (the corners).
+
+        On success the new position map replaces the old one atomically; on
+        failure the previous calibration (if any) is kept untouched.
+        ``last_detection_count`` records how many candies this attempt saw.
+        """
         lst = self.acquire_scene_one() if self.has_camera() else list(_SIMULATED_CORNERS)
+        self.last_detection_count = len(lst)
         if len(lst) != 4:
             logger.debug("Calibration failed: expected 4 candies, found %d", len(lst))
             return False
+        lst = [(t[0], float(t[1]), float(t[2])) for t in lst]
         lst.sort(key=lambda t: t[1])
         if lst[0][2] < lst[1][2]:
             tl, bl = lst[0], lst[1]
@@ -163,7 +186,7 @@ class CameraManager:
             tr, br = lst[2], lst[3]
         else:
             tr, br = lst[3], lst[2]
-        self.positions = {}
+        positions = {}
         for i in range(n):
             for j in range(m):
                 tag = chr(j + 65) + str(i + 1)
@@ -172,13 +195,50 @@ class CameraManager:
                      tr[k] * i * j + br[k] * i * (m - 1 - j)) / (n - 1) / (m - 1)
                     for k in [1, 2]
                 )
-                self.positions[tag] = pos
+                positions[tag] = pos
+        self.positions = positions
         self.positions_thresdist = min(
             (tr[1] + br[1] - tl[1] - bl[1]) / (n - 1) / 4,
             (bl[2] + br[2] - tl[2] - tr[2]) / (m - 1) / 4
         ) ** 2
+        self.calibration_warnings = self._sanity_check(
+            {'tl': tl, 'bl': bl, 'tr': tr, 'br': br})
+        for w in self.calibration_warnings:
+            logger.warning("Calibration: %s", w)
         logger.info("Calibration successful: %d positions mapped", len(self.positions))
         return True
+
+    def _sanity_check(self, corners: dict) -> list[str]:
+        """Warn (never reject) about a suspicious corner quadrilateral."""
+        warnings = []
+        w, h = self._frame_size
+        pts = {k: (v[1], v[2]) for k, v in corners.items()}
+
+        def dist(a, b):
+            return ((pts[a][0] - pts[b][0]) ** 2 + (pts[a][1] - pts[b][1]) ** 2) ** 0.5
+
+        # Opposite sides of a board seen from above should be similar.
+        for (a, b), (c, d), what in ((('tl', 'tr'), ('bl', 'br'), 'top/bottom'),
+                                      (('tl', 'bl'), ('tr', 'br'), 'left/right')):
+            s1, s2 = dist(a, b), dist(c, d)
+            ratio = min(s1, s2) / max(s1, s2) if max(s1, s2) > 0 else 0.0
+            if ratio < 0.6:
+                warnings.append(f"board looks skewed: {what} sides differ "
+                                f"({s1:.0f} vs {s2:.0f} px) - is a corner candy misplaced?")
+        # Shoelace area of tl -> tr -> br -> bl.
+        poly = [pts['tl'], pts['tr'], pts['br'], pts['bl']]
+        area = abs(sum(poly[i][0] * poly[(i + 1) % 4][1] - poly[(i + 1) % 4][0] * poly[i][1]
+                       for i in range(4))) / 2
+        if area < 0.03 * w * h:
+            warnings.append(f"board area is tiny ({100 * area / (w * h):.1f}% of the image) "
+                            f"- are the 4 candies really in the corners?")
+        mx, my = 0.04 * w, 0.04 * h
+        for k, (x, y) in pts.items():
+            if x < mx or x > w - mx or y < my or y > h - my:
+                warnings.append(f"corner {self._CORNER_TAGS[k]} is at the image edge "
+                                f"({x:.0f},{y:.0f} in {w}x{h}) - aim the table camera so "
+                                f"the whole board is well inside the picture")
+        return warnings
 
     def camera_positions(self) -> dict[str, tuple]:
         return self.positions

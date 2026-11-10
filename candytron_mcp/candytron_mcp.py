@@ -292,7 +292,31 @@ def main():
     if camera_index is None:
         camera_index = 0  # fallback for simulation mode
 
+    # Status lines for the operator (and the launcher, which parses them).
+    # Always flushed: stdout is a pipe when the launcher runs us.
+    import time
+
+    def status(msg: str) -> None:
+        print(f"[candytron] {msg}", flush=True)
+
+    # Robot status. The arm is connected lazily, when the client calls
+    # service_init(); wrap init_ned so that moment is visible.
+    global init_ned
+    _init_ned = init_ned
+
+    def init_ned(use_robot=True, robot_ip=None):
+        where = robot_ip or ned2_default_ip()
+        status(f"connecting to robot at {where}" if use_robot else "robot: simulated")
+        try:
+            _init_ned(use_robot=use_robot, robot_ip=robot_ip)
+        except Exception as e:
+            status(f"robot FAILED: {type(e).__name__}: {e}")
+            raise
+        status("robot ready" if use_robot else "robot ready (simulated)")
+
     # Initialize camera
+    status(f"table camera {'simulated' if simulate_camera else camera_index}: "
+           f"opening camera + loading YOLO model")
     cam = CameraManager(
         camera_index=camera_index,
         show_window=not args.no_window,
@@ -302,25 +326,50 @@ def main():
         cam.init_cam()
     except RuntimeError as e:
         logger.error("Camera initialization failed: %s", e)
+        status(f"table camera FAILED: {e}")
         sys.exit(1)
     logger.info("Initialized camera and YOLO model%s", " (simulated)" if simulate_camera else "")
+    status(f"table camera ready{' (simulated)' if simulate_camera else f' (index {camera_index})'}")
+
+    # Recalibration trigger: 'c' in the table-camera window, or this flag
+    # file (the launcher's "Recalibrate" button touches it).
+    recal_flag = os.environ.get("CANDYTRON_RECALIBRATE_FLAG", "/tmp/candytron-recalibrate")
+    try:
+        os.remove(recal_flag)   # stale request from an earlier run
+    except OSError:
+        pass
+
+    def calibrate(timeout_s=None) -> bool:
+        """Retry until 4 corner candies are seen. Prints a progress line about
+        once a second. Returns False on timeout; exits on 'q'. A previous
+        calibration stays in force until a new one succeeds."""
+        status("calibrating: place ONE candy in each of the 4 corners "
+               "(A1, A3, D1, D3) and nothing else on the board")
+        t0 = last = time.monotonic()
+        while True:
+            if cam.calibrate_positions(3, 4):
+                for w in cam.calibration_warnings:
+                    status(f"calibration WARNING: {w}")
+                status(f"calibrated ({len(cam.camera_positions())} positions)")
+                return True
+            now = time.monotonic()
+            if now - last >= 1.0:
+                last = now
+                n = cam.last_detection_count
+                hint = "remove extra candies" if n > 4 else "one in each corner"
+                status(f"calibrating: {n}/4 candies seen (need exactly 4, {hint}) "
+                       f"[{now - t0:.0f}s]")
+            if timeout_s is not None and now - t0 > timeout_s:
+                status("recalibration gave up - keeping the previous calibration")
+                return False
+            if cam.check_event(wait_ms=200):
+                logger.info("User cancelled calibration")
+                status("calibration cancelled ('q')")
+                cam.exit_cam()
+                sys.exit(0)
 
     # Calibration loop — retries until success or user presses 'q'
-    attempt = 0
-    while True:
-        if cam.calibrate_positions(3, 4):
-            if attempt > 0:
-                print()  # newline after dots
-            break
-        attempt += 1
-        if attempt % 50 == 0:
-            print(f"\nCalibrating... ({attempt} attempts). Place 4 candies in the corners.")
-        elif attempt % 10 == 0:
-            print(".", end="", flush=True)
-        if cam.check_event(wait_ms=200):
-            logger.info("User cancelled calibration")
-            cam.exit_cam()
-            sys.exit(0)
+    calibrate()
 
     # Register cleanup for robot shutdown
     atexit.register(exit_ned)
@@ -329,6 +378,7 @@ def main():
     mcp_thread = threading.Thread(target=_run_mcp_server, args=(args,), daemon=True)
     mcp_thread.start()
     logger.info("MCP server started on %s:%d (%s)", args.host, args.port, args.transport)
+    status(f"MCP server starting on {args.host}:{args.port}")
 
     # Main thread: continuous camera refresh loop (~5 fps)
     logger.info("Starting continuous camera refresh loop")
@@ -336,9 +386,20 @@ def main():
         while True:
             scene = cam.grab_and_detect()
             scene_state.update(scene)
-            if cam.check_event(wait_ms=200):
+            key = cam.poll_key(wait_ms=200)
+            if key == 'q':
                 logger.info("User requested exit via 'q' key")
                 break
+            recal = key == 'c'
+            if os.path.exists(recal_flag):
+                try:
+                    os.remove(recal_flag)
+                except OSError:
+                    pass
+                recal = True
+            if recal:
+                status("recalibration requested")
+                calibrate(timeout_s=120)
     except KeyboardInterrupt:
         logger.info("Shutting down (KeyboardInterrupt)")
     finally:

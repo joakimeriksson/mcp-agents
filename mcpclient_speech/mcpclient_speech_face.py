@@ -671,7 +671,26 @@ def scene_line(text) -> str:
     items = re.findall(r"^\s*([A-Z]\d)\s*:\s*([^,\n]+)", text or "", re.M)
     return "  Scene:  " + (" · ".join(f"{p} {c.strip()}" for p, c in items) or "no candy seen")
 
-def _direct_transcribe(audio, user_msg, lang, turn_lines=()):
+def _calls(seq) -> list:
+    """[(name, args, result)] -> JSON-able dicts for the session log."""
+    return [{"name": n, "arguments": a, "result": r} for n, a, r in seq or ()]
+
+def emit_turn(lines, **record):
+    """Print a turn block, append it to the readable transcript next to the
+    session log (<session>.txt), and log it as one structured 'turn' event."""
+    lines = [l for l in lines if l]
+    with _print_lock:
+        print("\n" + "\n".join(lines))
+        path = getattr(interaction_log, "path", None)
+        if path:
+            try:
+                with open(os.path.splitext(path)[0] + ".txt", "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%H:%M:%S") + "\n" + "\n".join(lines) + "\n\n")
+            except OSError as e:
+                logger.warning("transcript write failed: %s", e)
+    _ilog("turn", **record)
+
+def _direct_transcribe(audio, user_msg, lang, turn_lines=(), turn_info=None):
     """Background: transcribe the utterance for the history/log (the reply
     was already produced straight from the audio), then print the whole turn
     in reading order -- what was heard, what the arm did, what was said.
@@ -689,10 +708,12 @@ def _direct_transcribe(audio, user_msg, lang, turn_lines=()):
     user_msg['content'] = text or "(unintelligible audio)"
     heard_lang = (getattr(info, "language", "") if text else "") or lang
     seconds = len(audio) / 16000.0
-    with _print_lock:
-        print(f"\n  User:   ({heard_lang}, {seconds:.1f}s) {text or '(unintelligible)'}")
-        for line in turn_lines:
-            print(line)
+    info_ = dict(turn_info or {})
+    scene = info_.pop("scene_line", None)
+    emit_turn([scene, f"  User:   ({heard_lang}, {seconds:.1f}s) {text or '(unintelligible)'}",
+               *turn_lines],
+              kind="speech", user=text, user_lang=heard_lang,
+              user_seconds=round(seconds, 2), **info_)
     _ilog("user_transcript", content=text, lang=heard_lang)
 
 KNOWN_LANGS = ('en', 'sv', 'de', 'fr', 'es', 'it')
@@ -1301,7 +1322,9 @@ async def main(args):
                 # reply starts; a reply that comes later waits for it.
                 filler_timer = None
                 pending_transcript = None   # (audio, msg, lang, lines), run after speaking
-                classic_actions = []        # Action: lines of a non-direct turn
+                classic_calls = []          # (name, args, result) of a non-direct turn
+                turn_scene = None           # "Scene: ..." line for this turn's block
+                turn_user_line = None       # "User: ..." line of a greeting / typed turn
                 if (newstate == 'process' and not muted and voice_out is not None
                         and args.filler_delay >= 0):
                     filler_timer = threading.Timer(args.filler_delay, voice_out.filler, args=(lang,))
@@ -1322,7 +1345,7 @@ async def main(args):
                 augprompt = await augmentation_message(client, 'en' if direct_llm is not None else lang)
                 augpromptlist = []
                 if augprompt:
-                    print("\n" + scene_line(augprompt['content']))
+                    turn_scene = scene_line(augprompt['content'])
                     augpromptlist.append(augprompt)
                 augpromptlist.append(langprompt)
                 turn_audio = curr_audio if newstate == 'process' else None
@@ -1340,7 +1363,7 @@ async def main(args):
                     pending_user_msg = {"role": "user", "content": "(audio — transcribing)"}
                     messages.append(pending_user_msg)
                 elif newstate == 'process':
-                    print(f"\n  User:   ({lang}, typed) {prompt}")
+                    turn_user_line = f"  User:   ({lang}, typed) {prompt}"
                     _ilog("user_turn", kind=prompt_source or "unknown", content=prompt, lang=lang)
                     prompt_source = None
                     messages.append(user_message(prompt))
@@ -1349,7 +1372,7 @@ async def main(args):
                         greetprompt = greet_prompt_noname()
                     else:
                         greetprompt = greet_prompt()
-                    print("\n  User:   (visitor stepped up — greeting)")
+                    turn_user_line = "  User:   (visitor stepped up — greeting)"
                     _ilog("user_turn",
                           kind="greet_noname" if omit_names_and_prefs else "greet",
                           content=greetprompt['content'],
@@ -1422,7 +1445,14 @@ async def main(args):
                     # sentence 3-4x slower (1.1 s -> 3.6-4.9 s, measured). It
                     # only feeds the log and the history, so it waits until the
                     # robot has finished speaking.
-                    pending_transcript = (turn_audio, pending_user_msg, lang, turn_lines)
+                    pending_transcript = (turn_audio, pending_user_msg, lang, turn_lines, {
+                        "scene_line": turn_scene,
+                        "scene": augprompt['content'] if augprompt else None,
+                        "agent": reply_text, "agent_lang": lang,
+                        "reply_seconds": round(time.time() - t0, 2),
+                        "actions": _calls(getattr(direct_llm, "last_tool_calls", [])),
+                        "rejected": _calls(getattr(direct_llm, "rejected_tool_calls", [])),
+                    })
                 elif greet_stream:
                     # Greeting: streamed, short, no tools -- first words well
                     # under a second after contact.
@@ -1509,8 +1539,7 @@ async def main(args):
                                     }),
                                     "tool_call_id": tool_call.id
                                 }
-                                classic_actions.append(action_line(
-                                    tool_call.function.name, args_parsed, result=resulttxt))
+                                classic_calls.append((tool_call.function.name, args_parsed, resulttxt))
                                 _ilog("mcp_tool_call",
                                       name=tool_call.function.name,
                                       arguments=tool_call.function.arguments,
@@ -1526,7 +1555,7 @@ async def main(args):
                                     }),
                                     "tool_call_id": tool_call.id
                                 }
-                                classic_actions.append(f"  Action: unknown function {tool_call.function.name} {tool_call.function.arguments}")
+                                classic_calls.append((tool_call.function.name, args_parsed, "unknown function"))
                                 _ilog("mcp_tool_call",
                                       name=tool_call.function.name,
                                       arguments=tool_call.function.arguments,
@@ -1567,9 +1596,13 @@ async def main(args):
                     messages.append(response.choices[0].message)
                     reply_text = response.choices[0].message.content or ""
                 if not direct_turn:
-                    print(f"  Agent:  ({lang}) {reply_text}")
-                    for line in (classic_actions or ["  Action: <no action>"]):
-                        print(line)
+                    emit_turn([turn_scene, turn_user_line, f"  Agent:  ({lang}) {reply_text}",
+                               *actions_block(classic_calls)],
+                              kind="greeting" if newstate == 'greet' else "text",
+                              user=None if newstate == 'greet' else prompt, user_lang=lang,
+                              agent=reply_text, agent_lang=lang,
+                              scene=augprompt['content'] if augprompt else None,
+                              actions=_calls(classic_calls))
                 if filler_timer:
                     filler_timer.cancel()
                 set_win_state('talk')

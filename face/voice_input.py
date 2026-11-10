@@ -777,6 +777,9 @@ class VoiceInput:
         self.listen_phase = "waiting"
         self.vad_prob = 0.0
         self.silence_progress = 0.0
+        if self._cancel_listen:
+            self._cancel_listen = False
+            return None
         self._cancel_listen = False
         self._flush_listen = False
 
@@ -1070,8 +1073,10 @@ class ContinuousListener:
         old = self._paused
         self._paused = val
         if val and not old:
+            self.voice._cancel_listen = True
             self.voice._emit(VoiceEventType.CONTINUOUS_PAUSED, ContinuousStatePayload())
         elif not val and old:
+            self.voice._cancel_listen = False
             self.voice._emit(VoiceEventType.CONTINUOUS_RESUMED, ContinuousStatePayload())
 
     def _run(self):

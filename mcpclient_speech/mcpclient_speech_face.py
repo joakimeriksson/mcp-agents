@@ -382,24 +382,31 @@ def on_face_change(id):
         curr_person.lasttime = time.time()
         if not omit_names_and_prefs and curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
             curr_person.lastmessages = messages
-            info = distill_user_info(extract_dialog_messages(messages))
-            name = extract_value("Name:", info)
-            if name:
-                curr_person.name = name
-                if voice_db is not None and prev_face_id:
-                    voice_db.mark_named(prev_face_id)   # eligible for opt-in persistence
-            lang = extract_language(info)
-            if lang:
-                curr_person.lang = lang
-            pref = extract_value("Preferences:", info)
-            if pref:
-                curr_person.profileinfo = pref
-            _ilog("person_distillation",
-                  face_id=prev_face_id,
-                  raw_summary=info,
-                  parsed_name=name,
-                  parsed_lang=lang,
-                  parsed_preferences=pref)
+            target_person = curr_person
+            msgs_to_distill = list(messages)
+            def _async_distill():
+                try:
+                    info = distill_user_info(extract_dialog_messages(msgs_to_distill))
+                    name = extract_value("Name:", info)
+                    if name:
+                        target_person.name = name
+                        if voice_db is not None and prev_face_id:
+                            voice_db.mark_named(prev_face_id)   # eligible for opt-in persistence
+                    lang = extract_language(info)
+                    if lang:
+                        target_person.lang = lang
+                    pref = extract_value("Preferences:", info)
+                    if pref:
+                        target_person.profileinfo = pref
+                    _ilog("person_distillation",
+                          face_id=prev_face_id,
+                          raw_summary=info,
+                          parsed_name=name,
+                          parsed_lang=lang,
+                          parsed_preferences=pref)
+                except Exception as e:
+                    logger.warning("person distillation failed: %s", e)
+            threading.Thread(target=_async_distill, daemon=True).start()
         else:
             print("(Nothing new to extract)")
     if id is None:
@@ -982,14 +989,16 @@ async def main(args):
         def _on_face_event(ev):
             if ev.type == FaceEventType.FOCUS_CHANGED:
                 tid = ev.payload.new_track_id
-                focus_state["track_id"] = tid
+                focus_state["track_id"] = tid if tid else None
                 pid = ev.payload.new_person_id
-                if pid is None and tid is not None and talk_to_unknown:
+                if pid is None and tid and talk_to_unknown:
                     # Talk to a visitor the face DB doesn't know yet. Otherwise
                     # the robot sits in 'wait' (green eye) until auto-enrollment
                     # fires, which needs a big, sharp, frontal face -- at a stand
                     # most visitors never clear that bar and are never greeted.
                     pid = f"track:{tid}"
+                elif not tid:
+                    pid = None
                 _emit(pid)
             elif ev.type in (FaceEventType.IDENTITY_CONFIRMED,
                              FaceEventType.FACE_ENROLLED):
@@ -1209,6 +1218,7 @@ async def main(args):
                                and voice_in is not None and voice_in.last_audio is not None)
                 if direct_turn:
                     turn_audio = voice_in.last_audio
+                    voice_in.last_audio = None
                     print("\n  User: (", lang, ") [audio, %.1fs]" % (len(turn_audio) / voice_in.sample_rate))
                     _ilog("user_turn", kind="speech_audio", content="",
                           lang=lang, seconds=round(len(turn_audio) / voice_in.sample_rate, 2))

@@ -224,6 +224,15 @@ def _history_messages(history) -> list:
     return out
 
 
+def _claimed_kinds_any(text: str, scene: dict) -> set:
+    """Candies on the table named anywhere in *text* (for a claim found by the
+    judge, whose wording the phrase list did not know)."""
+    aliases = _candy_aliases(scene)
+    low = (text or "").lower()
+    return {h for h, names in aliases.items()
+            if any(re.search(r"\b" + re.escape(n) + r"\b", low) for n in names)}
+
+
 def _has_words(text: str) -> bool:
     """True if there is something to say once the language tag is removed."""
     return bool(_split_lang(text or "", "")[1])
@@ -314,6 +323,33 @@ class DirectAudioLLM:
         except Exception as e:
             logger.warning(f"direct: tool {name}({args}) failed: {e}")
             return f"Tool {name} failed: {e}"
+
+    _JUDGE = ("A candy robot said this to a visitor:\n\"{reply}\"\n\n"
+              "Does it say or imply that the robot is handing over, giving, moving or "
+              "fetching something for them RIGHT NOW or just did? Offers (\"would you "
+              "like...\", \"I can...\" + a question), questions and descriptions are "
+              "NO. Answer with one word: YES or NO.")
+
+    def _judge_claims_action(self, reply: str) -> bool:
+        """Language-independent check: does *reply* claim a physical action?"""
+        text = _split_lang(_strip_tool_text(reply), "")[1]
+        if not text:
+            return False
+        t0 = time.time()
+        try:
+            out = self._client.chat(model=self._model, messages=[{"role": "user", "content":
+                                    self._JUDGE.format(reply=text[:400])}],
+                                    options={"temperature": 0, "num_predict": 3}, think=False,
+                                    stream=False, keep_alive=KEEP_ALIVE)["message"]["content"]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"direct: action judge failed: {e}")
+            return False
+        verdict = (out or "").strip().upper().startswith(("YES", "JA"))
+        logger.info(f"direct: action judge {'YES' if verdict else 'NO'} in "
+                    f"{time.time() - t0:.2f}s for {text[:60]!r}")
+        if verdict:
+            logger.warning(f"direct: judge says the reply claims an action: {text[:70]!r}")
+        return verdict
 
     _NOTHING_MOVED = {
         "sv": "[sv] Förlåt, det gick inte. Vilket godis vill du ha?",
@@ -619,7 +655,16 @@ class DirectAudioLLM:
         claimed_kinds = _claimed_kinds(" ".join(texts + [reply]), scene_at_start) if reply else set()
         claimed = len(claimed_kinds)
         moved = self._moves_ok()
-        if (self._tools and reply and _is_claim(reply) and moved == 0 and not claimed
+        is_claim = bool(reply) and _is_claim(reply)
+        if self._tools and reply and not is_claim and moved == 0:
+            # The phrase list only knows phrasings it has seen. Ask the model
+            # itself -- any language, any wording -- whether the reply says it
+            # handed something over. Runs while the reply is already playing.
+            is_claim = self._judge_claims_action(reply)
+            if is_claim:
+                claimed_kinds = _claimed_kinds_any(reply, scene_at_start)
+                claimed = len(claimed_kinds)
+        if (self._tools and reply and is_claim and moved == 0 and not claimed
                 and scene_at_start):
             # It "handed over" something that is not on the table (at the demo:
             # "Here is your Marianne" with no Marianne). A retry then grabbed
@@ -628,7 +673,7 @@ class DirectAudioLLM:
                            " — no retry, honest answer")
             reply = self._honest_reply(messages + [{"role": "assistant", "content": reply}],
                                        language_hint or "en")
-        elif self._tools and reply and _is_claim(reply) and (moved == 0 or claimed > moved):
+        elif self._tools and reply and is_claim and (moved == 0 or claimed > moved):
             if moved == 0:
                 logger.warning(f"direct: action claimed without a move: {reply[:70]!r}"
                                " — retrying")

@@ -117,14 +117,21 @@ def _async_ned_call(args: dict) -> None:
         ned.move_to_home_pose()
     elif op == 'move':
         src, dst = args['from'], args['to']
-        logger.info("Arm: moving %s -> %s", args.get('src_name'), args.get('dst_name'))
+        name = f"{args.get('src_name')} -> {args.get('dst_name')}"
+        # WARNING level on purpose: the server logs warnings and up, and a
+        # move that silently did nothing left no trace at all (Nov 2026).
+        logger.warning("arm: starting move %s%s", name, " (simulated)" if _simulated else "")
+        t0 = time.monotonic()
         if _simulated:
             time.sleep(SIM_MOVE_SECONDS)
             return
         try:
-            ned.pick_and_place(src, dst)
+            result = ned.pick_and_place(src, dst)
+            logger.warning("arm: move %s returned %r after %.1f s", name, result,
+                           time.monotonic() - t0)
         except Exception as e:
-            logger.error("Failed to move: %s", e)
+            logger.error("arm: move %s FAILED after %.1f s: %s: %s", name,
+                         time.monotonic() - t0, type(e).__name__, e)
             if ned.collision_detected:
                 ned.clear_collision_detected()   # also goes home
             dropped = _ned_worker.cancel_waiting() if _ned_worker else 0
@@ -174,9 +181,14 @@ def ned_known_positions() -> set:
 
 def ned_move_between(src: str, dst: str) -> int | None:
     """Queue a move. Returns how many moves are ahead of it (0 = starts now),
-    or None if it could not be queued (unknown position or queue full)."""
+    or None if it could not be queued (unknown position, queue full, or the
+    arm was never initialised)."""
     if not _ned_worker:
-        return 0
+        # Used to return "started" here, so the robot announced a move that
+        # could not happen. Fail instead.
+        logger.error("arm: move %s -> %s refused: arm not initialised "
+                     "(service_init was never called?)", src, dst)
+        return None
     pos1 = ned.get_pose(src)
     pos2 = ned.get_pose(dst)
     if not pos1 or not pos2:

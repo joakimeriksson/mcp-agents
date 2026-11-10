@@ -143,3 +143,13 @@ def test_greet_streams_without_tools():
                             on_sentence=lambda s, l: heard.append(s))
     assert seen["tools"] is None
     assert heard == ["Hej!", "Vilket godis vill du ha?"] and lang == "sv"
+
+
+def test_tool_call_written_as_text_is_executed_and_not_spoken():
+    # Seen at the demo: the call arrived as text and was read out loud.
+    raw = ('[toolcall] movebetween{dst:<|"|>O0<|"|>,src:<|"|>A1<|"|>} '
+           '[toolcall] movebetween{dst:<|"|>O0<|"|>,src:<|"|>A3<|"|>}')
+    llm = make([(raw, None), ("[sv] Här är din Dumle.", None)])
+    reply, _, heard = run_scene(llm)
+    assert llm.moves == [{"dst": "O0", "src": "A1"}, {"dst": "O0", "src": "A3"}]
+    assert all("toolcall" not in s and "<|" not in s for s, _, _ in heard)

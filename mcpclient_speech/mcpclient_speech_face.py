@@ -588,7 +588,9 @@ Haha, du har god smak. Här kommer en Dumle."
   one reply out of three. A greeting or a plain answer gets no laugh.
 - Most replies need no tag at all; never more than one tagged sentence per reply.
 - Tags are never read aloud and never go in the middle of a sentence.
-- Never let a joke delay or replace a tool call."""
+- Never let a joke delay or replace a tool call.
+- Tags are ONLY for how a sentence sounds. Moving candy is done with the tool
+  (function call), never by writing a tag or the call as text."""
 
 
 async def system_message(client, lang):

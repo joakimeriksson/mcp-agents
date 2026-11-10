@@ -52,6 +52,8 @@ Rules:
   those are forbidden; call the tool and then say what you DID.
   To hand candy to the person, move it to position O0.
 - Never say position codes (A1, D2, O0 ...) to the person; name the candy.
+- If several candies of the kind they asked for are on the table, just take any
+  one of them -- never ask which one.
 - But only act on what you actually HEARD. If the audio was unclear, or you
   cannot tell WHICH candy they mean, ask them to say it again — do NOT call a
   tool and do NOT move a random candy. A wrong move is worse than a question.
@@ -79,14 +81,53 @@ _ACTION_CLAIM = re.compile(
     r"|här (får|har) du|här (är|kommer) (din|ditt|dina|en|ett|två|tre)|varsågod|nu (flyttar|ger|tar|hämtar) jag"
     r"|jag har (flyttat|gett|tagit|hämtat|lagt)"
     # en
-    r"|i (moved|gave|placed|took|put|fetched)|i'?m (moving|giving|getting|taking|fetching)"
-    r"|here (you go|it is|you are|comes)|here'?s your|moving it|i'?ll (move|give|get|take|fetch)"
+    r"|i (moved|gave|placed|took|put|fetched|handed)|i'?m (moving|giving|getting|taking|fetching|handing|bringing)"
+    r"|here (you go|it is|you are|comes)|here'?s (your|a|an|another|one)|here (is|are) (your|a|an|another|one|two)"
+    r"|there you go|moving it|i'?ll (move|give|get|take|fetch|hand|bring)|i will (move|give|get|take|fetch|hand|bring)|i(?: have|'ve) (moved|given|placed|put|handed)"
+    # "I can hand you a Dumle" in answer to "can I have one?" is a non-move
+    # dressed as a yes (8/12 plain-prompt requests moved before this).
+    r"|i can (hand|give|get|bring|fetch) you|jag kan (ge|hämta|räcka|ta) dig"
     # de / fr / es / it
     r"|ich (bewege|gebe|nehme|hole|bringe)|hier (ist|kommt) (dein|deine|ein|eine)|hier hast du|bitte schön"
     r"|je (déplace|donne|prends|t'apporte)|je (vous|te|t') ?(donne|apporte|passe)|voici|voilà"
     r"|aquí (tienes|está|lo tienes)|te (doy|traigo)|toma"
-    r"|ecco|ti (do|porto)"
+    r"|ecco|ti (do|porto)|ho (spostato|messo|dato|preso)"
+    r"|j'ai (déplacé|donné|mis|pris)|he (movido|puesto|dado|traído)|ich habe (dir|ihnen)"
     r")\b", re.IGNORECASE)
+
+# gemma4 sometimes WRITES its tool call as text instead of making it, e.g.
+#   [toolcall] movebetween{dst:<|"|>O0<|"|>,src:<|"|>A1<|"|>}
+#   <|tool_call>call:move_between{dst:<|"|>O0<|"|>,...}<tool_call|>
+# (seen at the demo with the expressive prompt, which teaches "[tag]" syntax).
+# The arm then never moved and the voice read the gibberish out. Such text is
+# never spoken, and the call in it is executed as if it had been made.
+_TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|\bcall:\s*\w+\s*\{|<\|\"\|>",
+                        re.IGNORECASE)
+_TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)\s*(?:call:)?\s*([a-z_]+)\s*\{([^{}]*)\}",
+                             re.IGNORECASE)
+_TOOL_TEXT_ARG = re.compile(r"(\w+)\s*:\s*(?:<\|\"\|>(.*?)<\|\"\|>|\"([^\"]*)\"|([^,}\s]+))")
+
+
+def _text_tool_calls(content: str, tool_names: list) -> list:
+    """Tool calls the model wrote as text, as Ollama-style call dicts."""
+    norm = {n.replace("_", "").lower(): n for n in tool_names}
+    calls = []
+    for m in _TOOL_TEXT_CALL.finditer(content or ""):
+        name = norm.get(m.group(1).replace("_", "").lower())
+        if not name:
+            continue
+        args = {}
+        for a in _TOOL_TEXT_ARG.finditer(m.group(2)):
+            args[a.group(1)] = next(v for v in a.groups()[1:] if v is not None)
+        calls.append({"function": {"name": name, "arguments": args}})
+    return calls
+
+
+def _strip_tool_text(content: str) -> str:
+    """The prose before any written-out tool call."""
+    m = _TOOL_TEXT.search(content or "")
+    return (content[:m.start()] if m else (content or "")).strip()
+
 
 # What the server answers when the arm really started (or queued) a move.
 _MOVE_OK = re.compile(r"^(Started moving|Queued|Successfully demonstrated)", re.IGNORECASE)
@@ -249,6 +290,25 @@ class DirectAudioLLM:
             logger.warning(f"direct: tool {name}({args}) failed: {e}")
             return f"Tool {name} failed: {e}"
 
+    def _recover_text_calls(self, content: str, scene: dict) -> list:
+        """Execute what the model wrote as a tool call instead of making one.
+        At most one move per kind of candy: written out, it tends to list
+        every Dumle on the table for "a Dumle"."""
+        calls = _text_tool_calls(content, [t["function"]["name"] for t in self._tools])
+        kept, kinds = [], set()
+        for c in calls:
+            fn = c["function"]
+            if fn["name"] == "move_between":
+                src = str(fn["arguments"].get("src", "")).upper().strip()
+                kind = (scene.get(src) or src).split(",")[0].strip().lower()
+                if kind in kinds:
+                    continue
+                kinds.add(kind)
+            kept.append(c)
+        logger.warning(f"direct: model wrote {len(calls)} tool call(s) as text; "
+                       f"executing {len(kept)}: {[c['function'] for c in kept]}")
+        return kept
+
     @staticmethod
     def _apply_move(name: str, args: dict, result: str, scene: dict) -> None:
         """Update this turn's scene copy after a move the arm accepted, so a
@@ -312,10 +372,12 @@ class DirectAudioLLM:
                 lang, body = _split_lang(content, default_lang)
                 fed = len(content) - len(body)
             for sentence in cutter.feed(content[fed:]):
-                say(sentence, lang)
+                if not _TOOL_TEXT.search(sentence):
+                    say(sentence, lang)
             fed = len(content)
         for sentence in cutter.flush():
-            say(sentence, lang or default_lang)
+            if not _TOOL_TEXT.search(sentence):
+                say(sentence, lang or default_lang)
         return ollama.Message(role="assistant", content=content,
                               tool_calls=calls or None)
 
@@ -465,6 +527,10 @@ class DirectAudioLLM:
             msg = self._chat(messages, self._tools or None, say, language_hint or "en")
             calls = msg.get("tool_calls") or []
             content = (msg.get("content") or "").strip()
+            if not calls and self._tools and _TOOL_TEXT.search(content):
+                calls = self._recover_text_calls(content, scene)
+                content = _strip_tool_text(content)
+                msg = {"role": "assistant", "content": content, "tool_calls": calls}
             if content:
                 texts.append(content)
             if not calls:
@@ -531,6 +597,10 @@ class DirectAudioLLM:
                 m2 = self._chat(messages, self._tools or None, None, language_hint or "en")
                 calls2 = m2.get("tool_calls") or []
                 content2 = (m2.get("content") or "").strip()
+                if not calls2 and _TOOL_TEXT.search(content2):
+                    calls2 = self._recover_text_calls(content2, scene)
+                    content2 = _strip_tool_text(content2)
+                    m2 = {"role": "assistant", "content": content2, "tool_calls": calls2}
                 if not calls2:
                     if _has_words(content2) and self._moves_ok() > had_moves:
                         reply = content2

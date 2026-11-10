@@ -56,6 +56,9 @@ Rules:
 - Never say position codes (A1, D2, O0 ...) to the person; name the candy.
 - If several candies of the kind they asked for are on the table, just take any
   one of them -- never ask which one.
+- A QUESTION is not a request: "what do you have / what is on the table / what
+  can you do" gets an answer and NO tool call. Only move candy when the person
+  asks for it in what they just said; earlier requests do not count.
 - But only act on what you actually HEARD. If the audio was unclear, or you
   cannot tell WHICH candy they mean, ask them to say it again — do NOT call a
   tool and do NOT move a random candy. A wrong move is worse than a question.
@@ -208,6 +211,27 @@ def _claimed_candies(text: str, scene: dict) -> int:
         seen.update(h for h, names in aliases.items()
                     if any(re.search(r"\b" + re.escape(n) + r"\b", low) for n in names))
     return len(seen)
+
+
+def _history_messages(history) -> list:
+    """Earlier turns for the model, INCLUDING the arm calls they made. With
+    text only, the model saw itself answer "Kan jag få en Dumle?" with "Här är
+    din Dumle!" and nothing else, learned that handing out candy means saying
+    so, and stopped calling the tool (0/4 requests moved in a test)."""
+    out = []
+    for m in history or []:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            out.append({"role": "assistant", "content": str(m.get("content") or ""),
+                        "tool_calls": m["tool_calls"]})
+        elif role == "tool":
+            out.append({"role": "tool", "tool_name": m.get("tool_name", ""),
+                        "content": str(m.get("content") or "")})
+        elif role in ("user", "assistant") and m.get("content"):
+            out.append({"role": role, "content": str(m["content"])})
+    while out and out[0]["role"] != "user":   # never start mid-turn
+        out.pop(0)
+    return out
 
 
 def _has_words(text: str) -> bool:
@@ -446,9 +470,7 @@ class DirectAudioLLM:
                      f"spoke another language earlier in the conversation.\n")
         system = self._system(service_prompt, augmentation, language, "", lang_rule)
         messages = [{"role": "system", "content": system}]
-        for m in history or []:
-            if m.get("role") in ("user", "assistant") and m.get("content"):
-                messages.append({"role": m["role"], "content": str(m["content"])})
+        messages += _history_messages(history)
         messages.append({"role": "user", "content": instruction})
         self.last_tool_calls, self.rejected_tool_calls = [], []
         start = time.time()
@@ -506,9 +528,7 @@ class DirectAudioLLM:
         system = self._system(service_prompt, aug, language_hint, context, lang_rule)
 
         messages = [{"role": "system", "content": system}]
-        for m in history or []:
-            if m.get("role") in ("user", "assistant") and m.get("content"):
-                messages.append({"role": m["role"], "content": str(m["content"])})
+        messages += _history_messages(history)
         messages.append({"role": "user",
                          "content": "(user speech attached as audio)",
                          "images": [wav]})

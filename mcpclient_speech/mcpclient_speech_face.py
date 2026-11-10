@@ -630,15 +630,32 @@ def user_message(prompt):
     return {"role": "user", "content": prompt}
 
 def _text_history(mlst, max_turns):
-    """Recent user/assistant turns as plain dicts (for the direct-audio call).
-    Skips tool traffic and works for both dict and OpenAI message objects."""
+    """Recent turns as plain dicts for the direct-audio call: user/assistant
+    text AND the arm calls of direct turns (assistant tool_calls + tool
+    results). With text only, the model saw "Här är din Dumle!" answered
+    with words alone and stopped calling the tool (0/4 requests moved in a
+    test; 4/4 with the calls kept). Works for dicts and OpenAI objects."""
     out = []
     for m in mlst:
-        role = m.get('role') if isinstance(m, dict) else getattr(m, 'role', None)
-        content = m.get('content') if isinstance(m, dict) else getattr(m, 'content', None)
+        if isinstance(m, dict):
+            role = m.get('role')
+            if role == 'assistant' and m.get('tool_calls'):
+                out.append({'role': 'assistant', 'content': str(m.get('content') or ''),
+                            'tool_calls': m['tool_calls']})
+                continue
+            if role == 'tool' and m.get('tool_name'):
+                out.append({'role': 'tool', 'tool_name': m['tool_name'],
+                            'content': str(m.get('content') or '')})
+                continue
+            content = m.get('content')
+        else:
+            role, content = getattr(m, 'role', None), getattr(m, 'content', None)
         if role in ('user', 'assistant') and content:
             out.append({'role': role, 'content': str(content)})
-    return out[-2 * max_turns:]
+    users = [i for i, m in enumerate(out) if m['role'] == 'user']
+    if len(users) > max_turns:
+        out = out[users[-max_turns]:]
+    return out
 
 _print_lock = threading.Lock()
 
@@ -1441,6 +1458,13 @@ async def main(args):
                         _ilog("tool_call_rejected", name=_tn, arguments=_ta, reason=_tr)
                     for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
                         _ilog("tool_call", name=_tn, arguments=_ta, result=_tr)
+                    _done = [(n, a, r) for n, a, r in getattr(direct_llm, "last_tool_calls", [])]
+                    if _done:
+                        # Keep the arm calls in the history (see _text_history).
+                        messages.append({"role": "assistant", "content": "", "tool_calls": [
+                            {"function": {"name": n, "arguments": a}} for n, a, _r in _done]})
+                        messages.extend({"role": "tool", "tool_name": n, "content": r}
+                                        for n, _a, r in _done)
                     messages.append({"role": "assistant", "content": reply_text})
                     _ilog("direct_response", content=reply_text, lang=lang,
                           tool_calls=[{"name": n, "arguments": a}

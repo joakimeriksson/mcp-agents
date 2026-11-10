@@ -1262,6 +1262,7 @@ async def main(args):
                 # fetched and the reply thought up. Cancelled as soon as the
                 # reply starts; a reply that comes later waits for it.
                 filler_timer = None
+                pending_transcript = None   # (audio, msg, lang, lines), run after speaking
                 if (newstate == 'process' and not muted and voice_out is not None
                         and args.filler_delay >= 0):
                     filler_timer = threading.Timer(args.filler_delay, voice_out.filler, args=(lang,))
@@ -1378,9 +1379,12 @@ async def main(args):
                                       for n, a, _ in getattr(direct_llm, "last_tool_calls", [])],
                           seconds=round(time.time() - t0, 2))
                     turn_lines.append(f"  Robot: ({lang}) {reply_text}   [{time.time() - t0:.2f}s]")
-                    threading.Thread(target=_direct_transcribe,
-                                     args=(turn_audio, pending_user_msg, lang, turn_lines),
-                                     daemon=True).start()
+                    # NOT now: the transcript is another gemma4 call, and running
+                    # it while VoxCPM2 voices the first sentence made that
+                    # sentence 3-4x slower (1.1 s -> 3.6-4.9 s, measured). It
+                    # only feeds the log and the history, so it waits until the
+                    # robot has finished speaking.
+                    pending_transcript = (turn_audio, pending_user_msg, lang, turn_lines)
                 elif greet_stream:
                     # Greeting: streamed, short, no tools -- first words well
                     # under a second after contact.
@@ -1566,6 +1570,9 @@ async def main(args):
                         voice_out.stop_speaking()
                     win.check_events()
                     await asyncio.sleep(0.05)
+                if pending_transcript is not None:
+                    threading.Thread(target=_direct_transcribe, args=pending_transcript,
+                                     daemon=True).start()
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
                 else:

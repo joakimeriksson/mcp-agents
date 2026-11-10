@@ -1,5 +1,6 @@
 import cv2
 import logging
+import numpy as np
 import os
 import threading
 import time
@@ -23,11 +24,105 @@ _SIMULATED_CORNERS = [
 ]
 
 
+
+# ---------------------------------------------------------------- board boxes
+# The board is white paper with one black-outlined rounded box per square.
+# On an EMPTY board all of them are visible, and their centres give every
+# square directly -- no candy needed, and no interpolation between corners.
+
+def find_board_boxes(frame) -> list[tuple]:
+    """(cx, cy, w, h) of every printed box outline found on the paper."""
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    paper = ((hsv[..., 2] > 140) & (hsv[..., 1] < 60)).astype(np.uint8) * 255
+    paper = cv2.morphologyEx(paper, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 15)
+    th = cv2.bitwise_and(th, paper)
+    cnts, hier = cv2.findContours(th, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = g.shape
+    boxes = []
+    if hier is None:
+        return boxes
+    for i, c in enumerate(cnts):
+        if hier[0][i][3] < 0:          # the INSIDE of an outline is a hole
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        a = cv2.contourArea(c)
+        if not (0.002 * W * H < a < 0.03 * W * H):
+            continue
+        if a / float(w * h) < 0.75 or not (0.5 < w / float(h) < 1.5):
+            continue
+        boxes.append((x + w / 2.0, y + h / 2.0, float(w), float(h)))
+    return boxes
+
+
+def snap_to_boxes(positions: dict, boxes: list[tuple]) -> int:
+    """Move each square to the centre of the printed box nearest to it, when
+    that box is clearly the one (closer than half a box). In place; returns
+    how many squares were snapped."""
+    snapped, used = 0, set()
+    for tag, (x, y) in list(positions.items()):
+        best, bd = None, None
+        for k, b in enumerate(boxes):
+            d = ((b[0] - x) ** 2 + (b[1] - y) ** 2) ** 0.5
+            if d < 0.5 * min(b[2], b[3]) and (bd is None or d < bd) and k not in used:
+                best, bd = k, d
+        if best is not None:
+            used.add(best)
+            positions[tag] = (boxes[best][0], boxes[best][1])
+            snapped += 1
+    return snapped
+
+
+def grid_from_boxes(boxes: list[tuple], n: int, m: int):
+    """{tag: (x, y)} if *boxes* are exactly an m-row x n-column grid, else None.
+    Rows are letters (A at the BOTTOM of the image), columns numbers (1 left),
+    the same orientation as the 4-candy calibration."""
+    if len(boxes) != n * m:
+        return None
+    # The paper is rarely square to the camera: estimate the grid's angle
+    # from the direction to each box's nearest neighbour (folded into
+    # -45..45 deg), and sort into rows in that rotated frame.
+    pts = np.array([[b[0], b[1]] for b in boxes])
+    angs = []
+    for k, p in enumerate(pts):
+        d = np.hypot(*(pts - p).T)
+        d[k] = np.inf
+        v = pts[int(np.argmin(d))] - p
+        a = np.degrees(np.arctan2(v[1], v[0]))
+        angs.append((a + 45) % 90 - 45)
+    theta = np.radians(float(np.median(angs)))
+    c, s_ = np.cos(-theta), np.sin(-theta)
+    rot = {id(b): (c * b[0] - s_ * b[1], s_ * b[0] + c * b[1]) for b in boxes}
+    by_y = sorted(boxes, key=lambda b: rot[id(b)][1])
+    rows = [sorted(by_y[r * n:(r + 1) * n], key=lambda b: rot[id(b)][0]) for r in range(m)]
+    for r in range(m):
+        # Perspective makes near boxes bigger than far ones, so sizes are
+        # compared within a row only.
+        hs = np.array([b[3] for b in rows[r]])
+        hmed = float(np.median(hs))
+        if np.any(np.abs(hs - hmed) > 0.3 * hmed):
+            return None                  # something that is not a board box
+        ys = [rot[id(b)][1] for b in rows[r]]
+        if max(ys) - min(ys) > 0.6 * hmed:
+            return None                  # a "row" that is not level
+        if r and min(ys) - max(rot[id(b)][1] for b in rows[r - 1]) < 0.6 * min(hmed, prev_h):
+            return None                  # rows not separated
+        prev_h = hmed
+    positions = {}
+    for r, row in enumerate(rows):
+        letter = chr(65 + (m - 1 - r))   # top row = last letter (D)
+        for c, b in enumerate(row):
+            positions[f"{letter}{c + 1}"] = (b[0], b[1])
+    return positions
+
 class CameraManager:
     _SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
     def __init__(self, camera_index: int = 0, model_path: str = 'models/best-m.pt',
                  show_window: bool = True, simulate: bool = False):
+        self.loose_pick = False   # --loose-pick: report candy outside the boxes as L1, L2...
+        self.loose: dict = {}     # {"L1": (x, y)} pixel position of loose candy
         self.camera_index = camera_index
         self.model_path = os.path.join(self._SOURCE_DIR, model_path)
         self.show_window = show_window
@@ -173,6 +268,28 @@ class CameraManager:
         """
         lst = self.acquire_scene_one() if self.has_camera() else list(_SIMULATED_CORNERS)
         self.last_detection_count = len(lst)
+        self.last_box_count = 0
+        if self.has_camera() and not lst:
+            # Empty board: calibrate from the printed boxes themselves.
+            raw = self.get_last_raw_frame()
+            if raw is not None:
+                try:
+                    boxes = find_board_boxes(raw)
+                    self.last_box_count = len(boxes)
+                    grid = grid_from_boxes(boxes, n, m)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("box calibration failed: %s", e)
+                    grid = None
+                if grid:
+                    pitch_x = (max(p[0] for p in grid.values()) - min(p[0] for p in grid.values())) / (n - 1)
+                    pitch_y = (max(p[1] for p in grid.values()) - min(p[1] for p in grid.values())) / (m - 1)
+                    self.positions = grid
+                    self.positions_thresdist = (min(pitch_x, pitch_y) / 2) ** 2
+                    self.calibration_warnings = []
+                    self.calibration_method = "boxes"
+                    logger.info("Calibration from the %d printed boxes: %d positions",
+                                len(boxes), len(grid))
+                    return True
         if len(lst) != 4:
             logger.debug("Calibration failed: expected 4 candies, found %d", len(lst))
             return False
@@ -196,6 +313,17 @@ class CameraManager:
                     for k in [1, 2]
                 )
                 positions[tag] = pos
+        # Snap every square whose printed box is visible (all but the 4
+        # covered by the corner candies) to the box's exact centre: the
+        # corner blend is off for the inner squares when the camera looks
+        # at the board at an angle.
+        if self.has_camera():
+            raw = self.get_last_raw_frame()
+            if raw is not None:
+                try:
+                    self.last_box_count = snap_to_boxes(positions, find_board_boxes(raw))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("box snapping failed: %s", e)
         self.positions = positions
         self.positions_thresdist = min(
             (tr[1] + br[1] - tl[1] - bl[1]) / (n - 1) / 4,
@@ -205,7 +333,9 @@ class CameraManager:
             {'tl': tl, 'bl': bl, 'tr': tr, 'br': br})
         for w in self.calibration_warnings:
             logger.warning("Calibration: %s", w)
-        logger.info("Calibration successful: %d positions mapped", len(self.positions))
+        self.calibration_method = "candies"
+        logger.info("Calibration successful: %d positions mapped (%d snapped to printed boxes)",
+                    len(self.positions), getattr(self, "last_box_count", 0))
         return True
 
     def _sanity_check(self, corners: dict) -> list[str]:
@@ -256,8 +386,29 @@ class CameraManager:
     def grab_and_detect(self) -> dict[str, str]:
         scene_one = self.acquire_scene_one()
         result = {}
+        loose = []
         for ele in scene_one:
             ptag = self.find_position((ele[1], ele[2]))
             if ptag:
                 result[ptag] = ele[0]
+            elif self.loose_pick and self._on_board((float(ele[1]), float(ele[2]))):
+                loose.append((ele[0], float(ele[1]), float(ele[2])))
+        # Candy on the board but in no box: "L1", "L2"... (left to right), so
+        # the arm can pick it from its coordinate (--loose-pick).
+        loose.sort(key=lambda t: (t[1], t[2]))
+        self.loose = {}
+        for k, (name, x, y) in enumerate(loose[:9]):
+            tag = f"L{k + 1}"
+            self.loose[tag] = (x, y)
+            result[tag] = name
         return result
+
+    def _on_board(self, xy: tuple) -> bool:
+        """Inside the board (the hull of the square centres, widened by half
+        a square). Off-board things -- a wrapper on the table -- are ignored."""
+        if len(self.positions) < 4:
+            return False
+        pts = np.array(list(self.positions.values()), np.float32)
+        hull = cv2.convexHull(pts)
+        margin = 0.5 * (self.positions_thresdist ** 0.5) * 2   # ~half a square pitch
+        return cv2.pointPolygonTest(hull, (float(xy[0]), float(xy[1])), True) >= -margin

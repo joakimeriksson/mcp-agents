@@ -6,11 +6,13 @@ import os
 import atexit
 import logging
 import random
+import re
 import sys
 import threading
 
 from camera import CameraManager
-from robotarm import (init_ned, exit_ned, ned_move_between,
+import robotarm
+from robotarm import (init_ned, exit_ned, ned_move_between, ned_move_from_pose,
                       ned_known_positions, ned_pending_moves, ned_moves_waiting,
                       MAX_QUEUED_MOVES)
 from transtable import transhead, transtable
@@ -75,6 +77,9 @@ def scene_message(scene, lang):
                     # Swedish visitors ask for "Lakrits", not "Licorice".
                     obj = f"{obj} ({sv_obj})"
                 content += "\n" + k + " : " + obj + ", " + cha + "."
+        if any(_LOOSE_TAG.match(k) for k in scene):
+            content += ("\n(L1, L2 ...: candy lying outside the boxes. It can be "
+                        "handed out the same way, e.g. move_between from L1 to O0.)")
     else:
         content += "No candies observed"
     return content
@@ -127,7 +132,13 @@ def move_between(src: str, dst: str) -> str:
         logger.warning("Refused move %r -> %r: %s", src, dst, refusal)
         return refusal
     src, dst = src.strip().upper(), dst.strip().upper()
-    ahead = ned_move_between(src, dst)
+    if _LOOSE_TAG.match(src):
+        pose = loose_pose(src)
+        if pose is None:
+            return f"Refused: cannot reach the loose candy {src} safely; nothing was moved."
+        ahead = ned_move_from_pose(src, pose, dst)
+    else:
+        ahead = ned_move_between(src, dst)
     if ahead is None:
         return "Failed to move"
     # The worker runs moves asynchronously, so this is "started"/"queued", not
@@ -156,6 +167,8 @@ def _refuse_move(src: str, dst: str) -> str | None:
 
     known = {p.upper() for p in ned_known_positions()} or _FALLBACK_POSITIONS
     movable = sorted(p for p in known if p != "HOME")
+    if loose_pick and _LOOSE_TAG.match(src_n) and src_n in (cam.loose if cam else {}):
+        known = known | {src_n}           # a loose candy can only be picked UP
     for label, pos in (("src", src_n), ("dst", dst_n)):
         if pos not in known or pos == "HOME":
             # Also catches coordinate strings: get_pose() would otherwise parse
@@ -178,6 +191,79 @@ def _refuse_move(src: str, dst: str) -> str | None:
             return (f"Refused: {dst_n} already holds {scene[dst_n]}; moving there would "
                     f"drop one candy on top of another. Pick a free position.")
     return None
+
+
+# ---------------------------------------------------------------- loose candy
+# --loose-pick: a candy on the board but in no box ("L1") is picked from its
+# coordinate. The camera->table mapping is a homography fitted to the 12
+# square centres in the image and the 12 taught arm poses (x, y in metres).
+_LOOSE_TAG = re.compile(r"^L[1-9]$")
+loose_pick = False
+_table_h = None            # 3x3 image -> robot-table homography
+_table_err_m = None
+_table_for = None          # the cam.positions the mapping was fitted on
+
+
+def fit_table_mapping() -> bool:
+    """(Re)fit the image -> table mapping after a calibration."""
+    global _table_h, _table_err_m
+    _table_h = None
+    try:
+        import numpy as np
+        import cv2
+        poses = robotarm.ned.get_poses() if robotarm.ned else {}
+        pairs = [(cam.positions[t], poses[t]) for t in cam.positions if t in poses]
+        if len(pairs) < 6:
+            logger.warning("loose pick: only %d squares with both a camera and an arm "
+                           "position -- disabled", len(pairs))
+            return False
+        img = np.float32([[p[0], p[1]] for p, _ in pairs])
+        tab = np.float32([[q.x, q.y] for _, q in pairs])
+        h, _mask = cv2.findHomography(img, tab, 0)
+        back = cv2.perspectiveTransform(img[None], h)[0]
+        _table_err_m = float(np.max(np.hypot(*(back - tab).T)))
+        if _table_err_m > 0.015:
+            logger.warning("loose pick: camera->table mapping is off by up to %.1f cm "
+                           "-- disabled (recalibrate?)", 100 * _table_err_m)
+            return False
+        _table_h = h
+        logger.warning("loose pick: camera->table mapping fitted on %d squares, "
+                       "max error %.1f mm", len(pairs), 1000 * _table_err_m)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("loose pick: mapping failed: %s", e)
+        return False
+
+
+def loose_pose(tag: str):
+    """Arm pose to pick the loose candy *tag*, or None if unsafe/unknown:
+    the nearest taught square's pose (height and gripper angle), moved to
+    the candy's x/y -- only within 6 cm of a taught square."""
+    import numpy as np
+    import cv2
+    if not cam or tag not in cam.loose or robotarm.ned is None:
+        return None
+    if _table_h is None or _table_for is not cam.positions:
+        # Fitted lazily: the arm object only exists after service_init, and
+        # a recalibration replaces cam.positions.
+        globals()["_table_for"] = cam.positions
+        if not fit_table_mapping():
+            return None
+    px = cam.loose[tag]
+    x, y = cv2.perspectiveTransform(np.float32([[px]]), _table_h)[0][0]
+    poses = {t: p for t, p in robotarm.ned.get_poses().items() if t in cam.positions}
+    if not poses:
+        return None
+    near_t, near = min(poses.items(), key=lambda kv: (kv[1].x - x) ** 2 + (kv[1].y - y) ** 2)
+    d = float(np.hypot(near.x - x, near.y - y))
+    if d > 0.06:
+        logger.warning("loose pick: %s at (%.3f, %.3f) is %.1f cm from the nearest square "
+                       "%s -- refused", tag, x, y, 100 * d, near_t)
+        return None
+    pose = near.copy_with_offsets(x_offset=float(x) - near.x, y_offset=float(y) - near.y)
+    pose.metadata = near.metadata
+    logger.warning("loose pick: %s -> (%.3f, %.3f), %.1f cm from %s", tag, x, y, 100 * d, near_t)
+    return pose
 
 
 def planned_scene() -> dict:
@@ -215,7 +301,7 @@ def _run_mcp_server(args):
 
 
 def main():
-    global use_robot, robot_ip, cam, scene_logger
+    global use_robot, robot_ip, cam, scene_logger, loose_pick
 
     parser = argparse.ArgumentParser(description=mcp.name)
     parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
@@ -230,6 +316,9 @@ def main():
                         help="Table-camera index, or part of its name (e.g. 'brio', 'hp'). "
                              "Names survive replugging; indices do not. Default: auto-detect.")
     parser.add_argument('--no-window', action='store_true', help='Disable the OpenCV display window')
+    parser.add_argument('--loose-pick', action='store_true',
+                        help='Also pick candy lying OUTSIDE the boxes (on the board), from its '
+                             'camera coordinate. Test carefully on the real arm first.')
     parser.add_argument('--log-scenes-dir', default=None, help='If set, log every scene request (annotated camera frame + returned state) to this directory')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
     args = parser.parse_args()
@@ -322,6 +411,10 @@ def main():
         show_window=not args.no_window,
         simulate=simulate_camera,
     )
+    loose_pick = bool(args.loose_pick)
+    cam.loose_pick = loose_pick
+    if loose_pick:
+        status("loose pick ON: candy outside the boxes can be picked from its coordinate")
     try:
         cam.init_cam()
     except RuntimeError as e:

@@ -198,6 +198,20 @@ def ned_move_between(src: str, dst: str) -> int | None:
                               move=(src, dst))
 
 
+def ned_move_from_pose(src_name: str, src_pose, dst: str) -> int | None:
+    """Queue a move whose SOURCE is a computed pose (a loose candy, see
+    candytron_mcp.loose_pose); the destination must be a calibrated name."""
+    if not _ned_worker:
+        logger.error("arm: move %s -> %s refused: arm not initialised", src_name, dst)
+        return None
+    pos2 = ned.get_pose(dst)
+    if src_pose is None or not pos2:
+        return None
+    return _ned_worker.submit({'op': 'move', 'from': src_pose, 'to': pos2,
+                               'src_name': src_name, 'dst_name': dst},
+                              move=(src_name, dst))
+
+
 def init_ned(use_robot=True, robot_ip=None):
     global ned, _ned_worker, _simulated
     if not ned:

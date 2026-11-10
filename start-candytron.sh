@@ -16,6 +16,7 @@
 #   --simulate-camera       simulate only the camera (real arm)
 #   --robot-ip IP           Niryo Ned 2 address (default $NIRYO_IP or 10.10.10.10)
 #   --robot-camera N        camera index for the TABLE camera (candytron_mcp)
+#   --loose-pick            let the arm pick candy lying OUTSIDE the boxes (test first!)
 #   --no-voice-server       don't start kokoro-voice-server (Piper only)
 #   --face-agent            use face/agent.py (person memory, direct-audio capable)
 #                           instead of mcpclient_speech_face as the client
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --sim)              SERVER_ARGS+=(--simulate-robot --simulate-camera); shift ;;
         --simulate-robot)   SERVER_ARGS+=(--simulate-robot); shift ;;
         --simulate-camera)  SERVER_ARGS+=(--simulate-camera); shift ;;
+        --loose-pick)       SERVER_ARGS+=(--loose-pick); shift ;;
         --robot-ip)         SERVER_ARGS+=(--robot-ip "$2"); shift 2 ;;
         --robot-camera)     SERVER_ARGS+=(--camera "$2"); shift 2 ;;
         --no-voice-server)  START_VOICE=0; shift ;;

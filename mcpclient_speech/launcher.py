@@ -448,6 +448,7 @@ class Launcher:
         self._refresh_mics(select_name=self.cfg["mic_name"])
         self.root.after(150, self._tick)
         self.root.after(500, self.check)
+        self.root.after(5000, lambda: self.auto_detect(quiet_if_unsure=True))
         if args.autostart:
             self.root.after(2500, self.start)
 
@@ -488,8 +489,12 @@ class Launcher:
                                              "Black = idle iPhone / covered lens.")
         self.cam_note.configure(wraplength=1000)
         self.cam_note.grid(row=1, column=0, columnspan=N_CAMS - 1, sticky="w", padx=6)
-        ttk.Button(camf, text="Re-scan cameras", command=self.rescan_cameras).grid(
-            row=1, column=N_CAMS - 1, sticky="e", padx=6, pady=(0, 4))
+        cbtns = ttk.Frame(camf)
+        cbtns.grid(row=1, column=N_CAMS - 1, sticky="e", padx=6, pady=(0, 4))
+        self.auto_btn = ttk.Button(cbtns, text="Auto-detect", command=self.auto_detect)
+        self.auto_btn.pack(side="left", padx=(0, 4))
+        ttk.Button(cbtns, text="Re-scan cameras", command=self.rescan_cameras).pack(side="left")
+        self.auto_running = False
 
         # ---- left column: config
         left = ttk.Frame(r)
@@ -851,6 +856,99 @@ class Launcher:
                 msg += "; " + self._yolo_msg[1]
             self.set_pre(key, {"ok": True, "black": False, "waiting": None, "noframes": False}[st], msg)
 
+    # ------------------------------------------------------------ auto-detect
+    def auto_detect(self, then_start: bool = False, quiet_if_unsure: bool = False):
+        """Pick the TABLE camera by candy (the board's own YOLO model) and the
+        PEOPLE camera by faces (OpenCV's face detector) in the live pictures.
+        Camera numbers shift whenever an iPhone comes or goes; the pictures
+        don't lie."""
+        if self.auto_running or self.running():
+            return
+        frames = {}
+        for i in range(N_CAMS):
+            r = self.cams.get(i)
+            if r is None or r.state() != "ok":
+                continue
+            with r.lock:
+                if r.full is not None:
+                    frames[i] = r.full.copy()
+        if not frames:
+            if not quiet_if_unsure:
+                self.say("auto-detect: no camera with a picture yet", "warn")
+            if then_start:
+                self.start(skip_auto=True)
+            return
+        self.auto_running = True
+        self.auto_btn.configure(state="disabled", text="Detecting…")
+        threading.Thread(target=self._auto_worker, args=(frames, then_start, quiet_if_unsure),
+                         daemon=True).start()
+
+    def _auto_worker(self, frames, then_start, quiet_if_unsure):
+        # Faces: OpenCV's Haar cascade -- fast, in-process, no extra model.
+        faces = {}
+        try:
+            cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            for i, f in frames.items():
+                g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                found = cascade.detectMultiScale(g, scaleFactor=1.1, minNeighbors=6,
+                                                 minSize=(max(40, g.shape[1] // 25),) * 2)
+                faces[i] = max((w * h for (_x, _y, w, h) in found), default=0) / float(g.size)
+        except Exception as e:  # noqa: BLE001
+            self.say(f"auto-detect: face detector failed: {e}", "warn")
+        # Candy: the table camera's YOLO, one subprocess for all pictures.
+        candies = {}
+        paths = {}
+        for i, f in frames.items():
+            paths[i] = os.path.join(tempfile.gettempdir(), f"candytron-launcher-cam{i}.jpg")
+            cv2.imwrite(paths[i], f)
+        code = ("import sys\n"
+                "from ultralytics import YOLO\n"
+                "m = YOLO('models/best-m.pt')\n"
+                "for a in sys.argv[1:]:\n"
+                "    i, p = a.split('=', 1)\n"
+                "    print(f'CANDY {i} {len(m(p, verbose=False)[0].boxes)}', flush=True)\n")
+        try:
+            out = subprocess.run(["uv", "run", "--no-sync", "python", "-c", code,
+                                  *[f"{i}={p}" for i, p in paths.items()]],
+                                 cwd=CANDYTRON_DIR, capture_output=True, text=True, timeout=120)
+            for m in re.finditer(r"^CANDY (\d+) (\d+)$", out.stdout, re.M):
+                candies[int(m.group(1))] = int(m.group(2))
+        except Exception as e:  # noqa: BLE001
+            self.say(f"auto-detect: YOLO failed: {e}", "warn")
+        self.q.put(("auto", candies, faces, then_start, quiet_if_unsure))
+
+    def _apply_auto(self, candies, faces, then_start, quiet_if_unsure):
+        self.auto_running = False
+        self.auto_btn.configure(state="normal", text="Auto-detect")
+        table, people = self.table_var.get(), self.people_var.get()
+        notes = []
+        if not self.sim_camera.get():
+            best_t = max(candies, key=candies.get, default=None)
+            if best_t is not None and candies[best_t] >= 2:
+                table = best_t
+                notes.append(f"TABLE #{table} ({candies[table]} candies)")
+            else:
+                notes.append(f"TABLE unsure (no camera sees 2+ candies) — kept #{table}")
+        cands = {i: a for i, a in faces.items() if i != table or self.sim_camera.get()}
+        best_p = max(cands, key=cands.get, default=None)
+        if best_p is not None and cands[best_p] > 0:
+            people = best_p
+            notes.append(f"PEOPLE #{people} (face seen)")
+        else:
+            ok = [i for i in sorted(faces) if i != table]
+            if people == table or people not in faces:
+                people = ok[0] if ok else people
+            notes.append(f"PEOPLE: no face in any picture — using #{people}; stand in front and press Auto-detect")
+        changed = (table, people) != (self.table_var.get(), self.people_var.get())
+        self.table_var.set(table)
+        self.people_var.set(people)
+        msg = "auto-detect: " + "; ".join(notes) + ("" if changed else " (unchanged)")
+        if changed or not quiet_if_unsure:
+            self.say(msg, "me")
+        self._cams_changed()
+        if then_start:
+            self.start(skip_auto=True)
+
     def yolo_check(self):
         if self.yolo_running or self.running():
             return
@@ -946,9 +1044,18 @@ class Launcher:
             a += shlex.split(c["extra_args"])
         return a
 
-    def start(self):
+    def start(self, skip_auto: bool = False):
         if self.running():
             return
+        if not skip_auto and not self.sim_camera.get():
+            # Numbers shift when an iPhone comes or goes: if a chosen camera
+            # is now black or gone, re-detect from the pictures first.
+            bad = [i for i in (self.table_var.get(), self.people_var.get())
+                   if self.cams.get(i) is None or self.cams.get(i).state() != "ok"]
+            if bad:
+                self.say(f"camera(s) {bad} no longer give a picture — re-detecting before start", "warn")
+                self.auto_detect(then_start=True)
+                return
         c = self._collect_cfg()
         if not c["sim_camera"] and c["table_cam"] == c["people_cam"]:
             if not self.args.autostart and not messagebox.askyesno(
@@ -1347,6 +1454,8 @@ class Launcher:
                     self._apply_health(item[1])
                 elif kind == "step":
                     self.set_step(item[1], item[2], item[3])
+                elif kind == "auto":
+                    self._apply_auto(*item[1:])
                 elif kind == "yolo":
                     self._yolo_msg = (item[1], item[2])
                     self.yolo_running = False

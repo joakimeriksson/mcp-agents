@@ -124,9 +124,18 @@ def _text_tool_calls(content: str, tool_names: list) -> list:
 
 
 def _strip_tool_text(content: str) -> str:
-    """The prose before any written-out tool call."""
-    m = _TOOL_TEXT.search(content or "")
-    return (content[:m.start()] if m else (content or "")).strip()
+    """The prose around written-out tool calls, without them. The real answer
+    often comes AFTER the calls ("[toolcall] ...{...} [en] Here is a Dumle")."""
+    text = _TOOL_TEXT_CALL.sub(" ", content or "")
+    text = re.sub(r"<\|tool_call>|<tool_call\|>|\[tool_?call\]|<\|\"\|>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    # a language tag left in the middle moves to the front, where it is read
+    m = re.match(r"^(.*?)\s*(\[[a-z]{2}\])\s*(.*)$", text)
+    if m and not m.group(1):
+        return text
+    if m and not _TOOL_TEXT.search(m.group(1)) and len(m.group(1)) < 3:
+        return f"{m.group(2)} {m.group(3)}".strip()
+    return text
 
 
 # What the server answers when the arm really started (or queued) a move.

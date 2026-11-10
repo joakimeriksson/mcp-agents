@@ -153,3 +153,18 @@ def test_tool_call_written_as_text_is_executed_and_not_spoken():
     reply, _, heard = run_scene(llm)
     assert llm.moves == [{"dst": "O0", "src": "A1"}, {"dst": "O0", "src": "A3"}]
     assert all("toolcall" not in s and "<|" not in s for s, _, _ in heard)
+
+
+def test_demo_turn_text_calls_then_the_real_answer():
+    # The exact reply from the robot at 21:11: four calls as text, then prose.
+    raw = ('[toolcall] movebetween{dst:<|"|>O0<|"|>,src:<|"|>A1<|"|>} '
+           '[toolcall] movebetween{dst:<|"|>O0<|"|>,src:<|"|>A3<|"|>} '
+           '[toolcall] movebetween{dst:<|"|>O0<|"|>,src:<|"|>D1<|"|>} '
+           '[toolcall] movebetween{dst:<|"|>O0<|"|>,src:<|"|>D3<|"|>} [en] Here is a Dumle for you.')
+    scene = "Positions:\nA1 : Dumle, red.\nA3 : Dumle, red.\nD1 : Dumle, red.\nD3 : Dumle, red."
+    llm = make([(raw, None), ("[en] Here is a Dumle for you.", None)])
+    heard = []
+    reply, lang = llm.respond(np.zeros(32000, np.float32), language_hint="sv", augmentation=scene,
+                              on_sentence=lambda s, l: heard.append((s, l)))
+    assert llm.moves == [{"dst": "O0", "src": "A1"}]          # ONE Dumle, not four
+    assert heard == [("Here is a Dumle for you.", "en")]       # no tool text spoken

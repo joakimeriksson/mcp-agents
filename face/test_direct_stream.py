@@ -215,3 +215,43 @@ def test_written_demo_move_is_dropped_not_executed_or_spoken():
     reply, lang, heard = run_scene(llm)
     assert llm.moves == []
     assert all("showdemomove" not in s for s, _, _ in heard)
+
+
+LIGHT_TOOLS = [{"type": "function", "function": {"name": "set_light",
+                "description": "Turn a lamp on or off, or dim it."}}]
+
+
+def test_generic_service_claim_without_tool_is_retried():
+    # Lighting, not candy: "I turned on the kitchen light" with no tool call.
+    ON = {"function": {"name": "set_light", "arguments": {"room": "kitchen", "on": True}}}
+    llm = make([("[en] I've turned on the kitchen light.", None),
+                ("YES", None),                                   # the judge
+                ("[en]", [ON]),                                  # retry calls the tool
+                ("[en] The kitchen light is on.", None)])
+    llm._tools = LIGHT_TOOLS
+    llm._call_tool = lambda name, args: llm.moves.append(args) or "OK: kitchen light on"
+    reply, lang, heard = run(llm)
+    assert llm.moves == [{"room": "kitchen", "on": True}]
+
+
+def test_generic_service_honest_when_retry_does_nothing():
+    llm = make([("[sv] Nu har jag släckt lampan.", None),
+                ("YES", None),                                   # judge
+                ("[sv] Nu har jag släckt lampan.", None),        # retry: still no tool
+                ("[sv] Förlåt, jag har inte släckt lampan.", None)])
+    llm._tools = LIGHT_TOOLS
+    reply, lang, heard = run(llm)
+    assert llm.moves == []
+    # An unknown phrasing streams before the judge rules; the honest
+    # correction must follow it, so the user is never left believing it.
+    assert [s for s, _, _ in heard][-1] == "Förlåt, jag har inte släckt lampan."
+
+
+def test_generic_written_tool_call_is_recovered():
+    llm = make([('set_light{room:<|"|>hall<|"|>,on:<|"|>false<|"|>} [en] Done.', None),
+                ("[en] The hall light is off.", None)])
+    llm._tools = LIGHT_TOOLS
+    llm._call_tool = lambda name, args: llm.moves.append(args) or "OK"
+    reply, lang, heard = run(llm)
+    assert llm.moves == [{"room": "hall", "on": "false"}]
+    assert all("set_light" not in s and "{" not in s for s, _, _ in heard)

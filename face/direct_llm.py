@@ -92,9 +92,9 @@ _TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|<\|\"\|>|\w
                         re.IGNORECASE)
 _TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)?\s*(?:call:)?\s*([a-z_]+)\s*\{([^{}]*)\}",
                              re.IGNORECASE)
-# Recovered from text only when concrete and checkable: a demo move (random)
-# or "do nothing" written as text is dropped, never executed.
-_RECOVERABLE = {"move_between"}
+# Any known tool written as text is executed as if it had been called --
+# except ones that act at random or do nothing, which are just dropped.
+_NOT_RECOVERED = {"show_demo_move", "default_action"}
 _TOOL_TEXT_ARG = re.compile(r"(\w+)\s*:\s*(?:<\|\"\|>(.*?)<\|\"\|>|\"([^\"]*)\"|([^,}\s]+))")
 
 
@@ -104,7 +104,7 @@ def _text_tool_calls(content: str, tool_names: list) -> list:
     calls = []
     for m in _TOOL_TEXT_CALL.finditer(content or ""):
         name = norm.get(m.group(1).replace("_", "").lower())
-        if not name or name not in _RECOVERABLE:
+        if not name or name in _NOT_RECOVERED:
             continue
         args = {}
         for a in _TOOL_TEXT_ARG.finditer(m.group(2)):
@@ -130,6 +130,11 @@ def _strip_tool_text(content: str) -> str:
 
 # What the server answers when the arm really started (or queued) a move.
 _MOVE_OK = re.compile(r"^(Started moving|Queued|Successfully demonstrated)", re.IGNORECASE)
+# Generic, for any service: a tool call counts as DONE unless its result says
+# it was refused, failed, or did nothing.
+_NOT_DONE = re.compile(r"^\s*(refused|failed|error|did nothing|tool \S+ failed|unknown)",
+                       re.IGNORECASE)
+_NO_OP_TOOLS = {"default_action"}
 
 
 def parse_scene_positions(augmentation: Optional[str]) -> dict:
@@ -324,11 +329,24 @@ class DirectAudioLLM:
             logger.warning(f"direct: tool {name}({args}) failed: {e}")
             return f"Tool {name} failed: {e}"
 
-    _JUDGE = ("A candy robot said this to a visitor:\n\"{reply}\"\n\n"
-              "Does it say or imply that the robot is handing over, giving, moving or "
-              "fetching something for them RIGHT NOW or just did? Offers (\"would you "
-              "like...\", \"I can...\" + a question), questions and descriptions are "
-              "NO. Answer with one word: YES or NO.")
+    _JUDGE = ("An assistant that acts in the real world ONLY through these tools:\n"
+              "{tools}\n\n"
+              "It said to the user:\n\"{reply}\"\n\n"
+              "Does that say or imply that the assistant itself has just done, or is "
+              "right now doing, something that needs one of these tools -- e.g. moving "
+              "or handing over something, switching something on or off, changing a "
+              "setting? Offers (\"would you like...\", \"I can...\"), questions and "
+              "descriptions of what it CAN do are NO. Answer with one word: YES or NO.")
+
+    def _tool_summary(self) -> str:
+        lines = []
+        for t in self._tools or []:
+            fn = t.get("function", {})
+            if fn.get("name") in _NO_OP_TOOLS:
+                continue
+            desc = (fn.get("description") or "").strip().splitlines()
+            lines.append(f"- {fn.get('name')}: {desc[0][:120] if desc else ''}")
+        return "\n".join(lines) or "- (none)"
 
     def _judge_claims_action(self, reply: str) -> bool:
         """Language-independent check: does *reply* claim a physical action?"""
@@ -338,7 +356,8 @@ class DirectAudioLLM:
         t0 = time.time()
         try:
             out = self._client.chat(model=self._model, messages=[{"role": "user", "content":
-                                    self._JUDGE.format(reply=text[:400])}],
+                                    self._JUDGE.format(tools=self._tool_summary(),
+                                                       reply=text[:400])}],
                                     options={"temperature": 0, "num_predict": 3}, think=False,
                                     stream=False, keep_alive=KEEP_ALIVE)["message"]["content"]
         except Exception as e:  # noqa: BLE001
@@ -364,11 +383,10 @@ class DirectAudioLLM:
         """A truthful one-liner after a claimed hand-out that did not happen:
         say so, and if the candy is not on the table, what is."""
         messages = messages + [{"role": "user", "content":
-            "Nothing was handed over: no move happened, so the person did NOT "
-            "get anything. Do not say they did. In ONE short sentence in the "
-            "person's language, starting with its ISO code in brackets, say so "
-            "honestly. If what they asked for is not on the table, say that and "
-            "name one or two candies that are."}]
+            "That was NOT done: no tool ran, so nothing happened. Do not say it "
+            "was done. In ONE short sentence in the person's language, starting "
+            "with its ISO code in brackets, say so honestly. If what they asked "
+            "for is not available, say that and name what is."}]
         try:
             text = (self._chat(messages, None, None, language).get("content") or "").strip()
         except Exception as e:  # noqa: BLE001
@@ -537,7 +555,7 @@ class DirectAudioLLM:
         """Moves the arm really started or queued this turn (a refused call,
         e.g. "arm busy", does not count)."""
         return sum(1 for n, _a, r in self.last_tool_calls
-                   if n in ("move_between", "show_demo_move") and _MOVE_OK.match(r or ""))
+                   if n not in _NO_OP_TOOLS and not _NOT_DONE.match(r or ""))
 
     def respond(self, audio: np.ndarray, *,
                 context: str = "",
@@ -674,7 +692,20 @@ class DirectAudioLLM:
             reply = self._honest_reply(messages + [{"role": "assistant", "content": reply}],
                                        language_hint or "en")
         elif self._tools and reply and is_claim and (moved == 0 or claimed > moved):
-            if moved == 0:
+            candy_arm = any(t.get("function", {}).get("name") == "move_between"
+                            for t in self._tools or [])
+            if moved == 0 and not candy_arm:
+                # Any service (lights, music, ...): the reply says something was
+                # done, but no tool ran.
+                logger.warning(f"direct: action claimed without a tool call: {reply[:70]!r}"
+                               " — retrying")
+                nudge = ("You just told the user you did something, but you called no "
+                         "tool (or the tool refused), so NOTHING happened. If you meant "
+                         "to do it, call the right tool NOW for exactly that action. "
+                         "Then answer in one sentence starting with the ISO language "
+                         "code in brackets -- and if you did not call a tool, say "
+                         "honestly that it was not done.")
+            elif moved == 0:
                 logger.warning(f"direct: action claimed without a move: {reply[:70]!r}"
                                " — retrying")
                 nudge = ("You just told the person you were moving or handing over "

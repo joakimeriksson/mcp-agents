@@ -44,6 +44,9 @@ import numpy as np
 import sounddevice as sd
 from PIL import Image, ImageTk
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "face"))
+import prompts  # noqa: E402  face/prompts.py: the editable prompt texts
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 START_SCRIPT = os.path.join(ROOT, "start-candytron.sh")
@@ -564,6 +567,7 @@ class Launcher:
         ttk.Button(bf, text="Check", command=self.check).pack(side="left")
         self.yolo_btn = ttk.Button(bf, text="Count candies (YOLO)", command=self.yolo_check)
         self.yolo_btn.pack(side="left", padx=6)
+        ttk.Button(bf, text="Prompts…", command=self.open_prompts).pack(side="left")
 
         btns = ttk.Frame(left)
         btns.grid(row=4, column=0, sticky="ew", pady=8)
@@ -855,6 +859,92 @@ class Launcher:
             if key == "table" and getattr(self, "_yolo_msg", None) and self._yolo_msg[0] == idx:
                 msg += "; " + self._yolo_msg[1]
             self.set_pre(key, {"ok": True, "black": False, "waiting": None, "noframes": False}[st], msg)
+
+    # ------------------------------------------------------------ prompts
+    def open_prompts(self):
+        """See and edit the system prompt. Saved texts apply from the robot's
+        NEXT turn: the client re-reads them before every turn."""
+        if getattr(self, "_pw", None) is not None and self._pw.winfo_exists():
+            self._pw.lift()
+            return
+        w = self._pw = tk.Toplevel(self.root)
+        w.title("CandyTron — system prompt")
+        w.geometry("980x720")
+        ttk.Label(w, wraplength=940, text=(
+            "Edit a part and press Save: it applies from the robot's NEXT turn, no restart. "
+            "Reset = back to the built-in text. 'Last prompt sent' shows exactly what the model got "
+            "last turn (rules + persona + scene)."), foreground="#555").pack(anchor="w", padx=10, pady=(8, 4))
+        nb = ttk.Notebook(w)
+        nb.pack(fill="both", expand=True, padx=10, pady=4)
+        self._ptexts = {}
+        for key in ("rules", "persona", "expressive", "greeting"):
+            f = ttk.Frame(nb)
+            nb.add(f, text=prompts.LABELS[key])
+            top = ttk.Frame(f)
+            top.pack(fill="x", pady=(6, 2))
+            state = ttk.Label(top, foreground="#1a7f37")
+            state.pack(side="left")
+            ttk.Label(f, text=prompts.HELP[key], foreground="#555", wraplength=920).pack(anchor="w")
+            t = ScrolledText(f, wrap="word", font=("Menlo", 12), undo=True)
+            t.pack(fill="both", expand=True, pady=4)
+            b = ttk.Frame(f)
+            b.pack(fill="x", pady=(0, 6))
+            ttk.Button(b, text="Save (live from next turn)",
+                       command=lambda k=key: self._save_prompt(k)).pack(side="left")
+            ttk.Button(b, text="Reset to default",
+                       command=lambda k=key: self._reset_prompt(k)).pack(side="left", padx=6)
+            self._ptexts[key] = (t, state)
+            self._load_prompt(key)
+        f = ttk.Frame(nb)
+        nb.add(f, text="Last prompt sent")
+        lt = ScrolledText(f, wrap="word", font=("Menlo", 11))
+        lt.pack(fill="both", expand=True, pady=4)
+        self._plast = lt
+
+        def refresh_last():
+            if not w.winfo_exists():
+                return
+            try:
+                txt = prompts.LAST_PROMPT.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                txt = "(nothing sent yet: start the robot and talk to it)"
+            if txt != lt.get("1.0", "end-1c"):
+                lt.configure(state="normal")
+                lt.delete("1.0", "end")
+                lt.insert("1.0", txt)
+                lt.configure(state="disabled")
+            w.after(2000, refresh_last)
+        refresh_last()
+
+    def _load_prompt(self, key):
+        t, state = self._ptexts[key]
+        t.delete("1.0", "end")
+        text = prompts.get(key)
+        if key == "persona" and not prompts.is_overridden("persona"):
+            text = ""
+            state.configure(text="Using the persona from candytron_mcp (see 'Last prompt sent'). "
+                                 "Type here to replace it.", foreground="#555")
+        else:
+            state.configure(text="EDITED (override active)" if prompts.is_overridden(key)
+                            else "Built-in default", foreground="#9a6700" if prompts.is_overridden(key) else "#1a7f37")
+        t.insert("1.0", text)
+        t.edit_reset()
+
+    def _save_prompt(self, key):
+        t, state = self._ptexts[key]
+        data = prompts.overrides()
+        text = t.get("1.0", "end-1c")
+        data[key] = "" if text.strip() == prompts.DEFAULTS[key].strip() else text
+        prompts.save(data)
+        self._load_prompt(key)
+        self.say(f"prompt '{prompts.LABELS[key]}' saved — applies from the next turn")
+
+    def _reset_prompt(self, key):
+        data = prompts.overrides()
+        data.pop(key, None)
+        prompts.save(data)
+        self._load_prompt(key)
+        self.say(f"prompt '{prompts.LABELS[key]}' reset to the built-in text")
 
     # ------------------------------------------------------------ auto-detect
     def auto_detect(self, then_start: bool = False, quiet_if_unsure: bool = False):

@@ -37,32 +37,11 @@ logger = logging.getLogger("direct_llm")
 
 # System prompt: the face-agent identity + the service role, with the rules the
 # direct path needs (language tag, tools, brevity). Mirrors llm.SYSTEM_PROMPT.
-DIRECT_SYSTEM = """\
-You are {name}, a camera-based assistant that can see, hear, and speak.
-You are listening to a person through a microphone; their speech is attached
-as audio. You remember people you've met.
-{service}
-Rules:
-- Begin your SPOKEN reply with the ISO language code of the spoken language
-  in square brackets, e.g. [sv] or [en], then reply in that same language.
-- Tool calls are function calls, made BEFORE you speak. Never write a tool
-  call, its name or its arguments as text or inside [brackets].
-{lang_rule}- Reply in 1-2 short sentences. No markdown or emojis.
-- ACT, do not narrate. If the person asks for candy, or asks you to move,
-  fetch, hand out or give anything, you MUST call the tool in THIS turn
-  before you answer. Never say "I can", "I could", "let me" or "I will" —
-  those are forbidden; call the tool and then say what you DID.
-  To hand candy to the person, move it to position O0.
-- Never say position codes (A1, D2, O0 ...) to the person; name the candy.
-- If several candies of the kind they asked for are on the table, just take any
-  one of them -- never ask which one.
-- A QUESTION is not a request: "what do you have / what is on the table / what
-  can you do" gets an answer and NO tool call. Only move candy when the person
-  asks for it in what they just said; earlier requests do not count.
-- But only act on what you actually HEARD. If the audio was unclear, or you
-  cannot tell WHICH candy they mean, ask them to say it again — do NOT call a
-  tool and do NOT move a random candy. A wrong move is worse than a question.
-"""
+import prompts as _prompts
+
+# The rules text lives in face/prompts.py and can be edited live (launcher's
+# "Prompts..." window); this is the default, kept for reference and tests.
+DIRECT_SYSTEM = _prompts.RULES
 
 # Positions the vision system reports, e.g. "A2 : Riesen-kola, brun ...".
 _SCENE_POS = re.compile(r"^\s*([A-Z]\d)\s*:\s*(.+?)\s*$", re.MULTILINE)
@@ -449,10 +428,11 @@ class DirectAudioLLM:
                          "Italian — judged only from the words you hear. Ignore the "
                          "language of the information above and of earlier turns.\n"
                          "- Never repeat or transcribe what the person said; answer it.\n")
-        system = DIRECT_SYSTEM.format(name=self._agent_name, service=service,
-                                      lang_rule=lang_rule)
+        system = _prompts.fill(_prompts.get("rules"), name=self._agent_name,
+                               service=service, lang_rule=lang_rule)
         if context:
             system += f"\nAbout the person you hear:\n{context}\n"
+        _prompts.write_last(system)
         return system
 
     def greet(self, instruction: str, *,

@@ -585,21 +585,8 @@ def map_tool_definition(f):
 
 # [voice] expressive: the voice server acts out style tags with VoxCPM2, so
 # the robot can laugh and whisper instead of reading everything flat.
-EXPRESSIVE_PROMPT = """
-Your voice can laugh, whisper and show feelings. Be warm and playful. Now and
-then, when it fits, make a light, friendly joke about candy, robots or the
-moment.
-To set how a sentence sounds, START that sentence with ONE of these tags:
-[skrattar] laughing, [glad] happy and excited, [viskar] whispering (a secret),
-[tänker] thinking out loud. Example: "[sv] [glad] Vad roligt att du kom! [skrattar]
-Haha, du har god smak. Här kommer en Dumle."
-- Use [skrattar] ONLY right after something that is actually funny, at most in
-  one reply out of three. A greeting or a plain answer gets no laugh.
-- Most replies need no tag at all; never more than one tagged sentence per reply.
-- Tags are never read aloud and never go in the middle of a sentence.
-- Never let a joke delay or replace a tool call.
-- Tags are ONLY for how a sentence sounds. Moving candy is done with the tool
-  (function call), never by writing a tag or the call as text."""
+import prompts   # face/prompts.py: editable live from the launcher
+EXPRESSIVE_PROMPT = prompts.EXPRESSIVE   # default; prompts.get("expressive") is what is used
 
 
 async def system_message(client, lang):
@@ -815,16 +802,15 @@ def language_message(lang):
 
 # Greetings must be SHORT: the visitor is waiting, and a long introduction of
 # the whole exhibition was the first thing people heard at the fair.
-GREET_RULE = (" Greet them in ONE short sentence (at most 12 words) and ask which "
-              "candy they would like. Do not describe yourself, the exhibition or "
-              "the technology unless they ask.")
+def _greet_rule() -> str:
+    return " " + prompts.get("greeting")   # editable live in the launcher
 
 def greet_prompt_noname():
     if curr_person.lasttime is None:
-        return {'role':'user', 'content':'A new person just stepped up to you.' + GREET_RULE}
+        return {'role':'user', 'content':'A new person just stepped up to you.' + _greet_rule()}
     else:
         duration = int((time.time() - curr_person.lasttime) / 60)
-        return {'role':'user', 'content': f'A person you met {duration} minutes ago just came back.' + GREET_RULE}
+        return {'role':'user', 'content': f'A person you met {duration} minutes ago just came back.' + _greet_rule()}
    
 def greet_prompt():
     if not curr_person.name and not curr_person.lasttime:
@@ -1363,8 +1349,10 @@ async def main(args):
                     curr_person.lang = lang
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
+                if prompts.is_overridden("persona"):   # edited live in the launcher
+                    sysprompt["content"] = prompts.get("persona")
                 if expressive:
-                    sysprompt["content"] += EXPRESSIVE_PROMPT
+                    sysprompt["content"] += "\n" + prompts.get("expressive")
                 # Direct-audio: the scene in English (with Swedish names kept).
                 # A Swedish scene list pulled gemma4 into answering English and
                 # German speakers in Swedish (measured: 9/16 -> 12/15 right).

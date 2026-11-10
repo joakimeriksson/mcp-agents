@@ -1180,6 +1180,13 @@ async def main(args):
         pump_task = asyncio.ensure_future(_pump_ui())
 
         set_state(state, 'wait')
+        if curr_person is not None and not muted:
+            # Someone stepped up while we were still starting (connecting to
+            # the real robot takes ~20 s). Their arrival event already fired
+            # and set_state() just cleared it, and no new one comes while
+            # they stay in view -- so greet them now instead of waiting.
+            logger.info("Visitor already in focus at startup: greeting")
+            state['newstate'] = 'greet'
         newstate = False
         prompt_source = None
         while True:

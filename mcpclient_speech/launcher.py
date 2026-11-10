@@ -75,7 +75,7 @@ PEOPLE_COLOR = "#1f6feb"
 DEFAULTS = {
     "table_cam": 1, "people_cam": 0, "mic_name": "", "robot_ip": DEFAULT_ROBOT_IP,
     "sim_robot": False, "sim_camera": False, "start_voice": True, "expressive": True,
-    "extra_args": "",
+    "extra_args": "", "ear": "whisper", "loose_pick": False,
 }
 
 

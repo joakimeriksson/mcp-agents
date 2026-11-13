@@ -223,6 +223,7 @@ class Gemma4Transcriber:
             messages=[{"role": "user", "content": prompt, "images": [wav_bytes]}],
             think=False,
             stream=False,
+            keep_alive=-1,   # keep gemma4 loaded (Ollama unloads after 5 idle min)
         )
         raw = (response.get("message", {}).get("content") or "").strip()
         return self._parse(raw)

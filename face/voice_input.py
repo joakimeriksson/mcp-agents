@@ -540,6 +540,14 @@ class VoiceInput:
         self.listen_phase: str = ""  # "", "waiting", "recording", "transcribing"
         self._cancel_listen: bool = False
         self._flush_listen: bool = False
+        # Set while the owner does not want input (ContinuousListener paused:
+        # the robot is thinking or talking, nobody in focus, muted). Unlike
+        # _cancel_listen it is NOT reset when a listen() starts, so a capture
+        # can neither begin nor keep running while it is set -- otherwise a
+        # recording that started just before the pause runs on to the next
+        # silence and comes back as a stale utterance (answering someone who
+        # spoke earlier, or the robot's own voice).
+        self.suspended: bool = False
         self._save_next_count: int = 0
         self._save_dir: str = "recordings"
         self.detected_language: str = ""
@@ -754,6 +762,8 @@ class VoiceInput:
         if not self._ready:
             logger.warning("STT not ready")
             return None
+        if self.suspended:
+            return None
 
         if not self._lock.acquire(timeout=1):
             logger.warning("Voice input busy, skipping listen")
@@ -777,6 +787,9 @@ class VoiceInput:
         self.listen_phase = "waiting"
         self.vad_prob = 0.0
         self.silence_progress = 0.0
+        if self._cancel_listen:
+            self._cancel_listen = False
+            return None
         self._cancel_listen = False
         self._flush_listen = False
 
@@ -817,8 +830,9 @@ class VoiceInput:
 
         try:
             while True:
-                if self._cancel_listen:
-                    logger.info("[VAD] listen cancelled")
+                if self._cancel_listen or self.suspended:
+                    logger.info("[VAD] listen cancelled%s",
+                                " (input suspended)" if self.suspended else "")
                     return None
                 if self._flush_listen:
                     if speech_started:
@@ -916,6 +930,10 @@ class VoiceInput:
                        TranscriptionEmptyPayload("no_speech"))
             return None
 
+        if self.suspended:
+            # Paused between the last chunk and here: drop it, it is stale.
+            self.listen_phase = ""
+            return None
         self.listen_phase = "transcribing"
         self.vad_prob = 0.0
         audio = np.concatenate(speech_chunks)
@@ -1040,11 +1058,15 @@ class ContinuousListener:
     """Background thread that continuously listens and emits events on speech."""
 
     def __init__(self, voice_input: VoiceInput, *,
-                 on_heard: Optional[Callable[[str], None]] = None):
+                 on_heard: Optional[Callable[[str], None]] = None,
+                 start_paused: bool = False):
         self.voice = voice_input
         self.on_heard = on_heard
         self._running = False
-        self._paused = False
+        # start_paused: passive from the first moment. Pausing right after
+        # start() races the thread, which may already be inside listen().
+        self._paused = start_paused
+        self.voice.suspended = start_paused
         self._thread = None
 
     def start(self):
@@ -1069,9 +1091,14 @@ class ContinuousListener:
     def paused(self, val):
         old = self._paused
         self._paused = val
+        # Pausing also aborts a capture already in progress (see
+        # VoiceInput.suspended); resuming lets the next listen() start fresh.
+        self.voice.suspended = bool(val)
         if val and not old:
+            self.voice._cancel_listen = True
             self.voice._emit(VoiceEventType.CONTINUOUS_PAUSED, ContinuousStatePayload())
         elif not val and old:
+            self.voice._cancel_listen = False
             self.voice._emit(VoiceEventType.CONTINUOUS_RESUMED, ContinuousStatePayload())
 
     def _run(self):

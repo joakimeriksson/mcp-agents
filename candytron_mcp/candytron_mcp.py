@@ -6,12 +6,15 @@ import os
 import atexit
 import logging
 import random
+import re
 import sys
 import threading
 
 from camera import CameraManager
-from robotarm import (init_ned, exit_ned, ned_move_between,
-                      ned_is_busy, ned_known_positions)
+import robotarm
+from robotarm import (init_ned, exit_ned, ned_move_between, ned_move_from_pose,
+                      ned_known_positions, ned_pending_moves, ned_moves_waiting,
+                      MAX_QUEUED_MOVES)
 from transtable import transhead, transtable
 from scene_state import SceneState
 from scene_logger import SceneLogger
@@ -51,6 +54,41 @@ def service_exit() -> bool:
     return True
 
 
+@mcp.resource("url://client_policy")
+def client_policy() -> str:
+    """Where a voice client finds CandyTron's client-side policy (empty-square
+    refusal, candy claim checks, ...): "module:Class", importable from the repo
+    root. See face/service_policy.py."""
+    return "candytron_mcp.client_policy:CandyPolicy"
+
+
+# How to use the arm -- kept apart from the persona so editing the persona in
+# the panel never drops them. Fetched by the client as get_service_rules.
+SERVICE_RULES = """- ACT, do not narrate. If the person asks for candy, or asks you to move,
+  fetch, hand out or give anything, you MUST call the tool in THIS turn
+  before you answer. Never say "I can", "I could", "let me" or "I will" --
+  those are forbidden; call the tool and then say what you DID.
+  To hand candy to the person, move it to position O0.
+- Never say position codes (A1, D2, O0 ...) to the person; name the candy.
+- If several candies of the kind they asked for are on the table, just take any
+  one of them -- never ask which one.
+- If the candy they ask for is NOT on the table, say so and name what is there.
+  Never hand over a different candy than the one they asked for without asking.
+- A QUESTION is not a request: "what do you have / what is on the table / what
+  can you do" gets an answer and NO tool call. Only move candy when the person
+  asks for it in what they just said; earlier requests do not count.
+- But only act on what you actually HEARD. If the audio was unclear, or you
+  cannot tell WHICH candy they mean, ask them to say it again -- do NOT call a
+  tool and do NOT move a random candy. A wrong move is worse than a question.
+"""
+
+
+@mcp.prompt()
+def get_service_rules(lang: str) -> str:
+    """Rules for using this service's tools, added to the client's rules."""
+    return SERVICE_RULES
+
+
 @mcp.prompt()
 def get_service_prompt(lang: str) -> str:
     """Return the system message snippet suitable for this service."""
@@ -69,7 +107,14 @@ def scene_message(scene, lang):
         for k in scene:
             if scene[k] in transtable:
                 obj,cha = transtable[scene[k]][lang]
+                sv_obj = transtable[scene[k]]['sv'][0]
+                if lang != 'sv' and sv_obj.lower() != obj.lower():
+                    # Swedish visitors ask for "Lakrits", not "Licorice".
+                    obj = f"{obj} ({sv_obj})"
                 content += "\n" + k + " : " + obj + ", " + cha + "."
+        if any(_LOOSE_TAG.match(k) for k in scene):
+            content += ("\n(L1, L2 ...: candy lying outside the boxes. It can be "
+                        "handed out the same way, e.g. move_between from L1 to O0.)")
     else:
         content += "No candies observed"
     return content
@@ -78,7 +123,9 @@ def scene_message(scene, lang):
 def get_service_augmentation(lang: str) -> str:
     """Return extra information on the current state, to insert before the user prompt"""
     scene = scene_state.get_scene()
-    message = scene_message(scene, lang)
+    # Tell the model about the board as it will be: a candy already queued for
+    # hand-out is not offered again.
+    message = scene_message(planned_scene(), lang)
     if scene_logger is not None:
         frame = cam.get_last_frame() if cam else None
         raw_frame = cam.get_last_raw_frame() if cam else None
@@ -95,13 +142,15 @@ def show_demo_move() -> str:
     must never be used to fetch, give or move a specific candy — use
     move_between for that.
     """
-    scene = scene_state.get_scene()
+    if ned_moves_waiting():
+        return "Refused: the arm is busy handing out candy; show the demo afterwards."
+    scene = planned_scene()
     scenepos = list(scene.keys())
     emptypos = [k for k in cam.camera_positions() if k not in scenepos] if cam else []
     if len(scenepos) and len(emptypos):
         p1 = random.choice(scenepos)
         p2 = random.choice(emptypos)
-        if ned_move_between(p1, p2):
+        if ned_move_between(p1, p2) is not None:
             return "Successfully demonstrated a move with the robot arm from " + p1 + " to " + p2
         else:
             return "Failed to move"
@@ -118,12 +167,27 @@ def move_between(src: str, dst: str) -> str:
         logger.warning("Refused move %r -> %r: %s", src, dst, refusal)
         return refusal
     src, dst = src.strip().upper(), dst.strip().upper()
-    if ned_move_between(src, dst):
-        # The worker runs the move asynchronously, so this is "started", not
-        # "finished" -- saying otherwise makes the robot announce a success it
-        # cannot yet know about (and that a collision may still cancel).
+    adj = None if _LOOSE_TAG.match(src) else adjusted_box_pose(src)
+    if adj is not None:
+        ahead = ned_move_from_pose(src, adj, dst)
+    elif _LOOSE_TAG.match(src):
+        pose = loose_pose(src)
+        if pose is None:
+            return (f"Refused: the {src} candy lies outside the boxes where the arm cannot "
+                    f"pick it safely; nothing was moved. Ask the person to put it in one "
+                    f"of the boxes, then you can hand it out.")
+        ahead = ned_move_from_pose(src, pose, dst)
+    else:
+        ahead = ned_move_between(src, dst)
+    if ahead is None:
+        return "Failed to move"
+    # The worker runs moves asynchronously, so this is "started"/"queued", not
+    # "finished" -- saying otherwise makes the robot announce a success it
+    # cannot yet know about (and that a collision may still cancel).
+    if ahead == 0:
         return f"Started moving the candy from {src} to {dst}; the arm is moving now."
-    return "Failed to move"
+    return (f"Queued: moving the candy from {src} to {dst} after {ahead} earlier "
+            f"move(s); the arm will do it right after.")
 
 
 # Positions the arm is calibrated for, as a last-resort allow-list for when the
@@ -143,6 +207,8 @@ def _refuse_move(src: str, dst: str) -> str | None:
 
     known = {p.upper() for p in ned_known_positions()} or _FALLBACK_POSITIONS
     movable = sorted(p for p in known if p != "HOME")
+    if loose_pick and _LOOSE_TAG.match(src_n) and src_n in (cam.loose if cam else {}):
+        known = known | {src_n}           # a loose candy can only be picked UP
     for label, pos in (("src", src_n), ("dst", dst_n)):
         if pos not in known or pos == "HOME":
             # Also catches coordinate strings: get_pose() would otherwise parse
@@ -152,18 +218,153 @@ def _refuse_move(src: str, dst: str) -> str | None:
     if src_n == dst_n:
         return f"Refused: src and dst are both {src_n}; nothing to do."
 
-    scene = scene_state.get_scene()
+    if ned_moves_waiting() >= MAX_QUEUED_MOVES:
+        return (f"Refused: the arm already has {MAX_QUEUED_MOVES} moves queued. "
+                f"Tell the person to wait a moment, then try again.")
+    scene = planned_scene()
     if scene:                      # only trust these when the vision system sees something
         if src_n not in scene:
             occupied = ", ".join(f"{p} ({c})" for p, c in sorted(scene.items()))
-            return (f"Refused: there is no candy at {src_n}, so the arm would grip "
-                    f"nothing. Candy is at: {occupied}.")
-        if dst_n in scene:
+            return (f"Refused: there is no candy at {src_n} (or it is already being "
+                    f"moved), so the arm would grip nothing. Candy is at: {occupied}.")
+        if dst_n in scene and dst_n != "O0":
             return (f"Refused: {dst_n} already holds {scene[dst_n]}; moving there would "
                     f"drop one candy on top of another. Pick a free position.")
-    if ned_is_busy():
-        return "Refused: the arm is still finishing the previous move. Try again in a moment."
     return None
+
+
+# ---------------------------------------------------------------- loose candy
+# --loose-pick: a candy on the board but in no box ("L1") is picked from its
+# coordinate. The camera->table mapping is a homography fitted to the 12
+# square centres in the image and the 12 taught arm poses (x, y in metres).
+_LOOSE_TAG = re.compile(r"^L[1-9]$")
+loose_pick = False
+_table_h = None            # 3x3 image -> robot-table homography
+_table_err_m = None
+_table_for = None          # the cam.positions the mapping was fitted on
+
+
+def fit_table_mapping() -> bool:
+    """(Re)fit the image -> table mapping after a calibration."""
+    global _table_h, _table_err_m
+    _table_h = None
+    try:
+        import numpy as np
+        import cv2
+        poses = robotarm.ned.get_poses() if robotarm.ned else {}
+        pairs = [(cam.positions[t], poses[t]) for t in cam.positions if t in poses]
+        if len(pairs) < 6:
+            logger.warning("loose pick: only %d squares with both a camera and an arm "
+                           "position -- disabled", len(pairs))
+            return False
+        img = np.float32([[p[0], p[1]] for p, _ in pairs])
+        tab = np.float32([[q.x, q.y] for _, q in pairs])
+        h, _mask = cv2.findHomography(img, tab, 0)
+        back = cv2.perspectiveTransform(img[None], h)[0]
+        _table_err_m = float(np.max(np.hypot(*(back - tab).T)))
+        if _table_err_m > 0.015:
+            logger.warning("loose pick: camera->table mapping is off by up to %.1f cm "
+                           "-- disabled (recalibrate?)", 100 * _table_err_m)
+            return False
+        _table_h = h
+        logger.warning("loose pick: camera->table mapping fitted on %d squares, "
+                       "max error %.1f mm", len(pairs), 1000 * _table_err_m)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("loose pick: mapping failed: %s", e)
+        return False
+
+
+def _pose_at_pixel(px, label: str):
+    """(pose, distance to nearest taught square in m, that square) for the
+    table point under pixel *px*, or None."""
+    import numpy as np
+    import cv2
+    if robotarm.ned is None or not cam:
+        return None
+    if _table_h is None or _table_for is not cam.positions:
+        globals()["_table_for"] = cam.positions
+        if not fit_table_mapping():
+            return None
+    x, y = cv2.perspectiveTransform(np.float32([[px]]), _table_h)[0][0]
+    poses = {t: p for t, p in robotarm.ned.get_poses().items() if t in cam.positions}
+    if not poses:
+        return None
+    near_t, near = min(poses.items(), key=lambda kv: (kv[1].x - x) ** 2 + (kv[1].y - y) ** 2)
+    pose = near.copy_with_offsets(x_offset=float(x) - near.x, y_offset=float(y) - near.y)
+    pose.metadata = near.metadata
+    return pose, float(np.hypot(near.x - x, near.y - y)), near_t
+
+
+def adjusted_box_pose(tag: str):
+    """For a candy IN box *tag*: the taught pose shifted to where the camera
+    sees the candy, when it lies 8 mm - 3 cm off-centre. Otherwise None
+    (use the taught pose)."""
+    if not loose_pick or not cam or tag not in getattr(cam, "seen_px", {}):
+        return None
+    try:
+        r = _pose_at_pixel(cam.seen_px[tag], tag)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pick adjust: %s failed: %s", tag, e)
+        return None
+    if r is None:
+        return None
+    pose, d, near_t = r
+    taught = robotarm.ned.get_pose(tag)
+    import math
+    off = math.hypot(pose.x - taught.x, pose.y - taught.y)
+    if off < 0.008 or off > 0.03:      # below 8 mm is mapping noise
+        if off > 0.03:
+            logger.warning("pick adjust: %s seen %.1f cm off its box -- using the taught pose", tag, 100 * off)
+        return None
+    pose = taught.copy_with_offsets(x_offset=pose.x - taught.x, y_offset=pose.y - taught.y)
+    pose.metadata = taught.metadata
+    logger.warning("pick adjust: %s candy is %.1f cm off-centre -- gripping where it lies", tag, 100 * off)
+    return pose
+
+
+def loose_pose(tag: str):
+    """Arm pose to pick the loose candy *tag*, or None if unsafe/unknown:
+    the nearest taught square's pose (height and gripper angle), moved to
+    the candy's x/y -- only within 8 cm of a taught square."""
+    import numpy as np
+    import cv2
+    if not cam or tag not in cam.loose or robotarm.ned is None:
+        return None
+    if _table_h is None or _table_for is not cam.positions:
+        # Fitted lazily: the arm object only exists after service_init, and
+        # a recalibration replaces cam.positions.
+        globals()["_table_for"] = cam.positions
+        if not fit_table_mapping():
+            return None
+    px = cam.loose[tag]
+    x, y = cv2.perspectiveTransform(np.float32([[px]]), _table_h)[0][0]
+    poses = {t: p for t, p in robotarm.ned.get_poses().items() if t in cam.positions}
+    if not poses:
+        return None
+    near_t, near = min(poses.items(), key=lambda kv: (kv[1].x - x) ** 2 + (kv[1].y - y) ** 2)
+    d = float(np.hypot(near.x - x, near.y - y))
+    if d > 0.08:     # the middle between 4 squares is ~6.3 cm from each
+        logger.warning("loose pick: %s at (%.3f, %.3f) is %.1f cm from the nearest square "
+                       "%s -- refused", tag, x, y, 100 * d, near_t)
+        return None
+    pose = near.copy_with_offsets(x_offset=float(x) - near.x, y_offset=float(y) - near.y)
+    pose.metadata = near.metadata
+    logger.warning("loose pick: %s -> (%.3f, %.3f), %.1f cm from %s", tag, x, y, 100 * d, near_t)
+    return pose
+
+
+def planned_scene() -> dict:
+    """The board as it will be once the queued moves are done: the camera's
+    view with every queued, running or just-finished move applied. A second
+    move in the same breath ("a Dumle and a Marianne") is checked against
+    this, not against a picture that still shows the first candy in place."""
+    scene = scene_state.get_scene()
+    for s, d in ned_pending_moves():
+        candy = scene.pop(s, None)
+        if candy is not None and d != "O0":
+            scene[d] = candy
+    return scene
 
 @mcp.tool()
 def default_action() -> str:
@@ -188,7 +389,7 @@ def _run_mcp_server(args):
 
 
 def main():
-    global use_robot, robot_ip, cam, scene_logger
+    global use_robot, robot_ip, cam, scene_logger, loose_pick
 
     parser = argparse.ArgumentParser(description=mcp.name)
     parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
@@ -203,6 +404,9 @@ def main():
                         help="Table-camera index, or part of its name (e.g. 'brio', 'hp'). "
                              "Names survive replugging; indices do not. Default: auto-detect.")
     parser.add_argument('--no-window', action='store_true', help='Disable the OpenCV display window')
+    parser.add_argument('--loose-pick', action='store_true',
+                        help='Also pick candy lying OUTSIDE the boxes (on the board), from its '
+                             'camera coordinate. Test carefully on the real arm first.')
     parser.add_argument('--log-scenes-dir', default=None, help='If set, log every scene request (annotated camera frame + returned state) to this directory')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
     args = parser.parse_args()
@@ -265,35 +469,100 @@ def main():
     if camera_index is None:
         camera_index = 0  # fallback for simulation mode
 
+    # Status lines for the operator (and the launcher, which parses them).
+    # Always flushed: stdout is a pipe when the launcher runs us.
+    import time
+
+    def status(msg: str) -> None:
+        print(f"[candytron] {msg}", flush=True)
+
+    # Robot status. The arm is connected lazily, when the client calls
+    # service_init(); wrap init_ned so that moment is visible.
+    global init_ned
+    _init_ned = init_ned
+
+    def init_ned(use_robot=True, robot_ip=None):
+        where = robot_ip or ned2_default_ip()
+        status(f"connecting to robot at {where}" if use_robot else "robot: simulated")
+        try:
+            _init_ned(use_robot=use_robot, robot_ip=robot_ip)
+        except Exception as e:
+            status(f"robot FAILED: {type(e).__name__}: {e}")
+            raise
+        status("robot ready" if use_robot else "robot ready (simulated)")
+
     # Initialize camera
+    status(f"table camera {'simulated' if simulate_camera else camera_index}: "
+           f"opening camera + loading YOLO model")
     cam = CameraManager(
         camera_index=camera_index,
         show_window=not args.no_window,
         simulate=simulate_camera,
     )
+    loose_pick = bool(args.loose_pick)
+    cam.loose_pick = loose_pick
+    if loose_pick:
+        status("loose pick ON: candy outside the boxes can be picked from its coordinate")
     try:
         cam.init_cam()
     except RuntimeError as e:
         logger.error("Camera initialization failed: %s", e)
+        status(f"table camera FAILED: {e}")
         sys.exit(1)
     logger.info("Initialized camera and YOLO model%s", " (simulated)" if simulate_camera else "")
+    status(f"table camera ready{' (simulated)' if simulate_camera else f' (index {camera_index})'}")
+
+    # Recalibration trigger: 'c' in the table-camera window, or this flag
+    # file (the launcher's "Recalibrate" button touches it).
+    recal_flag = os.environ.get("CANDYTRON_RECALIBRATE_FLAG", "/tmp/candytron-recalibrate")
+    try:
+        os.remove(recal_flag)   # stale request from an earlier run
+    except OSError:
+        pass
+
+    def calibrate(timeout_s=None) -> bool:
+        """Retry until 4 corner candies are seen. Prints a progress line about
+        once a second. Returns False on timeout; exits on 'q'. A previous
+        calibration stays in force until a new one succeeds."""
+        status("calibrating: place ONE candy in each of the 4 corners "
+               "(A1, A3, D1, D3) and nothing else on the board -- or clear the "
+               "board completely (then the printed boxes are used)")
+        t0 = last = time.monotonic()
+        while True:
+            if cam.calibrate_positions(3, 4):
+                for w in cam.calibration_warnings:
+                    status(f"calibration WARNING: {w}")
+                how = ("from the 12 printed boxes (empty board)"
+                       if getattr(cam, "calibration_method", "") == "boxes" else
+                       f"from the 4 corner candies, {getattr(cam, 'last_box_count', 0)} "
+                       f"squares snapped to their printed boxes")
+                status(f"calibrated ({len(cam.camera_positions())} positions, {how})")
+                return True
+            now = time.monotonic()
+            if now - last >= 1.0:
+                last = now
+                n = cam.last_detection_count
+                if n == -4:
+                    status("calibrating: 4/4 candies seen but they are NOT in the 4 corners "
+                           "-- move them to A1, A3, D1, D3, or clear the board")
+                    n = 4
+                hint = ("remove extra candies" if n > 4 else
+                        "one in each corner, or none at all")
+                if n == 0:
+                    hint += f"; {getattr(cam, 'last_box_count', 0)}/12 printed boxes seen"
+                status(f"calibrating: {n}/4 candies seen (need exactly 4, {hint}) "
+                       f"[{now - t0:.0f}s]")
+            if timeout_s is not None and now - t0 > timeout_s:
+                status("recalibration gave up - keeping the previous calibration")
+                return False
+            if cam.check_event(wait_ms=200):
+                logger.info("User cancelled calibration")
+                status("calibration cancelled ('q')")
+                cam.exit_cam()
+                sys.exit(0)
 
     # Calibration loop — retries until success or user presses 'q'
-    attempt = 0
-    while True:
-        if cam.calibrate_positions(3, 4):
-            if attempt > 0:
-                print()  # newline after dots
-            break
-        attempt += 1
-        if attempt % 50 == 0:
-            print(f"\nCalibrating... ({attempt} attempts). Place 4 candies in the corners.")
-        elif attempt % 10 == 0:
-            print(".", end="", flush=True)
-        if cam.check_event(wait_ms=200):
-            logger.info("User cancelled calibration")
-            cam.exit_cam()
-            sys.exit(0)
+    calibrate()
 
     # Register cleanup for robot shutdown
     atexit.register(exit_ned)
@@ -302,6 +571,7 @@ def main():
     mcp_thread = threading.Thread(target=_run_mcp_server, args=(args,), daemon=True)
     mcp_thread.start()
     logger.info("MCP server started on %s:%d (%s)", args.host, args.port, args.transport)
+    status(f"MCP server starting on {args.host}:{args.port}")
 
     # Main thread: continuous camera refresh loop (~5 fps)
     logger.info("Starting continuous camera refresh loop")
@@ -309,9 +579,20 @@ def main():
         while True:
             scene = cam.grab_and_detect()
             scene_state.update(scene)
-            if cam.check_event(wait_ms=200):
+            key = cam.poll_key(wait_ms=200)
+            if key == 'q':
                 logger.info("User requested exit via 'q' key")
                 break
+            recal = key == 'c'
+            if os.path.exists(recal_flag):
+                try:
+                    os.remove(recal_flag)
+                except OSError:
+                    pass
+                recal = True
+            if recal:
+                status("recalibration requested")
+                calibrate(timeout_s=120)
     except KeyboardInterrupt:
         logger.info("Shutting down (KeyboardInterrupt)")
     finally:

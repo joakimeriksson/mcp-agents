@@ -125,6 +125,7 @@ def resolve_camera(spec, max_index: int = 6):
         return next((n for j, n in named if j == i), "")
 
     order = []
+    explicit = spec is not None and str(spec).strip() not in ("", "-1")
     if isinstance(spec, str) and spec.strip() and not spec.strip().lstrip("-").isdigit():
         want = spec.strip().lower()
         order = [i for i, n in named if want in n.lower()]
@@ -139,7 +140,12 @@ def resolve_camera(spec, max_index: int = 6):
         except (TypeError, ValueError):
             pass
 
-    order += [i for i in range(max_index) if i not in order]
+    if not explicit:
+        order += [i for i in range(max_index) if i not in order]
+    # An explicitly requested camera that is gone must NOT fall back to "the
+    # first camera that works": when an iPhone Continuity Camera disappears
+    # the indices shift, and the fallback handed the people camera the TABLE
+    # camera -- the robot then waited forever for a face. Fail loudly instead.
     for idx in order:
         cap = cv2.VideoCapture(idx)
         if not cap.isOpened():
@@ -152,5 +158,11 @@ def resolve_camera(spec, max_index: int = 6):
         logger.warning(f"Camera {idx}{f' ({_named(idx)})' if _named(idx) else ''} "
                        f"opened but is black — skipping")
         cap.release()
-    logger.error("No working camera found")
+    if explicit:
+        logger.error(f"Camera {spec!r} is not available (or only black). Camera "
+                     f"numbers change when an iPhone connects or disconnects as a "
+                     f"Continuity Camera: pick the camera again in the launcher. "
+                     f"Now available: {[f'{i}: {n}' for i, n in named] or 'unknown'}")
+    else:
+        logger.error("No working camera found")
     return None, -1, ""

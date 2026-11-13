@@ -65,11 +65,14 @@ def _git_commit_short() -> str | None:
         return None
 
 default_lang = "sv"
-messages_trunclen = 8
+messages_trunclen = 3   # short: long histories made gemma4 copy its own bad turns
 messages = []
 state = {'evtime': 0, 'statetime': 0, 'newstate': None, 'currstate': None}
 omit_names_and_prefs = False
 talk_to_unknown = True   # greet faces the DB doesn't know yet
+expressive = False       # [voice] expressive: style tags + jokes (VoxCPM2)
+cfg_ear = "gemma4"       # [llm] ear: gemma4 | whisper
+express_tool = False     # [voice] express_tool: mood via an express() tool, not inline tags
 
 muted = False
 
@@ -92,8 +95,11 @@ class Person:
 persondict = {}
 
 curr_person = None
+last_greeting_at = 0.0     # time.time() of the last greeting
+REGREET_SECONDS = 20.0     # no new greeting this soon after the last one
 
 curr_prompt = ""
+curr_audio = None   # the utterance that started the current turn (direct-audio)
 
 win: EyeWindow | None = None
 cam_win: CameraWindow | None = None
@@ -193,6 +199,18 @@ def parse_args():
                         help='Seconds into a turn with nothing said yet before a thinking filler '
                              '("Hmm…", "Mm, vänta lite…") plays; only voices the TTS server has '
                              'fillers for (its --vox-voice voices). Negative = never.')
+    parser.add_argument('--expressive', dest='expressive', action='store_true', default=None,
+                        help='Playful voice: style tags ([skrattar], [glad] ...) acted out by '
+                             'VoxCPM2, light jokes (default from config [voice] expressive)')
+    parser.add_argument('--ear', choices=['gemma4', 'whisper'], default=None,
+                        help='Direct-audio: who hears the speech. whisper = Whisper (MLX, GPU) '
+                             'transcribes and gemma4 answers the text; gemma4 = audio into gemma4 '
+                             '(default from config [llm] ear)')
+    parser.add_argument('--express-tool', dest='express_tool', action='store_true', default=None,
+                        help='Expressive mood via a local express(mood) tool call instead of '
+                             'inline [tags] (direct-audio only; default from config [voice] express_tool)')
+    parser.add_argument('--no-expressive', dest='expressive', action='store_false',
+                        help='Plain voice, no style tags or jokes')
     parser.add_argument('--detect-fps', type=int, default=6,
                         help='Max face-detection rate (Hz). Lower = far less memory '
                              '(InsightFace/onnxruntime leaks ~40MB per inference on this build).')
@@ -237,7 +255,9 @@ def extract_language(info):
                  "Francaise": "fr",
                  "Spanish": "es",
                  "Espanol": "es",
-                 "Español": "es"}
+                 "Español": "es",
+                 "Italian": "it",
+                 "Italiano": "it"}
     s = extract_value("Language:", info)
     if s:
         for l in languages:
@@ -382,24 +402,31 @@ def on_face_change(id):
         curr_person.lasttime = time.time()
         if not omit_names_and_prefs and curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
             curr_person.lastmessages = messages
-            info = distill_user_info(extract_dialog_messages(messages))
-            name = extract_value("Name:", info)
-            if name:
-                curr_person.name = name
-                if voice_db is not None and prev_face_id:
-                    voice_db.mark_named(prev_face_id)   # eligible for opt-in persistence
-            lang = extract_language(info)
-            if lang:
-                curr_person.lang = lang
-            pref = extract_value("Preferences:", info)
-            if pref:
-                curr_person.profileinfo = pref
-            _ilog("person_distillation",
-                  face_id=prev_face_id,
-                  raw_summary=info,
-                  parsed_name=name,
-                  parsed_lang=lang,
-                  parsed_preferences=pref)
+            target_person = curr_person
+            msgs_to_distill = list(messages)
+            def _async_distill():
+                try:
+                    info = distill_user_info(extract_dialog_messages(msgs_to_distill))
+                    name = extract_value("Name:", info)
+                    if name:
+                        target_person.name = name
+                        if voice_db is not None and prev_face_id:
+                            voice_db.mark_named(prev_face_id)   # eligible for opt-in persistence
+                    lang = extract_language(info)
+                    if lang:
+                        target_person.lang = lang
+                    pref = extract_value("Preferences:", info)
+                    if pref:
+                        target_person.profileinfo = pref
+                    _ilog("person_distillation",
+                          face_id=prev_face_id,
+                          raw_summary=info,
+                          parsed_name=name,
+                          parsed_lang=lang,
+                          parsed_preferences=pref)
+                except Exception as e:
+                    logger.warning("person distillation failed: %s", e)
+            threading.Thread(target=_async_distill, daemon=True).start()
         else:
             print("(Nothing new to extract)")
     if id is None:
@@ -435,18 +462,33 @@ def on_face_change(id):
         state['evtime'] = time.time()
         if curr_person.lasttime and state['evtime'] - curr_person.lasttime < 60:
             state['newstate'] = 'listen'
+        elif state['evtime'] - last_greeting_at < REGREET_SECONDS:
+            # Focus jumped to another face (or the same face got a new track)
+            # seconds after a greeting: greeting again sounds broken. A group
+            # standing together gets one greeting; just keep listening.
+            logger.info("Focus changed %.0fs after a greeting: listening, not re-greeting",
+                        state['evtime'] - last_greeting_at)
+            state['newstate'] = 'listen'
         else:
             state['newstate'] = 'greet'
 
 def on_speech(txt):
-    global curr_prompt, state
+    global curr_prompt, curr_audio, state
     if muted:
         return
     logger.info("Speech event")
     if state['newstate'] == 'exit':
         return
+    if curr_person is None:
+        # Nobody in focus (they walked away, or never came): whoever is
+        # talking in the room is not our visitor.
+        logger.info("Speech ignored: nobody in focus")
+        return
     if state['currstate'] == 'listen' and (state['newstate'] is None or state['newstate'] == 'listen'):
         curr_prompt = txt
+        # Keep THIS utterance for the turn. Reading voice_in.last_audio later,
+        # when the turn is processed, can pick up a different capture.
+        curr_audio = voice_in.last_audio if voice_in is not None else None
         if voice_db is not None and voice_in is not None and voice_in.last_audio is not None:
             # Fetch the speaker embedding in parallel with everything else the
             # turn does (LLM, scene fetch); the gate collects it just before
@@ -507,6 +549,11 @@ def set_state(state, newstate):
     if prev != newstate:
         _ilog("state_change", **{"from": prev, "to": newstate})
 
+def visitor_left() -> bool:
+    """True once the person this turn is for walked away or someone else took
+    focus: stop talking to them instead of finishing the reply."""
+    return state.get('newstate') in ('wait', 'greet', 'exit')
+
 def set_win_state(newstate):
     win.set_state('muted' if muted else newstate)
     win.check_events()
@@ -545,6 +592,12 @@ def map_tool_definition(f):
         }
         return tool_param
 
+# [voice] expressive: the voice server acts out style tags with VoxCPM2, so
+# the robot can laugh and whisper instead of reading everything flat.
+import prompts   # face/prompts.py: editable live from the launcher
+EXPRESSIVE_PROMPT = prompts.EXPRESSIVE   # default; prompts.get("expressive") is what is used
+
+
 async def system_message(client, lang):
     if has_sysprompt:
         if has_sysprompt_lang:
@@ -573,32 +626,125 @@ def user_message(prompt):
     return {"role": "user", "content": prompt}
 
 def _text_history(mlst, max_turns):
-    """Recent user/assistant turns as plain dicts (for the direct-audio call).
-    Skips tool traffic and works for both dict and OpenAI message objects."""
+    """Recent turns as plain dicts for the direct-audio call: user/assistant
+    text AND the arm calls of direct turns (assistant tool_calls + tool
+    results). With text only, the model saw "Här är din Dumle!" answered
+    with words alone and stopped calling the tool (0/4 requests moved in a
+    test; 4/4 with the calls kept). Works for dicts and OpenAI objects."""
     out = []
     for m in mlst:
-        role = m.get('role') if isinstance(m, dict) else getattr(m, 'role', None)
-        content = m.get('content') if isinstance(m, dict) else getattr(m, 'content', None)
+        if isinstance(m, dict):
+            role = m.get('role')
+            if role == 'assistant' and m.get('tool_calls'):
+                out.append({'role': 'assistant', 'content': str(m.get('content') or ''),
+                            'tool_calls': m['tool_calls']})
+                continue
+            if role == 'tool' and m.get('tool_name'):
+                out.append({'role': 'tool', 'tool_name': m['tool_name'],
+                            'content': str(m.get('content') or '')})
+                continue
+            content = m.get('content')
+        else:
+            role, content = getattr(m, 'role', None), getattr(m, 'content', None)
+        if role == 'assistant' and content and has_tool_text(str(content)):
+            continue   # a tool call written as text: never let the model copy it
         if role in ('user', 'assistant') and content:
             out.append({'role': role, 'content': str(content)})
-    return out[-2 * max_turns:]
+    users = [i for i, m in enumerate(out) if m['role'] == 'user']
+    if len(users) > max_turns:
+        out = out[users[-max_turns]:]
+    return out
 
-def _direct_transcribe(audio, user_msg, lang):
+_print_lock = threading.Lock()
+
+# Console transcript, one block per turn:
+#   User:   (sv, 2.1s) Kan jag få en Dumle?
+#   Agent:  (sv) Här är din Dumle!   [0.62s]
+#   Action: move between D1 and O0  (started)
+
+def action_line(name, args, result=None, refused=None) -> str:
+    """One 'Action:' line for a tool call and what the arm said about it."""
+    args = args if isinstance(args, dict) else {}
+    if name == "default_action":
+        return "  Action: <no action>"
+    what = (policy.describe_call(name, args)
+            or f"{name} {json.dumps(args, ensure_ascii=False)}")
+    r = (refused or result or "").strip()
+    if refused or r.startswith("Refused"):
+        outcome = "REFUSED: " + r.removeprefix("Refused:").strip()[:90]
+    elif r.startswith(("Started", "Successfully")):
+        outcome = "started"
+    elif r.startswith("Queued"):
+        m = re.search(r"after (\d+)", r)
+        outcome = f"queued after {m.group(1)} earlier move(s)" if m else "queued"
+    else:
+        outcome = r[:90] or "no answer"
+    return f"  Action: {what}  ({outcome})"
+
+def actions_block(calls=(), rejected=()) -> list:
+    lines = [action_line(n, a, refused=r) for n, a, r in rejected]
+    lines += [action_line(n, a, result=r) for n, a, r in calls]
+    return lines or ["  Action: <no action>"]
+
+def scene_line(text):
+    """The service's state in one line (CandyTron: 'Scene: A1 Dumle · ...')."""
+    line = policy.state_line(text)
+    return f"  {line}" if line else None
+
+def _calls(seq) -> list:
+    """[(name, args, result)] -> JSON-able dicts for the session log."""
+    return [{"name": n, "arguments": a, "result": r} for n, a, r in seq or ()]
+
+def emit_turn(lines, **record):
+    """Print a turn block, append it to the readable transcript next to the
+    session log (<session>.txt), and log it as one structured 'turn' event."""
+    lines = [l for l in lines if l]
+    with _print_lock:
+        print("\n" + "\n".join(lines))
+        path = getattr(interaction_log, "path", None)
+        if path:
+            try:
+                with open(os.path.splitext(path)[0] + ".txt", "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%H:%M:%S") + "\n" + "\n".join(lines) + "\n\n")
+            except OSError as e:
+                logger.warning("transcript write failed: %s", e)
+    _ilog("turn", **record)
+
+def _direct_transcribe(audio, user_msg, lang, turn_lines=(), turn_info=None):
     """Background: transcribe the utterance for the history/log (the reply
-    was already produced straight from the audio)."""
+    was already produced straight from the audio), then print the whole turn
+    in reading order -- what was heard, what the arm did, what was said.
+    Printing the reply first and the transcript whenever it arrived put them
+    in the wrong order, sometimes in the middle of the next turn."""
+    info = None
     try:
-        tr = direct_llm.transcriber
-        tr.language_hint = lang
-        segs, info = tr.transcribe(audio)
-        text = "".join(seg.text for seg in segs).strip()
+        heard = (turn_info or {}).get("whisper_heard")
+        if heard is not None:
+            # Whisper already transcribed it for the reply: that IS what was heard.
+            from types import SimpleNamespace
+            text = heard.text or f"({heard.reason})"
+            info = SimpleNamespace(language=heard.language or lang)
+        else:
+            tr = direct_llm.transcriber
+            tr.language_hint = lang
+            segs, info = tr.transcribe(audio)
+            text = "".join(seg.text for seg in segs).strip()
     except Exception as e:
         logger.warning("background transcription failed: %s", e)
         text = ""
     user_msg['content'] = text or "(unintelligible audio)"
-    print(f"\n  Heard: ({info.language or lang if text else '?'}) {text}")
-    _ilog("user_transcript", content=text, lang=(info.language if text else "") or lang)
+    heard_lang = (getattr(info, "language", "") if text else "") or lang
+    seconds = len(audio) / 16000.0
+    info_ = dict(turn_info or {})
+    scene = info_.pop("scene_line", None)
+    emit_turn([scene, f"  User:   ({heard_lang}, {seconds:.1f}s) {text or '(unintelligible)'}",
+               *turn_lines],
+              kind="speech", user=text, user_lang=heard_lang,
+              user_seconds=round(seconds, 2), **info_)
+    _ilog("user_transcript", content=text, lang=heard_lang)
 
 KNOWN_LANGS = ('en', 'sv', 'de', 'fr', 'es', 'it')
+SWITCH_MIN_SECONDS = 1.6    # a shorter utterance can't switch the conversation language
 LANG_SWITCH_MIN_WORDS = 4   # a shorter utterance can't flip the conversation language
 LANG_SWITCH_TURNS = 2       # ...and it takes this many consecutive turns to flip
 # Pending language switch: {lang, count}. Module state so a single stray turn
@@ -658,25 +804,32 @@ def choose_language(current, detected, text):
 def language_message(lang):
     languages = { "en": "English",
                   "sv": "Swedish",
-                  "de": "Deutch",
+                  "de": "German",
                   "fr": "French",
-                  "es": "Spanish"}
+                  "es": "Spanish",
+                  "it": "Italian"}
     if not lang in languages:
         lang = 'en'
     reply_language = languages[lang]
     msg = f"Reply in {reply_language}!"
     return {"role": "system", "content": msg}
 
+# Greetings must be SHORT: the visitor is waiting, and a long introduction of
+# the whole exhibition was the first thing people heard at the fair.
+def _greet_rule() -> str:
+    # editable live in the panel; else the service's own, else the generic one
+    return " " + prompts.get("greeting", policy.greeting())
+
 def greet_prompt_noname():
     if curr_person.lasttime is None:
-        return {'role':'user', 'content':'There is a new person in front of you. Produce a suitable greeting.'}
+        return {'role':'user', 'content':'A new person just stepped up to you.' + _greet_rule()}
     else:
         duration = int((time.time() - curr_person.lasttime) / 60)
-        return {'role':'user', 'content': f'A person has appeared in front of you. It was {duration} minutes since you last met. Produce a suitable greeting.'}
+        return {'role':'user', 'content': f'A person you met {duration} minutes ago just came back.' + _greet_rule()}
    
 def greet_prompt():
     if not curr_person.name and not curr_person.lasttime:
-        return {'role':'user', 'content':'There is a new person in front of you. Produce a greeting and ask for the name.'}
+        return {'role':'user', 'content':'A new person just stepped up to you. Greet them in ONE short sentence and ask for their name.'}
     if curr_person.lasttime is None: # This alternative was added by Claude but it should actually never happen
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. Produce a suitable greeting.'}
     duration = int((time.time() - curr_person.lasttime) / 60)
@@ -685,6 +838,49 @@ def greet_prompt():
         return {'role':'user', 'content': f'A person has appeared in front of you. {pref} It was {duration} minutes since you last met, but you still dont know the name. Produce a suitable greeting and ask for the name.'}
     else:
         return {'role':'user', 'content': f'The person {curr_person.name} has appeared in front of you. {pref} It was {duration} minutes since you last met. Produce a suitable greeting.'}
+
+
+# gemma4 sometimes WRITES a tool call as text ("movebetween{dst: O0,src: C1}
+# [sv] Här är din Snickers.") instead of calling it. The arm never moved, the
+# text went into the history, and every later turn copied it. Execute such a
+# call for real and keep only the prose (same recovery as face/direct_llm.py).
+from direct_llm import (has_tool_text, set_known_tools, _text_tool_calls,
+                        _strip_tool_text, _split_lang)
+from service_policy import GENERIC, load_policy
+
+# The connected service's client-side policy (face/service_policy.py), loaded
+# from its url://client_policy at startup; generic until then.
+policy = GENERIC
+service_rules = ""   # the service's get_service_rules text
+from types import SimpleNamespace
+
+
+def recover_text_tool_calls(message, tools):
+    """(message-like, history-entry) with text-written calls made real."""
+    content = message.content or ""
+    if message.tool_calls or not tools or not has_tool_text(content):
+        return message, message
+    names = [t["function"]["name"] for t in tools]
+    calls, seen = [], set()
+    for c in _text_tool_calls(content, names, policy.not_recovered):
+        key = (c["function"]["name"], json.dumps(c["function"]["arguments"], sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            calls.append(c)
+    text = _split_lang(_strip_tool_text(content), "")[1]
+    logger.warning(f"classic: model wrote tool call(s) as text: {content[:80]!r} -> {calls}")
+    tcs = [SimpleNamespace(id=f"textcall_{i}", type="function",
+                           function=SimpleNamespace(name=c["function"]["name"],
+                                                    arguments=json.dumps(c["function"]["arguments"])))
+           for i, c in enumerate(calls)]
+    msg = SimpleNamespace(content=text, tool_calls=tcs or None)
+    hist = {"role": "assistant", "content": text}
+    if tcs:
+        hist["tool_calls"] = [{"id": t.id, "type": "function",
+                               "function": {"name": t.function.name,
+                                            "arguments": t.function.arguments}} for t in tcs]
+    return msg, hist
+
 
 def compose_messages(sysp, mlst, augs):
     n = 0
@@ -755,7 +951,8 @@ async def main(args):
     global has_init
     global has_exit
     global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm, voice_db, speaker_client, _voice_pool
-    global curr_prompt
+    global curr_prompt, curr_audio, last_greeting_at
+    global policy, service_rules
 
     # Connect via SSE to the MCP server
     async with Client(transport=SSETransport(args.server)) as client:
@@ -773,9 +970,9 @@ async def main(args):
             elif res.name == 'service_exit':
                 has_exit = True
         
-        prompts = await client.list_prompts()
+        mcp_prompt_list = await client.list_prompts()
         print("\nAvailable prompts:")
-        for prompt in prompts:
+        for prompt in mcp_prompt_list:
             print(prompt)
             if prompt.name == 'get_service_prompt':
                 has_sysprompt = True
@@ -793,7 +990,26 @@ async def main(args):
         for tool in tools:
             print(tool)
         tools = [map_tool_definition(tool) for tool in tools]
+        set_known_tools([t["function"]["name"] for t in tools] + ["express", "default_action"])
         print("\n")
+
+        # What this client needs to know about the service beyond its tools
+        # (see face/service_policy.py). Optional: a service without them gets
+        # the generic behaviour.
+        if any(r.name == 'client_policy' for r in ress):
+            try:
+                res = await client.read_resource("url://client_policy")
+                policy = load_policy(res[0].text)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"client_policy not readable: {e}")
+        if any(p.name == 'get_service_rules' for p in mcp_prompt_list):
+            try:
+                pr = await client.get_prompt("get_service_rules", {"lang": "en"})
+                service_rules = pr.messages[0].content.text
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"get_service_rules failed: {e}")
+        print(f"Service policy: {type(policy).__name__}"
+              f"{', with service rules' if service_rules else ''}")
 
         make_nonblocking(sys.stdin)
 
@@ -884,9 +1100,8 @@ async def main(args):
         if not voice_in.ready:
             print('Failed to load whisper model')
             return False
-        listener = ContinuousListener(voice_in)
+        listener = ContinuousListener(voice_in, start_paused=True)   # passive until a visitor is in focus
         listener.start()
-        listener.paused = True
         voice_in.language_hint = default_lang
         print('Continuous listener started')
 
@@ -917,8 +1132,22 @@ async def main(args):
             # asyncio.run(), which is not allowed inside this running loop.
             direct_llm = await asyncio.to_thread(
                 DirectAudioLLM, model=args.llm_model, host=ollama_host,
-                agent_name=name, tools_url=args.server)
+                agent_name=name, tools_url=args.server, policy=policy)
+            direct_llm.service_rules = service_rules
             direct_llm.transcriber.check()   # fail fast if the model can't hear
+            print(f'Loading {args.llm_model} into memory (kept loaded for the whole session)...')
+            await asyncio.to_thread(direct_llm.warm)
+            try:
+                # Whisper on the GPU picks the reply language (gemma4's ear
+                # takes short Swedish for English). Falls back silently.
+                from lang_id import LanguageID
+                direct_llm.lang_id = LanguageID()
+                direct_llm.lang_id.warm()
+                direct_llm.ear = args.ear or cfg_ear
+                print(f'Ear: {direct_llm.ear}')
+                print(f'Language id: {direct_llm.lang_id._repo} (loading in the background)')
+            except Exception as e:  # noqa: BLE001
+                print(f'Language id unavailable ({e}); gemma4 picks the language itself')
             if not direct_llm._tools:
                 print('WARNING: direct-audio mode loaded no tools from the server')
             print(f'Direct-audio mode: speech goes straight into {args.llm_model} '
@@ -982,14 +1211,16 @@ async def main(args):
         def _on_face_event(ev):
             if ev.type == FaceEventType.FOCUS_CHANGED:
                 tid = ev.payload.new_track_id
-                focus_state["track_id"] = tid
+                focus_state["track_id"] = tid if tid else None
                 pid = ev.payload.new_person_id
-                if pid is None and tid is not None and talk_to_unknown:
+                if pid is None and tid and talk_to_unknown:
                     # Talk to a visitor the face DB doesn't know yet. Otherwise
                     # the robot sits in 'wait' (green eye) until auto-enrollment
                     # fires, which needs a big, sharp, frontal face -- at a stand
                     # most visitors never clear that bar and are never greeted.
                     pid = f"track:{tid}"
+                elif not tid:
+                    pid = None
                 _emit(pid)
             elif ev.type in (FaceEventType.IDENTITY_CONFIRMED,
                              FaceEventType.FACE_ENROLLED):
@@ -1024,15 +1255,37 @@ async def main(args):
               f"{f' ({cam_name})' if cam_name else ''}")
         _ilog("camera_selected", requested=args.camera, index=cam_index, name=cam_name)
 
+        cam_ref = {"cap": cap}
+
+        def _reopen_camera(reason):
+            # The iPhone camera drops out now and then, and one bad frame used
+            # to kill this loop for good. Reopen instead of dying.
+            logger.warning("people camera: %s -- reopening", reason)
+            _ilog("camera_reopen", reason=reason)
+            try:
+                cam_ref["cap"].release()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1.0)
+            new_cap, idx, name = resolve_camera(args.camera)
+            if new_cap is not None:
+                cam_ref["cap"] = new_cap
+                logger.info("people camera reopened: %s %s", idx, name or "")
+
         def _camera_loop():
             detect_interval = 1.0 / max(1, args.detect_fps)
             last_detect = [0.0]
-            try:
-                while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
-                    ret, frame = cap.read()
-                    if not ret:
+            last_ok, errors = time.time(), 0
+            while state.get('currstate') != 'exit' and state.get('newstate') != 'exit':
+              try:
+                    ret, frame = cam_ref["cap"].read()
+                    if not ret or frame is None:
+                        if time.time() - last_ok > 3.0:
+                            _reopen_camera("no frames for 3 s")
+                            last_ok = time.time()
                         time.sleep(0.05)
                         continue
+                    last_ok = time.time()
                     # Throttle detection to DETECT_FPS. onnxruntime retains
                     # ~40 MB per InsightFace inference on this build (a known
                     # leak, provider-independent), so running it at full camera
@@ -1066,10 +1319,20 @@ async def main(args):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     cam_win.set_camera_frame(rgb)
-            except Exception:
-                logger.exception("camera_loop crashed")
-            finally:
-                cap.release()
+                    errors = 0
+              except Exception as e:  # noqa: BLE001
+                    errors += 1
+                    logger.exception("camera_loop error (%d in a row)", errors)
+                    _ilog("camera_error", error_class=type(e).__name__,
+                          error_message=str(e), in_a_row=errors)
+                    if errors >= 5:
+                        _reopen_camera(f"{errors} errors in a row")
+                        errors = 0
+                    time.sleep(0.2)
+            try:
+                cam_ref["cap"].release()
+            except Exception:  # noqa: BLE001
+                pass
 
         threading.Thread(target=_camera_loop, daemon=True).start()
         print('Face tracker started')
@@ -1112,6 +1375,13 @@ async def main(args):
         pump_task = asyncio.ensure_future(_pump_ui())
 
         set_state(state, 'wait')
+        if curr_person is not None and not muted:
+            # Someone stepped up while we were still starting (connecting to
+            # the real robot takes ~20 s). Their arrival event already fired
+            # and set_state() just cleared it, and no new one comes while
+            # they stay in view -- so greet them now instead of waiting.
+            logger.info("Visitor already in focus at startup: greeting")
+            state['newstate'] = 'greet'
         newstate = False
         prompt_source = None
         while True:
@@ -1176,7 +1446,7 @@ async def main(args):
                             continue
 
                 if newstate == 'greet':
-                    if curr_person and curr_person.lang and curr_person.lang in ['en','sv','de','fr','es']:
+                    if curr_person and curr_person.lang and curr_person.lang in KNOWN_LANGS:
                         lang = curr_person.lang
                     else:
                         lang = default_lang
@@ -1185,6 +1455,10 @@ async def main(args):
                 # fetched and the reply thought up. Cancelled as soon as the
                 # reply starts; a reply that comes later waits for it.
                 filler_timer = None
+                pending_transcript = None   # (audio, msg, lang, lines), run after speaking
+                classic_calls = []          # (name, args, result) of a non-direct turn
+                turn_scene = None           # "Scene: ..." line for this turn's block
+                turn_user_line = None       # "User: ..." line of a greeting / typed turn
                 if (newstate == 'process' and not muted and voice_out is not None
                         and args.filler_delay >= 0):
                     filler_timer = threading.Timer(args.filler_delay, voice_out.filler, args=(lang,))
@@ -1197,26 +1471,43 @@ async def main(args):
                     curr_person.lang = lang
                 langprompt = language_message(lang)
                 sysprompt = await system_message(client, lang)
-                augprompt = await augmentation_message(client, lang)
+                if prompts.is_overridden("persona"):   # edited live in the launcher
+                    sysprompt["content"] = prompts.get("persona")
+                if direct_llm is None and service_rules:
+                    # Classic mode has no rules template: the service's rules
+                    # go straight after the persona.
+                    sysprompt["content"] += "\nRules:\n" + service_rules
+                if expressive:
+                    use_tool = express_tool and direct_llm is not None
+                    if direct_llm is not None:
+                        direct_llm.express_tool = use_tool
+                    sysprompt["content"] += "\n" + prompts.get(
+                        "expressive_tool" if use_tool else "expressive")
+                # Direct-audio: the scene in English (with Swedish names kept).
+                # A Swedish scene list pulled gemma4 into answering English and
+                # German speakers in Swedish (measured: 9/16 -> 12/15 right).
+                augprompt = await augmentation_message(client, 'en' if direct_llm is not None else lang)
                 augpromptlist = []
                 if augprompt:
-                    print("\n  Augmentation:")
-                    print(augprompt['content'])
+                    turn_scene = scene_line(augprompt['content'])
                     augpromptlist.append(augprompt)
                 augpromptlist.append(langprompt)
+                turn_audio = curr_audio if newstate == 'process' else None
                 direct_turn = (direct_llm is not None and newstate == 'process'
-                               and prompt == RAW_AUDIO_TEXT
-                               and voice_in is not None and voice_in.last_audio is not None)
+                               and prompt == RAW_AUDIO_TEXT and turn_audio is not None)
+                greet_stream = direct_llm is not None and newstate == 'greet'
+                turn_lines = []   # direct turns print as one block once the transcript is in
                 if direct_turn:
-                    turn_audio = voice_in.last_audio
-                    print("\n  User: (", lang, ") [audio, %.1fs]" % (len(turn_audio) / voice_in.sample_rate))
+                    # Consumed: never reuse this utterance for a later turn (#26).
+                    curr_audio = None
+                    voice_in.last_audio = None
                     _ilog("user_turn", kind="speech_audio", content="",
                           lang=lang, seconds=round(len(turn_audio) / voice_in.sample_rate, 2))
                     prompt_source = None
                     pending_user_msg = {"role": "user", "content": "(audio — transcribing)"}
                     messages.append(pending_user_msg)
                 elif newstate == 'process':
-                    print("\n  User: (", lang, ") ", prompt)
+                    turn_user_line = f"  User:   ({lang}, typed) {prompt}"
                     _ilog("user_turn", kind=prompt_source or "unknown", content=prompt, lang=lang)
                     prompt_source = None
                     messages.append(user_message(prompt))
@@ -1225,7 +1516,7 @@ async def main(args):
                         greetprompt = greet_prompt_noname()
                     else:
                         greetprompt = greet_prompt()
-                    print("\n  Greeting:", greetprompt['content'])
+                    turn_user_line = "  User:   (visitor stepped up — greeting)"
                     _ilog("user_turn",
                           kind="greet_noname" if omit_names_and_prefs else "greet",
                           content=greetprompt['content'],
@@ -1245,13 +1536,17 @@ async def main(args):
                     stream_lang = {}
 
                     def _on_sentence(sentence, s_lang, lang=lang):
+                        if visitor_left():
+                            return   # they walked away: say nothing more
                         if not stream_lang:
                             if filler_timer:
                                 filler_timer.cancel()
                             listener.paused = True
-                            stream_lang["lang"] = (
-                                choose_language(lang, s_lang, sentence)
-                                if s_lang in KNOWN_LANGS and s_lang != lang else lang)
+                            # The voice must match the language the reply is
+                            # actually written in, or a Swedish voice reads
+                            # Spanish. (Whether the CONVERSATION switches is
+                            # decided separately, with stickiness, below.)
+                            stream_lang["lang"] = s_lang if s_lang in KNOWN_LANGS else lang
                             stream_lang["thread"] = voice_out.speak_async(
                                 iter(sentence_q.get, None), stream_lang["lang"])
                         sentence_q.put(sentence)
@@ -1270,27 +1565,82 @@ async def main(args):
                     finally:
                         sentence_q.put(None)   # end of the reply for speak()
                     tts_streamed = bool(stream_lang)
-                    if tag_lang in KNOWN_LANGS and tag_lang != lang:
+                    turn_seconds = len(turn_audio) / float(voice_in.sample_rate)
+                    if (tag_lang in KNOWN_LANGS and tag_lang != lang
+                            and turn_seconds >= SWITCH_MIN_SECONDS):
                         # The model heard a language switch; trust it only on a
-                        # real sentence (the tag misfires on short turns).
+                        # real utterance (a "yeah" or a noise blip flipped the
+                        # conversation to Spanish at the fair).
                         lang = choose_language(lang, tag_lang, reply_text)
                     for _tn, _ta, _tr in getattr(direct_llm, "rejected_tool_calls", []):
-                        print(f"\n  Rejected: {_tn} ( {json.dumps(_ta)} )")
-                        print(f"  Reason:   {_tr[:90]}")
                         _ilog("tool_call_rejected", name=_tn, arguments=_ta, reason=_tr)
                     for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
-                        print(f"\n  Function: {_tn} ( {json.dumps(_ta)} )")
-                        print(f"  Result:   {_tr}")
                         _ilog("tool_call", name=_tn, arguments=_ta, result=_tr)
+                    _done = [(n, a, r) for n, a, r in getattr(direct_llm, "last_tool_calls", [])]
+                    if _done:
+                        # Keep the arm calls in the history (see _text_history).
+                        messages.append({"role": "assistant", "content": "", "tool_calls": [
+                            {"function": {"name": n, "arguments": a}} for n, a, _r in _done]})
+                        messages.extend({"role": "tool", "tool_name": n, "content": r}
+                                        for n, _a, r in _done)
                     messages.append({"role": "assistant", "content": reply_text})
                     _ilog("direct_response", content=reply_text, lang=lang,
+                          lang_id=list(getattr(direct_llm, "last_lid", (None, 0.0))),
                           tool_calls=[{"name": n, "arguments": a}
                                       for n, a, _ in getattr(direct_llm, "last_tool_calls", [])],
                           seconds=round(time.time() - t0, 2))
-                    print(f"  (direct-audio turn: {time.time() - t0:.2f}s)")
-                    threading.Thread(target=_direct_transcribe,
-                                     args=(turn_audio, pending_user_msg, lang),
-                                     daemon=True).start()
+                    turn_lines.append(f"  Agent:  ({lang}) {reply_text}   [{time.time() - t0:.2f}s]")
+                    turn_lines += actions_block(getattr(direct_llm, "last_tool_calls", []),
+                                                getattr(direct_llm, "rejected_tool_calls", []))
+                    # NOT now: the transcript is another gemma4 call, and running
+                    # it while VoxCPM2 voices the first sentence made that
+                    # sentence 3-4x slower (1.1 s -> 3.6-4.9 s, measured). It
+                    # only feeds the log and the history, so it waits until the
+                    # robot has finished speaking.
+                    pending_transcript = (turn_audio, pending_user_msg, lang, turn_lines, {
+                        "scene_line": turn_scene,
+                        "scene": augprompt['content'] if augprompt else None,
+                        "agent": reply_text, "agent_lang": lang,
+                        "reply_seconds": round(time.time() - t0, 2),
+                        "actions": _calls(getattr(direct_llm, "last_tool_calls", [])),
+                        "rejected": _calls(getattr(direct_llm, "rejected_tool_calls", [])),
+                        "whisper_heard": getattr(direct_llm, "last_heard", None),
+                    })
+                elif greet_stream:
+                    # Greeting: streamed, short, no tools -- first words well
+                    # under a second after contact.
+                    t0 = time.time()
+                    last_greeting_at = t0
+                    sentence_q = queue.Queue()
+                    stream_lang = {}
+
+                    def _on_greet_sentence(sentence, s_lang, lang=lang):
+                        if visitor_left():
+                            return
+                        if not stream_lang:
+                            listener.paused = True
+                            stream_lang["lang"] = s_lang if s_lang in KNOWN_LANGS else lang
+                            stream_lang["thread"] = voice_out.speak_async(
+                                iter(sentence_q.get, None), stream_lang["lang"])
+                        sentence_q.put(sentence)
+                    try:
+                        reply_text, _glang = await asyncio.to_thread(
+                            direct_llm.greet, messages[-1]['content'],
+                            language=lang,
+                            service_prompt=sysprompt['content'],
+                            augmentation=augprompt['content'] if augprompt else None,
+                            history=_text_history(messages[:-1], messages_trunclen),
+                            on_sentence=None if muted else _on_greet_sentence)
+                    except Exception as e:
+                        logger.exception("greeting failed")
+                        _ilog("llm_error", error_class=type(e).__name__, error_message=str(e))
+                        reply_text = ""
+                    finally:
+                        sentence_q.put(None)
+                    tts_streamed = bool(stream_lang)
+                    messages.append({"role": "assistant", "content": reply_text})
+                    _ilog("greet_response", content=reply_text, lang=lang,
+                          seconds=round(time.time() - t0, 2))
                 else:
                     iteration = 0
                     msg = compose_messages(sysprompt, messages, augpromptlist)
@@ -1321,14 +1671,23 @@ async def main(args):
                           content=response.choices[0].message.content,
                           tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
 
-                    tool_calls = response.choices[0].message.tool_calls
-                    while tool_calls:
-                        messages.append(response.choices[0].message)
+                    rmsg, rhist = recover_text_tool_calls(response.choices[0].message, tools)
+                    tool_calls = rmsg.tool_calls
+                    turn_scene_pos = policy.parse_state(augprompt['content'] if augprompt else None)
+                    while tool_calls and iteration < 4:
+                        messages.append(rhist)
                         for tool_call in tool_calls:
                             try:
                                 args_parsed = json.loads(tool_call.function.arguments)
                             except (TypeError, ValueError):
                                 args_parsed = None
+                            refusal = (policy.reject(tool_call.function.name, args_parsed, turn_scene_pos)
+                                       if isinstance(args_parsed, dict) else None)
+                            if refusal:
+                                logger.warning(f"classic: refused {tool_call.function.name}({args_parsed}): {refusal}")
+                                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                                 "content": json.dumps({"result": refusal})})
+                                continue
                             try:
                                 result = await client.call_tool(tool_call.function.name,
                                                                 json.loads(tool_call.function.arguments))
@@ -1343,8 +1702,7 @@ async def main(args):
                                     }),
                                     "tool_call_id": tool_call.id
                                 }
-                                print("\n  Function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
-                                print(  "  Result:   ", resulttxt)
+                                classic_calls.append((tool_call.function.name, args_parsed, resulttxt))
                                 _ilog("mcp_tool_call",
                                       name=tool_call.function.name,
                                       arguments=tool_call.function.arguments,
@@ -1360,7 +1718,7 @@ async def main(args):
                                     }),
                                     "tool_call_id": tool_call.id
                                 }
-                                print("\n  Unknown function: ", tool_call.function.name, "(", tool_call.function.arguments, ")")
+                                classic_calls.append((tool_call.function.name, args_parsed, "unknown function"))
                                 _ilog("mcp_tool_call",
                                       name=tool_call.function.name,
                                       arguments=tool_call.function.arguments,
@@ -1395,17 +1753,30 @@ async def main(args):
                               iteration=iteration,
                               content=response.choices[0].message.content,
                               tool_calls=_serialize_tool_calls(response.choices[0].message.tool_calls))
-                        tool_calls = response.choices[0].message.tool_calls
+                        rmsg, rhist = recover_text_tool_calls(response.choices[0].message, tools)
+                        tool_calls = rmsg.tool_calls
 
-                    # No tool calls, just print the response.
-                    messages.append(response.choices[0].message)
-                    reply_text = response.choices[0].message.content or ""
-                print(f'\n  Response: {reply_text}  (lang={lang})')
+                    # No tool calls, just print the response. Never speak or
+                    # store leftover tool syntax.
+                    reply_text = _strip_tool_text(rmsg.content or "") if has_tool_text(rmsg.content or "") else (rmsg.content or "")
+                    reply_text = _split_lang(reply_text, "")[1]
+                    messages.append({"role": "assistant", "content": reply_text})
+                if not direct_turn:
+                    emit_turn([turn_scene, turn_user_line, f"  Agent:  ({lang}) {reply_text}",
+                               *actions_block(classic_calls)],
+                              kind="greeting" if newstate == 'greet' else "text",
+                              user=None if newstate == 'greet' else prompt, user_lang=lang,
+                              agent=reply_text, agent_lang=lang,
+                              scene=augprompt['content'] if augprompt else None,
+                              actions=_calls(classic_calls))
                 if filler_timer:
                     filler_timer.cancel()
                 set_win_state('talk')
                 if not reply_text:
                     _ilog("tts_speak", text="", lang=lang, status="empty")
+                elif visitor_left() and not tts_streamed:
+                    # They walked away while the reply was being thought up.
+                    _ilog("tts_speak", text=reply_text, lang=lang, status="visitor_left")
                 elif muted:
                     _ilog("tts_speak", text=reply_text, lang=lang, status="muted_suppressed")
                 else:
@@ -1421,6 +1792,8 @@ async def main(args):
                         voice_out.speak_async(reply_text, lang)
                     if tts_thread is not None:
                         while tts_thread.is_alive():
+                            if visitor_left():
+                                voice_out.stop_speaking()   # they walked away mid-reply
                             win.check_events()
                             await asyncio.sleep(0.05)
                         if not voice_out.interrupted:
@@ -1432,8 +1805,13 @@ async def main(args):
                 # Nothing to say (noise, a muted turn) but a filler started:
                 # the mic must not reopen on our own "Hmm…".
                 while voice_out is not None and voice_out.speaking:
+                    if visitor_left():
+                        voice_out.stop_speaking()
                     win.check_events()
                     await asyncio.sleep(0.05)
+                if pending_transcript is not None:
+                    threading.Thread(target=_direct_transcribe, args=pending_transcript,
+                                     daemon=True).start()
                 if state['newstate'] is None or state['newstate']=='listen':
                     set_state(state, 'listen')
                 else:
@@ -1448,7 +1826,7 @@ async def main(args):
         print('Exiting')
 
 def run():
-    global omit_names_and_prefs, talk_to_unknown
+    global omit_names_and_prefs, talk_to_unknown, expressive, express_tool
 
     args = parse_args()
 
@@ -1501,6 +1879,11 @@ def run():
 
     omit_names_and_prefs = cfg["face"]["omit_names_and_prefs"]
     talk_to_unknown = cfg["face"].get("talk_to_unknown", True)
+    expressive = cfg["voice"].get("expressive", False) if args.expressive is None else args.expressive
+    global cfg_ear
+    cfg_ear = cfg["llm"].get("ear", "gemma4")
+    express_tool = (cfg["voice"].get("express_tool", False)
+                    if args.express_tool is None else args.express_tool)
     voice_cfg.update(cfg.get("voice_id", {}))
     if args.debug_audio is None:
         args.debug_audio = cfg["debug"].get("audio_panel", False)

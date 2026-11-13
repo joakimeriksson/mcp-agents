@@ -32,6 +32,9 @@ from events import EventDispatcher
 from reply_language import reply_language
 from sentences import split_sentences
 
+# Inline style tags ("[skrattar] Haha!") are for the voice server; Piper drops them.
+_STYLE_TAG = re.compile(r"\[[^\]\[]{1,80}\]")
+
 logger = logging.getLogger("voice_output")
 
 _SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -492,6 +495,8 @@ class VoiceOutput:
             body["voice"] = server["voice"]
         if server.get("speed"):
             body["speed"] = server["speed"]
+        if server.get("model"):
+            body["model"] = server["model"]
         # Advisory, not authoritative: the client's per-turn language
         # detection is flaky (a Swedish turn mislabeled 'it' would make the
         # server speak Swedish text through the Italian pipeline). The server
@@ -517,7 +522,7 @@ class VoiceOutput:
 
         def chunks():
             for sentence in itertools.chain([first], sentences):
-                text = self._apply_pronunciations(sentence, language)
+                text = self._apply_pronunciations(_STYLE_TAG.sub("", sentence).strip(), language)
                 for chunk in voice.synthesize(text):
                     yield chunk.audio_float_array
 

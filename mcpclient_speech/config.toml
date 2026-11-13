@@ -3,6 +3,7 @@ model    = "gemma4:latest"
 base_url = "http://localhost:11434/v1/"
 api_key  = "ollama"
 direct_audio = true    # speech straight into gemma4 (one call: hear + think + tools)
+ear = "whisper"        # whisper: Whisper (MLX) transcribes, gemma4 answers the text; gemma4: audio into gemma4
 
 [face]
 omit_names_and_prefs = true    # skip "vad heter du?" and the per-person distillation LLM call
@@ -16,7 +17,7 @@ reject        = 0.40     # cosine similarity <  : someone else (calibrated on sy
 min_seconds   = 2.0      # never decide on clips shorter than this
 
 [audio]
-near_field_ratio = 3.0   # voice must be 3x the room noise floor to count (1.0 = off)
+near_field_ratio = 2.0   # voice must be 2x the room noise floor (was 3.0, tuned for the fair hall: with the Samson it missed normal speech for 30 s)
 
 [devices]
 # Camera/mic may be an index OR part of the device name. Prefer names: an
@@ -24,6 +25,10 @@ near_field_ratio = 3.0   # voice must be 3x the room noise floor to count (1.0 =
 # one streams black frames. Run with -l (cameras) or -m (mics) to list them.
 camera     = "macbook"   # the built-in laptop camera, never the iPhone
 # microphone = 0         # uncomment to pin a microphone
+
+[voice]
+expressive = true    # experiment: playful CandyTron that laughs now and then (VoxCPM2 tags)
+express_tool = true  # mood via an express() tool call instead of inline [tags] (inline tags made gemma4 write arm calls as text)
 
 [debug]
 audio_panel = true   # VU meters + oscilloscope in the eye window

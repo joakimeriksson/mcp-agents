@@ -1024,7 +1024,10 @@ def main():
             service_prompt=service_prompt,
             augmentation_provider=service.fetch_augmentation if service else None,
             tools_url=args.service_server,
+            policy=service.fetch_policy() if service else None,
         )
+        if service:
+            direct_llm.service_rules = service.fetch_rules(get_default_language()) or ""
         direct_llm.transcriber.check()  # fail fast if the model can't hear
         logger.info("Direct-audio mode: speech goes straight into "
                     f"{args.llm_model} (background transcripts for memory)")

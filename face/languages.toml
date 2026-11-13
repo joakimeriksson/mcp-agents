@@ -22,7 +22,9 @@ default = "en"
 [languages.en]
 tts_model = "en_US-lessac-medium"    # Piper fallback if the server is down
 tts_server = "http://127.0.0.1:8880/v1/audio/speech"
-tts_voice = "af_heart"
+tts_voice = "Klara"     # one persona in every language: Klara's VoxCPM2 clone (laughs/whispers work too)
+tts_engine = "voxcpm2"  # needs the voice server's --vox-voice Klara=...; without it the server uses its own voice
+# was: tts_voice = "af_heart" (Kokoro, faster, but no expressive styles)
 
 greetings = [
     "Hello, {name}!",
@@ -82,10 +84,14 @@ favourite_music = [
 tts_model = "sv_SE-lisa-medium"    # Piper fallback if the server is down
 # Swedish Kokoro voices via kokoro-voice-server (start it on :8880).
 tts_server = "http://127.0.0.1:8880/v1/audio/speech"
-tts_voice = "Greta"
+tts_voice = "Klara"
 # Selectable live in the clients (mcpclient_speech: press 'v')
 tts_voices = ["Greta", "Alice", "Ebba", "Elsa", "Anton", "Björn", "Lars", "Nils", "Oskar", "Klara", "Viktor"]
 tts_speed = 1.3      # speech rate: <1 slower, >1 faster (0.5-2.0)
+# Experiment: speak through VoxCPM2 (the server's --vox-voice voices, e.g. Klara)
+# instead of Kokoro: livelier, can laugh and whisper; ~0.6 s a sentence on an
+# M5 Max vs ~0.3 s. Voices without a VoxCPM2 reference stay on Kokoro.
+tts_engine = "voxcpm2"
 
 greetings = [
     "Hej {name}!",
@@ -144,7 +150,9 @@ favourite_music = [
 [languages.fr]
 tts_model = "fr_FR-siwis-medium"    # Piper fallback if the server is down
 tts_server = "http://127.0.0.1:8880/v1/audio/speech"
-tts_voice = "ff_siwis"
+tts_voice = "Klara"     # one persona in every language: Klara's VoxCPM2 clone (laughs/whispers work too)
+tts_engine = "voxcpm2"  # needs the voice server's --vox-voice Klara=...; without it the server uses its own voice
+# was: tts_voice = "ff_siwis" (Kokoro, faster, but no expressive styles)
 
 greetings = [
     "Bonjour {name} !",
@@ -193,7 +201,9 @@ favourite_music = [
 [languages.es]
 tts_model = "es_ES-davefx-medium"    # Piper fallback if the server is down
 tts_server = "http://127.0.0.1:8880/v1/audio/speech"
-tts_voice = "ef_dora"
+tts_voice = "Klara"     # one persona in every language: Klara's VoxCPM2 clone (laughs/whispers work too)
+tts_engine = "voxcpm2"  # needs the voice server's --vox-voice Klara=...; without it the server uses its own voice
+# was: tts_voice = "ef_dora" (Kokoro, faster, but no expressive styles)
 
 greetings = [
     "¡Hola {name}!",
@@ -240,7 +250,10 @@ favourite_music = [
 # ── German ───────────────────────────────────────────────────────────
 
 [languages.de]
-tts_model = "de_DE-thorsten-medium"
+tts_model = "de_DE-thorsten-medium"    # Piper fallback if the server is down
+tts_server = "http://127.0.0.1:8880/v1/audio/speech"   # Kokoro has no German; Klara's VoxCPM2 clone speaks it
+tts_voice = "Klara"     # one persona in every language: Klara's VoxCPM2 clone (laughs/whispers work too)
+tts_engine = "voxcpm2"  # needs the voice server's --vox-voice Klara=...; without it the server uses its own voice
 
 greetings = [
     "Hallo {name}!",
@@ -294,7 +307,9 @@ favourite_music = [
 [languages.it]
 tts_model = "it_IT-paola-medium"    # Piper fallback if the server is down
 tts_server = "http://127.0.0.1:8880/v1/audio/speech"
-tts_voice = "if_sara"
+tts_voice = "Klara"     # one persona in every language: Klara's VoxCPM2 clone (laughs/whispers work too)
+tts_engine = "voxcpm2"  # needs the voice server's --vox-voice Klara=...; without it the server uses its own voice
+# was: tts_voice = "if_sara" (Kokoro, faster, but no expressive styles)
 
 greetings = [
     "Ciao {name}!",

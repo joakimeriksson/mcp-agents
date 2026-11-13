@@ -10,10 +10,11 @@ and TTS, not the LLM, sets the pace.
 import re
 
 # A sentence ends at . ! ? or … followed by whitespace and then something that
-# can start a sentence. Waiting for that next character costs one token but
-# keeps "t.ex. Plopp" and "kl. 3" in one piece.
+# can start a sentence: a capital, a digit, or a style tag ("[skrattar] Haha").
+# Waiting for that next character costs one token but keeps "t.ex. Plopp" and
+# "kl. 3" in one piece.
 _BOUNDARY = re.compile(
-    r"(?:(?<=[.!?…])|(?<=[.!?…][\"”»)]))\s+(?=[\"“«(]?[A-ZÅÄÖÆØÉÜ0-9¿¡])")
+    r"(?:(?<=[.!?…])|(?<=[.!?…][\"”»)]))\s+(?=\[|[\"“«(]?[A-ZÅÄÖÆØÉÜ0-9¿¡])")
 
 # Emojis and pictographs: TTS reads them aloud or chokes on them.
 _EMOJI = re.compile(

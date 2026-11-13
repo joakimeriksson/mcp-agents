@@ -1,4 +1,9 @@
-"""CandyTron's prompt texts, editable live.
+"""The voice agent's prompt texts, editable live.
+
+Only GENERIC rules live here (language tag, brevity, tools are function
+calls). How to use a particular service's tools comes from that service
+(``get_service_rules`` / ``get_service_prompt`` on its MCP server).
+
 
 The parts of the system prompt that people tune at a demo live here, with
 their defaults. Overrides go in ~/.config/candytron/prompts.json (the
@@ -33,27 +38,12 @@ Rules:
 - Tool calls are function calls, made BEFORE you speak. Never write a tool
   call, its name or its arguments as text or inside [brackets].
 {lang_rule}- Reply in 1-2 short sentences. No markdown or emojis.
-- ACT, do not narrate. If the person asks for candy, or asks you to move,
-  fetch, hand out or give anything, you MUST call the tool in THIS turn
-  before you answer. Never say "I can", "I could", "let me" or "I will" —
-  those are forbidden; call the tool and then say what you DID.
-  To hand candy to the person, move it to position O0.
-- Never say position codes (A1, D2, O0 ...) to the person; name the candy.
-- If several candies of the kind they asked for are on the table, just take any
-  one of them -- never ask which one.
-- If the candy they ask for is NOT on the table, say so and name what is there.
-  Never hand over a different candy than the one they asked for without asking.
-- A QUESTION is not a request: "what do you have / what is on the table / what
-  can you do" gets an answer and NO tool call. Only move candy when the person
-  asks for it in what they just said; earlier requests do not count.
-- But only act on what you actually HEARD. If the audio was unclear, or you
-  cannot tell WHICH candy they mean, ask them to say it again — do NOT call a
-  tool and do NOT move a random candy. A wrong move is worse than a question.
-"""
+- If the person asks for something your tools can do, call the tool in THIS
+  turn before you answer, then say what you DID. A question is not a request.
+{service_rules}"""
 
 EXPRESSIVE = """Your voice can laugh, whisper and show feelings. Be warm and playful. Now and
-then, when it fits, make a light, friendly joke about candy, robots or the
-moment.
+then, when it fits, make a light, friendly joke about robots or the moment.
 To set how a sentence sounds, START that sentence with ONE of these tags:
 [skrattar] laughing, [glad] happy and excited, [viskar] whispering (a secret),
 [tänker] thinking out loud. Example: "[sv] [glad] Vad roligt att du kom! [skrattar]
@@ -63,24 +53,24 @@ Haha, du har god smak. Här kommer en Dumle."
 - Most replies need no tag at all; never more than one tagged sentence per reply.
 - Tags are never read aloud and never go in the middle of a sentence.
 - Never let a joke delay or replace a tool call.
-- Tags are ONLY for how a sentence sounds. Moving candy is done with the tool
-  (function call), never by writing a tag or the call as text."""
+- Tags are ONLY for how a sentence sounds. Actions are done with the tools
+  (function calls), never by writing a tag or the call as text."""
 
 EXPRESSIVE_TOOL = """Your voice can laugh, whisper and show feelings. Be warm and playful. Now and
-then, when it fits, make a light, friendly joke about candy, robots or the
-moment.
+then, when it fits, make a light, friendly joke about robots or the moment.
 To set how your reply sounds, call the express tool (mood: laugh, happy,
 whisper or thinking) together with your reply. Most replies need no mood at
 all. Use laugh ONLY after something actually funny. express never replaces
-another tool: if the person wants candy, you still call move_between.
+another tool: if the person asks for an action, you still call its tool.
 Your spoken text is always plain sentences: no tags, no brackets except the
 leading language code."""
 
-GREETING = ("Greet them in ONE short sentence (at most 12 words) and ask which candy they would like. Do not describe yourself, the exhibition or the technology unless they ask.")
+# Generic; a service's policy may supply its own (CandyTron: "ask which candy").
+GREETING = ("Greet them in ONE short sentence (at most 12 words) and ask how you can help. Do not describe yourself, the exhibition or the technology unless they ask.")
 
 DEFAULTS = {
     "rules": RULES,
-    "persona": "",   # empty: the service's own persona (candytron_mcp get_service_prompt)
+    "persona": "",   # empty: the service's own persona (its get_service_prompt)
     "expressive": EXPRESSIVE,
     "expressive_tool": EXPRESSIVE_TOOL,
     "greeting": GREETING,
@@ -96,11 +86,12 @@ LABELS = {
 
 HELP = {
     "rules": "How to answer: language tag, tools, brevity, questions vs requests. "
-             "{name}, {service} (persona + scene) and {lang_rule} are filled in per turn.",
-    "persona": "Who the robot is. Empty = the persona from candytron_mcp.",
+             "{name}, {service} (persona + state), {lang_rule} and {service_rules} "
+             "(the service's own rules) are filled in per turn.",
+    "persona": "Who the robot is. Empty = the persona from the service.",
     "expressive": "Added when expressive mode is on: the [skrattar]/[glad]/[viskar]/[tänker] tags.",
     "expressive_tool": "Used instead of the above with [voice] express_tool = true: mood via the express() tool.",
-    "greeting": "Instruction for the greeting when a visitor steps up.",
+    "greeting": "Instruction for the greeting when a visitor steps up. Empty = the service's default.",
 }
 
 _lock = threading.Lock()
@@ -125,10 +116,13 @@ def overrides() -> dict:
         return dict(_cache["data"])
 
 
-def get(name: str) -> str:
-    """The text in use: the override if set, else the default."""
+def get(name: str, default: str | None = None) -> str:
+    """The text in use: the override if set, else *default* (e.g. the
+    service's own greeting), else the built-in default."""
     v = overrides().get(name)
-    return v if isinstance(v, str) and v.strip() else DEFAULTS[name]
+    if isinstance(v, str) and v.strip():
+        return v
+    return default if default else DEFAULTS[name]
 
 
 def is_overridden(name: str) -> bool:

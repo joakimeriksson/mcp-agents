@@ -54,6 +54,41 @@ def service_exit() -> bool:
     return True
 
 
+@mcp.resource("url://client_policy")
+def client_policy() -> str:
+    """Where a voice client finds CandyTron's client-side policy (empty-square
+    refusal, candy claim checks, ...): "module:Class", importable from the repo
+    root. See face/service_policy.py."""
+    return "candytron_mcp.client_policy:CandyPolicy"
+
+
+# How to use the arm -- kept apart from the persona so editing the persona in
+# the panel never drops them. Fetched by the client as get_service_rules.
+SERVICE_RULES = """- ACT, do not narrate. If the person asks for candy, or asks you to move,
+  fetch, hand out or give anything, you MUST call the tool in THIS turn
+  before you answer. Never say "I can", "I could", "let me" or "I will" --
+  those are forbidden; call the tool and then say what you DID.
+  To hand candy to the person, move it to position O0.
+- Never say position codes (A1, D2, O0 ...) to the person; name the candy.
+- If several candies of the kind they asked for are on the table, just take any
+  one of them -- never ask which one.
+- If the candy they ask for is NOT on the table, say so and name what is there.
+  Never hand over a different candy than the one they asked for without asking.
+- A QUESTION is not a request: "what do you have / what is on the table / what
+  can you do" gets an answer and NO tool call. Only move candy when the person
+  asks for it in what they just said; earlier requests do not count.
+- But only act on what you actually HEARD. If the audio was unclear, or you
+  cannot tell WHICH candy they mean, ask them to say it again -- do NOT call a
+  tool and do NOT move a random candy. A wrong move is worse than a question.
+"""
+
+
+@mcp.prompt()
+def get_service_rules(lang: str) -> str:
+    """Rules for using this service's tools, added to the client's rules."""
+    return SERVICE_RULES
+
+
 @mcp.prompt()
 def get_service_prompt(lang: str) -> str:
     """Return the system message snippet suitable for this service."""

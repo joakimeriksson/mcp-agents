@@ -646,7 +646,7 @@ def _text_history(mlst, max_turns):
             content = m.get('content')
         else:
             role, content = getattr(m, 'role', None), getattr(m, 'content', None)
-        if role == 'assistant' and content and _TOOL_TEXT.search(str(content)):
+        if role == 'assistant' and content and has_tool_text(str(content)):
             continue   # a tool call written as text: never let the model copy it
         if role in ('user', 'assistant') and content:
             out.append({'role': role, 'content': str(content)})
@@ -667,12 +667,8 @@ def action_line(name, args, result=None, refused=None) -> str:
     args = args if isinstance(args, dict) else {}
     if name == "default_action":
         return "  Action: <no action>"
-    if name == "move_between":
-        what = f"move between {args.get('src', '?')} and {args.get('dst', '?')}"
-    elif name == "show_demo_move":
-        what = "demo move (random candy)"
-    else:
-        what = f"{name} {json.dumps(args, ensure_ascii=False)}"
+    what = (policy.describe_call(name, args)
+            or f"{name} {json.dumps(args, ensure_ascii=False)}")
     r = (refused or result or "").strip()
     if refused or r.startswith("Refused"):
         outcome = "REFUSED: " + r.removeprefix("Refused:").strip()[:90]
@@ -690,10 +686,10 @@ def actions_block(calls=(), rejected=()) -> list:
     lines += [action_line(n, a, result=r) for n, a, r in calls]
     return lines or ["  Action: <no action>"]
 
-def scene_line(text) -> str:
-    """'Scene: A1 Dumle · A3 Marianne ...' from the vision system's report."""
-    items = re.findall(r"^\s*([A-Z]\d)\s*:\s*([^,\n]+)", text or "", re.M)
-    return "  Scene:  " + (" · ".join(f"{p} {c.strip()}" for p, c in items) or "no candy seen")
+def scene_line(text):
+    """The service's state in one line (CandyTron: 'Scene: A1 Dumle · ...')."""
+    line = policy.state_line(text)
+    return f"  {line}" if line else None
 
 def _calls(seq) -> list:
     """[(name, args, result)] -> JSON-able dicts for the session log."""
@@ -821,7 +817,8 @@ def language_message(lang):
 # Greetings must be SHORT: the visitor is waiting, and a long introduction of
 # the whole exhibition was the first thing people heard at the fair.
 def _greet_rule() -> str:
-    return " " + prompts.get("greeting")   # editable live in the launcher
+    # editable live in the panel; else the service's own, else the generic one
+    return " " + prompts.get("greeting", policy.greeting())
 
 def greet_prompt_noname():
     if curr_person.lasttime is None:
@@ -847,19 +844,25 @@ def greet_prompt():
 # [sv] Här är din Snickers.") instead of calling it. The arm never moved, the
 # text went into the history, and every later turn copied it. Execute such a
 # call for real and keep only the prose (same recovery as face/direct_llm.py).
-from direct_llm import (_TOOL_TEXT, _text_tool_calls, _strip_tool_text,
-                        _split_lang, parse_scene_positions)
+from direct_llm import (has_tool_text, set_known_tools, _text_tool_calls,
+                        _strip_tool_text, _split_lang)
+from service_policy import GENERIC, load_policy
+
+# The connected service's client-side policy (face/service_policy.py), loaded
+# from its url://client_policy at startup; generic until then.
+policy = GENERIC
+service_rules = ""   # the service's get_service_rules text
 from types import SimpleNamespace
 
 
 def recover_text_tool_calls(message, tools):
     """(message-like, history-entry) with text-written calls made real."""
     content = message.content or ""
-    if message.tool_calls or not tools or not _TOOL_TEXT.search(content):
+    if message.tool_calls or not tools or not has_tool_text(content):
         return message, message
     names = [t["function"]["name"] for t in tools]
     calls, seen = [], set()
-    for c in _text_tool_calls(content, names):
+    for c in _text_tool_calls(content, names, policy.not_recovered):
         key = (c["function"]["name"], json.dumps(c["function"]["arguments"], sort_keys=True))
         if key not in seen:
             seen.add(key)
@@ -878,16 +881,6 @@ def recover_text_tool_calls(message, tools):
                                             "arguments": t.function.arguments}} for t in tcs]
     return msg, hist
 
-
-def empty_square_refusal(name, args, scene):
-    """Reason to refuse a move from a square the camera sees as empty."""
-    if name != "move_between" or not scene or not isinstance(args, dict):
-        return None
-    src = str(args.get("src", "")).upper().strip()
-    if src and src not in scene:
-        known = ", ".join(f"{p} ({d.split(',')[0]})" for p, d in sorted(scene.items()))
-        return f"Position {src} is EMPTY, nothing was moved. Candy is at: {known}."
-    return None
 
 def compose_messages(sysp, mlst, augs):
     n = 0
@@ -959,6 +952,7 @@ async def main(args):
     global has_exit
     global voice_in, voice_out, listener, tracker, audio_monitor, direct_llm, voice_db, speaker_client, _voice_pool
     global curr_prompt, curr_audio, last_greeting_at
+    global policy, service_rules
 
     # Connect via SSE to the MCP server
     async with Client(transport=SSETransport(args.server)) as client:
@@ -996,7 +990,26 @@ async def main(args):
         for tool in tools:
             print(tool)
         tools = [map_tool_definition(tool) for tool in tools]
+        set_known_tools([t["function"]["name"] for t in tools] + ["express", "default_action"])
         print("\n")
+
+        # What this client needs to know about the service beyond its tools
+        # (see face/service_policy.py). Optional: a service without them gets
+        # the generic behaviour.
+        if any(r.name == 'client_policy' for r in ress):
+            try:
+                res = await client.read_resource("url://client_policy")
+                policy = load_policy(res[0].text)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"client_policy not readable: {e}")
+        if any(p.name == 'get_service_rules' for p in mcp_prompt_list):
+            try:
+                pr = await client.get_prompt("get_service_rules", {"lang": "en"})
+                service_rules = pr.messages[0].content.text
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"get_service_rules failed: {e}")
+        print(f"Service policy: {type(policy).__name__}"
+              f"{', with service rules' if service_rules else ''}")
 
         make_nonblocking(sys.stdin)
 
@@ -1119,7 +1132,8 @@ async def main(args):
             # asyncio.run(), which is not allowed inside this running loop.
             direct_llm = await asyncio.to_thread(
                 DirectAudioLLM, model=args.llm_model, host=ollama_host,
-                agent_name=name, tools_url=args.server)
+                agent_name=name, tools_url=args.server, policy=policy)
+            direct_llm.service_rules = service_rules
             direct_llm.transcriber.check()   # fail fast if the model can't hear
             print(f'Loading {args.llm_model} into memory (kept loaded for the whole session)...')
             await asyncio.to_thread(direct_llm.warm)
@@ -1459,6 +1473,10 @@ async def main(args):
                 sysprompt = await system_message(client, lang)
                 if prompts.is_overridden("persona"):   # edited live in the launcher
                     sysprompt["content"] = prompts.get("persona")
+                if direct_llm is None and service_rules:
+                    # Classic mode has no rules template: the service's rules
+                    # go straight after the persona.
+                    sysprompt["content"] += "\nRules:\n" + service_rules
                 if expressive:
                     use_tool = express_tool and direct_llm is not None
                     if direct_llm is not None:
@@ -1655,7 +1673,7 @@ async def main(args):
 
                     rmsg, rhist = recover_text_tool_calls(response.choices[0].message, tools)
                     tool_calls = rmsg.tool_calls
-                    turn_scene_pos = parse_scene_positions(augprompt['content'] if augprompt else None)
+                    turn_scene_pos = policy.parse_state(augprompt['content'] if augprompt else None)
                     while tool_calls and iteration < 4:
                         messages.append(rhist)
                         for tool_call in tool_calls:
@@ -1663,7 +1681,8 @@ async def main(args):
                                 args_parsed = json.loads(tool_call.function.arguments)
                             except (TypeError, ValueError):
                                 args_parsed = None
-                            refusal = empty_square_refusal(tool_call.function.name, args_parsed, turn_scene_pos)
+                            refusal = (policy.reject(tool_call.function.name, args_parsed, turn_scene_pos)
+                                       if isinstance(args_parsed, dict) else None)
                             if refusal:
                                 logger.warning(f"classic: refused {tool_call.function.name}({args_parsed}): {refusal}")
                                 messages.append({"role": "tool", "tool_call_id": tool_call.id,
@@ -1739,7 +1758,7 @@ async def main(args):
 
                     # No tool calls, just print the response. Never speak or
                     # store leftover tool syntax.
-                    reply_text = _strip_tool_text(rmsg.content or "") if _TOOL_TEXT.search(rmsg.content or "") else (rmsg.content or "")
+                    reply_text = _strip_tool_text(rmsg.content or "") if has_tool_text(rmsg.content or "") else (rmsg.content or "")
                     reply_text = _split_lang(reply_text, "")[1]
                     messages.append({"role": "assistant", "content": reply_text})
                 if not direct_turn:

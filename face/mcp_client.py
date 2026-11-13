@@ -57,6 +57,9 @@ class ServiceHost:
 
       - resource ``url://get_service_name``  — the service's display name
       - prompt   ``get_service_prompt(lang)`` — persona/system prompt snippet
+      - prompt   ``get_service_rules(lang)``  — rules for using its tools
+      - resource ``url://client_policy``     — "module:Class" of its client-side
+        ServicePolicy (face/service_policy.py)
       - resource ``url://service_init``      — call once before using tools
       - resource ``url://service_exit``      — call on shutdown
 
@@ -106,6 +109,17 @@ class ServiceHost:
         positions from the vision system), to inject before the user prompt."""
         return self._run(self._get_prompt("get_service_augmentation", lang),
                          "augmentation")
+
+    def fetch_rules(self, lang: str) -> Optional[str]:
+        """Rules for this service's tools (``get_service_rules``), kept apart
+        from the persona so a persona override never drops them."""
+        return self._run(self._get_prompt("get_service_rules", lang), "rules")
+
+    def fetch_policy(self):
+        """The service's client-side ServicePolicy (``url://client_policy``),
+        or the generic one."""
+        from service_policy import load_policy
+        return load_policy(self._run(self._read_resource("url://client_policy"), "policy"))
 
     def init(self) -> bool:
         return self._run(self._read_resource("url://service_init"),

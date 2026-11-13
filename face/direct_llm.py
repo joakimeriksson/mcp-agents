@@ -15,8 +15,13 @@ turns sometimes lost their prose), which is why reachy split it too.
 
 The reply carries its language as a leading ISO tag ("[sv] Hej!") so the TTS
 voice can be routed without a separate detection step; tools are fetched once
-from a service MCP server (candytron_mcp) and executed over short-lived SSE
-sessions, mirroring ``ServiceHost``.
+from a service MCP server and executed over short-lived SSE sessions,
+mirroring ``ServiceHost``.
+
+Nothing here knows about a particular service. What a service's tools mean --
+which positions exist, which call hands something over, what to say when
+nothing happened -- comes from its ``ServicePolicy`` (face/service_policy.py;
+CandyTron's is candytron_mcp/client_policy.py).
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import numpy as np
 import soundfile as sf
 
 from sentences import SentenceStream, split_sentences
+from service_policy import GENERIC, ServicePolicy
 
 logger = logging.getLogger("direct_llm")
 
@@ -42,9 +48,6 @@ import prompts as _prompts
 # The rules text lives in face/prompts.py and can be edited live (launcher's
 # "Prompts..." window); this is the default, kept for reference and tests.
 DIRECT_SYSTEM = _prompts.RULES
-
-# Positions the vision system reports, e.g. "A2 : Riesen-kola, brun ...".
-_SCENE_POS = re.compile(r"^\s*([A-Z]\d)\s*:\s*(.+?)\s*$", re.MULTILINE)
 
 # The robot claiming it did something physical. If a turn ends with one of
 # these and NO tool was called, the arm never moved and the visitor is being
@@ -88,18 +91,34 @@ _ACTION_CLAIM = re.compile(
 # Braces never occur in speech, so "name{...}" is always a written-out call --
 # with or without a [toolcall] / <|tool_call> prefix (the bare form
 # "movebetween{dst: O0 ,src: C1 }" and "showdemomove{}" were read out loud).
-# Also "movebetween(src='B2', dst='O0')" -- parentheses, but only for known
-# tool names (ordinary speech has parentheses too).
-_KNOWN_CALL = r"(?:move_?between|show_?demo_?move|default_?action|express)\s*\([^()]*\)"
-_TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|<\|\"\|>|\w+\s*\{[^{}]*\}|[{}]|" + _KNOWN_CALL,
-                        re.IGNORECASE)
-_TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)?\s*(?:call:)?\s*"
-                             r"(?:([a-z_]+)\s*\{([^{}]*)\}|"
-                             r"(move_?between|show_?demo_?move|default_?action|express)\s*\(([^()]*)\))",
-                             re.IGNORECASE)
-# Any known tool written as text is executed as if it had been called --
-# except ones that act at random or do nothing, which are just dropped.
-_NOT_RECOVERED = {"show_demo_move", "default_action"}
+# Also "movebetween(src='B2', dst='O0')" -- parentheses, but only for KNOWN
+# tool names (ordinary speech has parentheses too). The names are the tools
+# actually loaded; set_known_tools() rebuilds the patterns.
+_TOOL_TEXT = _TOOL_TEXT_CALL = None
+
+
+def _name_pattern(name: str) -> str:
+    """'move_between' -> 'move_?between' (gemma4 drops the underscores)."""
+    return "_?".join(re.escape(p) for p in name.split("_"))
+
+
+def set_known_tools(names) -> None:
+    """(Re)build the written-call patterns for these tool names."""
+    global _TOOL_TEXT, _TOOL_TEXT_CALL, _JUNK_TAG
+    alts = "|".join(sorted({_name_pattern(n) for n in names if n}, key=len, reverse=True))
+    known = rf"(?:{alts})\s*\([^()]*\)" if alts else r"(?!x)x"
+    _TOOL_TEXT = re.compile(r"\[tool_?call\]|<\|tool_call>|<tool_call\|>|<\|\"\|>|\w+\s*\{[^{}]*\}|[{}]|" + known,
+                            re.IGNORECASE)
+    _TOOL_TEXT_CALL = re.compile(r"(?:\[tool_?call\]|<\|tool_call>|\bcall:)?\s*(?:call:)?\s*"
+                                 r"(?:([a-z_]+)\s*\{([^{}]*)\}|"
+                                 rf"({alts or '(?!x)x'})\s*\(([^()]*)\))",
+                                 re.IGNORECASE)
+    _JUNK_TAG = re.compile(rf"\[\s*(?:tool[^\]]*|{alts or '(?!x)x'}|[a-z]{{2}})\s*\]", re.IGNORECASE)
+
+
+# Until tools are loaded: the local express tool plus the classic names, so
+# a service-less client still never reads a written call aloud.
+set_known_tools(["express", "default_action"])
 _TOOL_TEXT_ARG = re.compile(r"(\w+)\s*[:=]\s*(?:<\|\"\|>(.*?)<\|\"\|>|\"([^\"]*)\"|'([^']*)'|([^,})\s]+))")
 
 
@@ -144,9 +163,8 @@ _MOOD_WORDS = {"laugh": "laugh", "laughing": "laugh", "skrattar": "laugh",
 # express() written as text: "express(mood: laugh)", "[express:happy]", "express{mood:happy}"
 _EXPRESS_TEXT = re.compile(r"\[?\s*express\s*[(:{\[]\s*(?:mood\s*[:=]\s*)?[\"']?(\w+)[\"']?\s*[)}\]]?\]?",
                            re.IGNORECASE)
-# Other markup gemma4 leaks next to tool calls: "[tool: ]", "[defaultaction]", a mid-text "[en]".
-_JUNK_TAG = re.compile(r"\[\s*(?:tool[^\]]*|default_?action|show_?demo_?move|move_?between|[a-z]{2})\s*\]",
-                       re.IGNORECASE)
+# _JUNK_TAG (built by set_known_tools above): other markup gemma4 leaks next to
+# tool calls -- "[tool: ]", "[defaultaction]", "[movebetween]", a mid-text "[en]".
 _BRACKET_MOOD = re.compile(r"\[\s*(\w+)\s*\]")
 
 
@@ -175,20 +193,26 @@ def _clean_spoken(sentence: str) -> tuple:
     return sentence, mood
 
 
-def _text_tool_calls(content: str, tool_names: list) -> list:
+def _text_tool_calls(content: str, tool_names: list, not_recovered=frozenset()) -> list:
     """Tool calls the model wrote as text, as Ollama-style call dicts."""
     norm = {n.replace("_", "").lower(): n for n in tool_names}
     calls = []
     for m in _TOOL_TEXT_CALL.finditer(content or ""):
         raw_name, raw_args = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
         name = norm.get(raw_name.replace("_", "").lower())
-        if not name or name in _NOT_RECOVERED:
+        if not name or name in not_recovered:
             continue
         args = {}
         for a in _TOOL_TEXT_ARG.finditer(raw_args):
             args[a.group(1)] = next(v for v in a.groups()[1:] if v is not None)
         calls.append({"function": {"name": name, "arguments": args}})
     return calls
+
+
+def has_tool_text(content: str) -> bool:
+    """True if *content* contains a tool call written as text. (A function,
+    not the pattern: the pattern is rebuilt when tools are loaded.)"""
+    return bool(_TOOL_TEXT.search(content or ""))
 
 
 def _strip_tool_text(content: str) -> str:
@@ -206,20 +230,10 @@ def _strip_tool_text(content: str) -> str:
     return text
 
 
-# What the server answers when the arm really started (or queued) a move.
-_MOVE_OK = re.compile(r"^(Started moving|Queued|Successfully demonstrated)", re.IGNORECASE)
 # Generic, for any service: a tool call counts as DONE unless its result says
 # it was refused, failed, or did nothing.
 _NOT_DONE = re.compile(r"^\s*(refused|failed|error|did nothing|tool \S+ failed|unknown)",
                        re.IGNORECASE)
-_NO_OP_TOOLS = {"default_action", "express"}
-
-
-def parse_scene_positions(augmentation: Optional[str]) -> dict:
-    """{position: description} from the vision system's scene text."""
-    if not augmentation:
-        return {}
-    return {m.group(1): m.group(2) for m in _SCENE_POS.finditer(augmentation)}
 
 
 _LANG_TAG = re.compile(r"^\s*\[([a-z]{2}(?:-[a-z]{2})?)\]\s*", re.IGNORECASE)
@@ -259,45 +273,9 @@ def _is_claim(text: str) -> bool:
     return bool(_ACTION_CLAIM.search(text)) and not _NOT_A_CLAIM.search(text)
 
 
-def _candy_aliases(scene: dict) -> dict:
-    """{candy name: {ways it is said}} for the candies on the table. The name
-    is the head of the vision system's description ("Riesen-kola", "Dumle");
-    its first word is an alias too unless another candy shares it
-    ("Nötkräm päron" / "Nötkräm original")."""
-    heads = sorted({desc.split(",")[0].strip().lower() for desc in scene.values()} - {""})
-    # "licorice (lakrits)": the Swedish name in brackets is a name too.
-    extra = {h: set(re.findall(r"\(([^)]+)\)", h)) for h in heads}
-    first = {}
-    for h in heads:
-        w = re.split(r"[\s\-]+", h)[0]
-        first.setdefault(w, []).append(h)
-    out = {}
-    for h in heads:
-        w = re.split(r"[\s\-]+", h)[0]
-        bare = re.sub(r"\s*\([^)]*\)", "", h).strip()
-        out[h] = ({h, bare} | {x.strip() for x in extra[h]}
-                  | ({w} if len(w) >= 4 and len(first[w]) == 1 else set()))
-    return out
-
-
-def _claimed_candies(text: str, scene: dict) -> int:
-    """How many different candies the CLAIM sentences of *text* hand over."""
-    return len(_claimed_kinds(text, scene))
-
-
-def _claimed_kinds(text: str, scene: dict) -> set:
-    """The candies ON THE TABLE that the claim sentences of *text* name."""
-    aliases = _candy_aliases(scene)
-    if not aliases:
-        return set()
-    seen = set()
-    for sentence in split_sentences(text or ""):
-        if not _is_claim(sentence):
-            continue
-        low = sentence.lower()
-        seen.update(h for h, names in aliases.items()
-                    if any(re.search(r"\b" + re.escape(n) + r"\b", low) for n in names))
-    return seen
+def _claim_sentences(text: str) -> list:
+    """The sentences of *text* that claim an action (see _ACTION_CLAIM)."""
+    return [x for x in split_sentences(text or "") if _is_claim(x)]
 
 
 def _history_messages(history) -> list:
@@ -321,15 +299,6 @@ def _history_messages(history) -> list:
     return out
 
 
-def _claimed_kinds_any(text: str, scene: dict) -> set:
-    """Candies on the table named anywhere in *text* (for a claim found by the
-    judge, whose wording the phrase list did not know)."""
-    aliases = _candy_aliases(scene)
-    low = (text or "").lower()
-    return {h for h, names in aliases.items()
-            if any(re.search(r"\b" + re.escape(n) + r"\b", low) for n in names)}
-
-
 def _has_words(text: str) -> bool:
     """True if there is something to say once the language tag is removed."""
     return bool(_split_lang(text or "", "")[1])
@@ -350,6 +319,22 @@ class DirectAudioLLM:
     utterance for memory purposes.
     """
 
+    # Defaults (also for tests that build the object with __new__).
+    policy: ServicePolicy = GENERIC
+    express_tool = False   # offer the local express(mood) tool
+    lang_id = None         # lang_id.LanguageID: Whisper decides the reply language
+    last_lid = (None, 0.0)
+    last_mood = ""         # style tag the model chose this turn
+    # "gemma4": the audio goes into gemma4. "whisper": Whisper (MLX, GPU)
+    # transcribes it and gemma4 answers the TEXT.
+    ear = "gemma4"
+    last_heard = None      # lang_id.Heard of this turn (ear == "whisper")
+    # Languages the VOICE can speak: Kokoro's six + what VoxCPM2 speaks well
+    # (tested Nov 2026 by synthesizing and transcribing back: nl/pt/da
+    # good, fi garbled). Anything else gets a reply in English.
+    speakable = ("en", "sv", "de", "fr", "es", "it") + VOX_LANGS
+    service_rules = ""     # the service's get_service_rules text
+
     def __init__(self, *,
                  model: str = "gemma4:latest",
                  host: str = "http://localhost:11434",
@@ -357,6 +342,7 @@ class DirectAudioLLM:
                  service_prompt: Optional[str] = None,
                  augmentation_provider: Optional[Callable[[str], Optional[str]]] = None,
                  tools_url: Optional[str] = None,
+                 policy: Optional[ServicePolicy] = None,
                  sample_rate: int = 16000,
                  temperature: float = 0.2):
         self.last_tool_calls: list = []
@@ -365,8 +351,8 @@ class DirectAudioLLM:
         self._client = ollama.Client(host=host)
         self._model = model
         # Low temperature: tool calling on audio turns is otherwise flaky —
-        # the same request sometimes calls move_between, sometimes just says
-        # it did (measured Aug 2026).
+        # the same request sometimes calls the tool, sometimes just says it
+        # did (measured Aug 2026).
         self._options = {"temperature": temperature}
         self._agent_name = agent_name
         self._service_prompt = service_prompt
@@ -374,18 +360,7 @@ class DirectAudioLLM:
         self._tools_url = tools_url
         self._sample_rate = sample_rate
         self._tools: list = []
-        self.express_tool = False   # offer the local express(mood) tool
-        self.lang_id = None         # lang_id.LanguageID: Whisper decides the reply language
-        self.last_lid = (None, 0.0)
-        self.last_mood = ""         # style tag the model chose this turn
-        # "gemma4": the audio goes into gemma4. "whisper": Whisper (MLX, GPU)
-        # transcribes it and gemma4 answers the TEXT.
-        self.ear = "gemma4"
-        self.last_heard = None      # lang_id.Heard of this turn (ear == "whisper")
-        # Languages the VOICE can speak: Kokoro's six + what VoxCPM2 speaks well
-        # (tested Nov 2026 by synthesizing and transcribing back: nl/pt/da
-        # good, fi garbled). Anything else gets a reply in English.
-        self.speakable = ("en", "sv", "de", "fr", "es", "it") + VOX_LANGS
+        self.policy = policy or GENERIC
         if tools_url:
             self._tools = self._load_tools(tools_url)
 
@@ -415,8 +390,9 @@ class DirectAudioLLM:
                 "parameters": t.inputSchema,
             },
         } for t in tools]
-        logger.info(f"direct: {len(mapped)} tool(s) from {url}: "
-                    f"{[t['function']['name'] for t in mapped]}")
+        names = [t["function"]["name"] for t in mapped]
+        set_known_tools(names + ["express", "default_action"])
+        logger.info(f"direct: {len(mapped)} tool(s) from {url}: {names}")
         return mapped
 
     def _call_tool(self, name: str, args: dict) -> str:
@@ -446,7 +422,7 @@ class DirectAudioLLM:
         lines = []
         for t in self._tools or []:
             fn = t.get("function", {})
-            if fn.get("name") in _NO_OP_TOOLS:
+            if fn.get("name") in self.policy.noop_tools:
                 continue
             desc = (fn.get("description") or "").strip().splitlines()
             lines.append(f"- {fn.get('name')}: {desc[0][:120] if desc else ''}")
@@ -474,18 +450,18 @@ class DirectAudioLLM:
             logger.warning(f"direct: judge says the reply claims an action: {text[:70]!r}")
         return verdict
 
-    _NOTHING_MOVED = {
-        "sv": "[sv] Förlåt, det gick inte. Vilket godis vill du ha?",
-        "en": "[en] Sorry, that didn't work. Which candy would you like?",
-        "de": "[de] Entschuldigung, das hat nicht geklappt. Welche Süßigkeit möchtest du?",
-        "fr": "[fr] Désolé, ça n'a pas marché. Quel bonbon veux-tu ?",
-        "es": "[es] Lo siento, no ha funcionado. ¿Qué caramelo quieres?",
-        "it": "[it] Scusa, non ha funzionato. Quale caramella vuoi?",
+    _NOTHING_DONE = {
+        "sv": "[sv] Förlåt, det gick inte.",
+        "en": "[en] Sorry, that didn't work.",
+        "de": "[de] Entschuldigung, das hat nicht geklappt.",
+        "fr": "[fr] Désolé, ça n'a pas marché.",
+        "es": "[es] Lo siento, no ha funcionado.",
+        "it": "[it] Scusa, non ha funzionato.",
     }
 
     def _honest_reply(self, messages: list, language: str) -> str:
-        """A truthful one-liner after a claimed hand-out that did not happen:
-        say so, and if the candy is not on the table, what is."""
+        """A truthful one-liner after a claimed action that did not happen:
+        say so, and if what they asked for is not available, what is."""
         messages = messages + [{"role": "user", "content":
             "That was NOT done: no tool ran, so nothing happened. Do not say it "
             "was done. In ONE short sentence in the person's language, starting "
@@ -497,63 +473,18 @@ class DirectAudioLLM:
             logger.warning(f"direct: honest reply failed: {e}")
             text = ""
         if not _has_words(text) or _is_claim(text) or _TOOL_TEXT.search(text):
-            text = self._NOTHING_MOVED.get(language, self._NOTHING_MOVED["en"])
+            text = (self.policy.fallback_reply(language)
+                    or self._NOTHING_DONE.get(language, self._NOTHING_DONE["en"]))
         return text
 
     def _recover_text_calls(self, content: str, scene: dict) -> list:
-        """Execute what the model wrote as a tool call instead of making one.
-        At most one move per kind of candy: written out, it tends to list
-        every Dumle on the table for "a Dumle"."""
-        calls = _text_tool_calls(content, [t["function"]["name"] for t in self._tools])
-        kept, kinds = [], set()
-        for c in calls:
-            fn = c["function"]
-            if fn["name"] == "move_between":
-                src = str(fn["arguments"].get("src", "")).upper().strip()
-                kind = (scene.get(src) or src).split(",")[0].strip().lower()
-                if kind in kinds:
-                    continue
-                kinds.add(kind)
-            kept.append(c)
+        """Execute what the model wrote as a tool call instead of making one."""
+        calls = _text_tool_calls(content, [t["function"]["name"] for t in self._tools],
+                                 self.policy.not_recovered)
+        kept = self.policy.dedupe_text_calls(calls, scene)
         logger.warning(f"direct: model wrote {len(calls)} tool call(s) as text; "
                        f"executing {len(kept)}: {[c['function'] for c in kept]}")
         return kept
-
-    @staticmethod
-    def _apply_move(name: str, args: dict, result: str, scene: dict) -> None:
-        """Update this turn's scene copy after a move the arm accepted, so a
-        second move in the same turn is checked against the board as it will
-        be (B3 -> O0 after A1 -> B3 is fine; A1 -> O0 twice is not)."""
-        if name != "move_between" or not _MOVE_OK.match(result or ""):
-            return
-        src = str(args.get("src", "")).upper().strip()
-        dst = str(args.get("dst", "")).upper().strip()
-        desc = scene.pop(src, None)
-        if desc is not None and dst and dst != "O0":
-            scene[dst] = desc
-
-    def _reject_bad_move(self, name: str, args: dict, scene: dict) -> Optional[str]:
-        """Reason to refuse this call, or None to let it through.
-
-        The server happily reports "Successfully moved from B1 to O0" for an
-        empty square -- the arm grips air and the visitor gets nothing while
-        the robot says it worked. Only the caller knows what the vision system
-        actually sees, so the check belongs here.
-        """
-        if name != "move_between" or not scene:
-            return None
-        src = str(args.get("src", "")).upper().strip()
-        dst = str(args.get("dst", "")).upper().strip()
-        known = ", ".join(f"{p} ({d.split(',')[0]})" for p, d in sorted(scene.items()))
-        if not src or not dst:
-            return f"Missing src or dst. Candy is at: {known}."
-        if src == dst:
-            return f"src and dst are both {src}; pick a different destination."
-        if src not in scene:
-            return (f"Position {src} is EMPTY -- there is no candy there, so "
-                    f"nothing was moved. Candy is at: {known}. "
-                    f"Call move_between again with one of those as src.")
-        return None
 
     def _chat(self, messages: list, tools: Optional[list], say, default_lang: str):
         """One model call; returns its message. With *say* set it streams and
@@ -634,7 +565,9 @@ class DirectAudioLLM:
                          "language of the information above and of earlier turns.\n"
                          "- Never repeat or transcribe what the person said; answer it.\n")
         system = _prompts.fill(_prompts.get("rules"), name=self._agent_name,
-                               service=service, lang_rule=lang_rule)
+                               service=service, lang_rule=lang_rule,
+                               service_rules=(self.service_rules or "").rstrip() + "\n"
+                               if self.service_rules else "")
         if context:
             system += f"\nAbout the person you hear:\n{context}\n"
         _prompts.write_last(system)
@@ -677,8 +610,7 @@ class DirectAudioLLM:
     def _lang_order(self, code: str) -> str:
         """The LANGUAGE rule for a detected spoken language."""
         from lang_id import language_name
-        tail = (" The language only changes your words: if they ask for candy, you "
-                "still call move_between FIRST, exactly as you would in English.\n")
+        tail = self.policy.language_tail()
         if code not in self.speakable:
             heard = language_name(code)
             return (f"- LANGUAGE: the person is speaking {heard}, which your voice cannot "
@@ -689,10 +621,13 @@ class DirectAudioLLM:
                 f"information above are in.{tail}")
 
     def _moves_ok(self) -> int:
-        """Moves the arm really started or queued this turn (a refused call,
-        e.g. "arm busy", does not count)."""
+        """Actions really started or queued this turn (a refused call, e.g.
+        "arm busy", does not count)."""
+        pol = self.policy
         return sum(1 for n, _a, r in self.last_tool_calls
-                   if n not in _NO_OP_TOOLS and not _NOT_DONE.match(r or ""))
+                   if n not in pol.noop_tools
+                   and (not pol.action_tools or n in pol.action_tools)
+                   and not _NOT_DONE.match(r or ""))
 
     def respond(self, audio: np.ndarray, *,
                 context: str = "",
@@ -739,10 +674,8 @@ class DirectAudioLLM:
         heard = None
         if self.ear == "whisper" and self.lang_id is not None and self.lang_id.available:
             from lang_id import language_name
-            # Both names: "Licorice (Lakrits)" -> Licorice, Lakrits.
-            kinds = sorted({n.strip() for d in parse_scene_positions(aug).values()
-                            for n in re.split(r"[()]", d.split(",")[0]) if n.strip()})
-            heard = self.lang_id.transcribe(audio, ", ".join(kinds))
+            heard = self.lang_id.transcribe(
+                audio, self.policy.hint_words(self.policy.parse_state(aug)))
             self.last_heard = heard
             if not heard.text:
                 # Noise, a cough, crowd babble: say nothing rather than answer it.
@@ -799,8 +732,8 @@ class DirectAudioLLM:
         # same as one where it works, so this must not be INFO-only.
         self.last_tool_calls = []
         self.rejected_tool_calls = []
-        scene = parse_scene_positions(aug)
-        scene_at_start = dict(scene)   # _apply_move updates `scene` as moves happen
+        scene = self.policy.parse_state(aug)
+        scene_at_start = dict(scene)   # policy.apply updates `scene` as calls happen
         reply, used_tools = "", False
         texts: list[str] = []   # every piece of prose the model produced
         spoken: list[str] = []  # sentences already handed to on_sentence
@@ -853,11 +786,11 @@ class DirectAudioLLM:
                 fn = call["function"]
                 logger.info(f"direct: tool call {fn['name']}({dict(fn['arguments'])})")
                 args = dict(fn["arguments"])
-                refusal = self._reject_bad_move(fn["name"], args, scene)
+                refusal = self.policy.reject(fn["name"], args, scene)
                 if refusal:
-                    # Don't send the arm after candy that isn't there. Hand the
-                    # model the reason plus the real positions so it can retry
-                    # in the next round instead of miming an empty square.
+                    # e.g. the arm sent after candy that isn't there. Hand the
+                    # model the reason (the policy adds the real state) so it
+                    # can retry in the next round.
                     logger.warning(f"direct: rejected {fn['name']}({args}): {refusal}")
                     self.rejected_tool_calls.append((fn["name"], args, refusal))
                     messages.append({"role": "tool", "tool_name": fn["name"],
@@ -865,7 +798,7 @@ class DirectAudioLLM:
                     continue
                 result = self._call_tool(fn["name"], args)
                 self.last_tool_calls.append((fn["name"], args, result))
-                self._apply_move(fn["name"], args, result, scene)
+                self.policy.apply(fn["name"], args, result, scene)
                 messages.append({"role": "tool", "tool_name": fn["name"],
                                  "content": result})
 
@@ -878,7 +811,8 @@ class DirectAudioLLM:
         # Claimed an action without calling the tool: the arm never moved and
         # the visitor is being told it did. Give the model exactly one chance
         # to make good on it, with the tools still attached.
-        claimed_kinds = _claimed_kinds(" ".join(texts + [reply]), scene_at_start) if reply else set()
+        claimed_kinds = (self.policy.claimed_items(_claim_sentences(" ".join(texts + [reply])),
+                                                   scene_at_start) if reply else set())
         claimed = len(claimed_kinds)
         moved = self._moves_ok()
         is_claim = bool(reply) and _is_claim(reply)
@@ -888,49 +822,32 @@ class DirectAudioLLM:
             # handed something over. Runs while the reply is already playing.
             is_claim = self._judge_claims_action(reply)
             if is_claim:
-                claimed_kinds = _claimed_kinds_any(reply, scene_at_start)
+                claimed_kinds = self.policy.claimed_items([reply], scene_at_start)
                 claimed = len(claimed_kinds)
         if (self._tools and reply and is_claim and moved == 0 and not claimed
                 and scene_at_start):
-            # It "handed over" something that is not on the table (at the demo:
+            # It claimed acting on something the service does not have (at the demo:
             # "Here is your Marianne" with no Marianne). A retry then grabbed
             # whatever was there -- a Plopp. Do not retry; say it honestly.
-            logger.warning(f"direct: claimed a candy that is not on the table: {reply[:70]!r}"
+            logger.warning(f"direct: claimed something not in the service state: {reply[:70]!r}"
                            " — no retry, honest answer")
             reply = self._honest_reply(messages + [{"role": "assistant", "content": reply}],
                                        language_hint or "en")
         elif self._tools and reply and is_claim and (moved == 0 or claimed > moved):
-            candy_arm = any(t.get("function", {}).get("name") == "move_between"
-                            for t in self._tools or [])
-            if moved == 0 and not candy_arm:
-                # Any service (lights, music, ...): the reply says something was
-                # done, but no tool ran.
+            generic = ("You just told the user you did something, but you called no "
+                       "tool (or the tool refused), so NOTHING happened. If you meant "
+                       "to do it, call the right tool NOW for exactly that action. "
+                       "Then answer in one sentence starting with the ISO language "
+                       "code in brackets -- and if you did not call a tool, say "
+                       "honestly that it was not done.")
+            if moved == 0:
                 logger.warning(f"direct: action claimed without a tool call: {reply[:70]!r}"
                                " — retrying")
-                nudge = ("You just told the user you did something, but you called no "
-                         "tool (or the tool refused), so NOTHING happened. If you meant "
-                         "to do it, call the right tool NOW for exactly that action. "
-                         "Then answer in one sentence starting with the ISO language "
-                         "code in brackets -- and if you did not call a tool, say "
-                         "honestly that it was not done.")
-            elif moved == 0:
-                logger.warning(f"direct: action claimed without a move: {reply[:70]!r}"
-                               " — retrying")
-                nudge = ("You just told the person you were moving or handing over "
-                         "candy, but no move happened (no tool call, or the arm "
-                         "refused it), so nothing happened. Call move_between NOW "
-                         "for exactly that action, then confirm in one sentence "
-                         "starting with the ISO language code in brackets.")
+                nudge = self.policy.nudge_no_action() or generic
             else:
-                logger.warning(f"direct: {claimed} candies claimed but {moved} moved"
+                logger.warning(f"direct: {claimed} items claimed but {moved} done"
                                f" — retrying for the rest: {reply[:70]!r}")
-                nudge = (f"You told the person you are handing over {claimed} "
-                         f"candies but only {moved} move(s) happened. Call "
-                         f"move_between NOW for each candy that was not moved yet "
-                         f"(one call per candy), then confirm in one sentence "
-                         f"starting with the ISO language code in brackets. If you "
-                         f"only meant to hand over one candy, call no tool and just "
-                         f"answer.")
+                nudge = self.policy.nudge_partial(claimed, moved) or generic
             had_moves = moved
             messages.append({"role": "assistant", "content": reply})
             messages.append({"role": "user", "content": nudge})
@@ -952,14 +869,9 @@ class DirectAudioLLM:
                 for call in calls2:
                     fn = call["function"]
                     args = dict(fn["arguments"])
-                    refusal = self._reject_bad_move(fn["name"], args, scene)
-                    if not refusal and fn["name"] == "move_between" and claimed_kinds:
-                        src = str(args.get("src", "")).upper().strip()
-                        kind = (scene_at_start.get(src) or "").split(",")[0].strip().lower()
-                        if kind not in claimed_kinds:
-                            refusal = (f"Refused: you promised {', '.join(sorted(claimed_kinds))}, "
-                                       f"but {src} holds {kind or 'nothing'}. Never hand over a "
-                                       f"different candy than the one promised.")
+                    refusal = (self.policy.reject(fn["name"], args, scene)
+                               or self.policy.retry_refusal(fn["name"], args, claimed_kinds,
+                                                            scene_at_start))
                     if refusal:
                         self.rejected_tool_calls.append((fn["name"], args, refusal))
                         messages.append({"role": "tool", "tool_name": fn["name"],
@@ -968,7 +880,7 @@ class DirectAudioLLM:
                     logger.info(f"direct: recovered tool call {fn['name']}({args})")
                     result = self._call_tool(fn["name"], args)
                     self.last_tool_calls.append((fn["name"], args, result))
-                    self._apply_move(fn["name"], args, result, scene)
+                    self.policy.apply(fn["name"], args, result, scene)
                     messages.append({"role": "tool", "tool_name": fn["name"],
                                      "content": result})
                 # Only take the retry's words if it produced any: after a

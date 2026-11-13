@@ -2,7 +2,15 @@
 only once the arm has really moved. gemma4 is replaced by scripted replies."""
 import numpy as np
 
+import os
+import sys
+
+import direct_llm
 from direct_llm import DirectAudioLLM
+from service_policy import GENERIC
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from candytron_mcp.client_policy import CandyPolicy  # noqa: E402
 
 MOVE = {"function": {"name": "move_between", "arguments": {"src": "A1", "dst": "O0"}}}
 
@@ -25,8 +33,11 @@ class FakeOllama:
         return iter(pieces)
 
 
-def make(rounds, tools=True):
+def make(rounds, tools=True, policy=None):
+    """CandyTron by default; generic-service tests pass policy=GENERIC."""
     llm = DirectAudioLLM.__new__(DirectAudioLLM)
+    llm.policy = policy or CandyPolicy()
+    direct_llm.set_known_tools(["move_between", "show_demo_move", "default_action", "express"])
     llm._client = FakeOllama(rounds)
     llm._model, llm._options, llm._agent_name = "gemma4", {}, "CandyTron"
     llm._service_prompt = llm._augmentation_provider = None
@@ -227,8 +238,9 @@ def test_generic_service_claim_without_tool_is_retried():
     llm = make([("[en] I've turned on the kitchen light.", None),
                 ("YES", None),                                   # the judge
                 ("[en]", [ON]),                                  # retry calls the tool
-                ("[en] The kitchen light is on.", None)])
+                ("[en] The kitchen light is on.", None)], policy=GENERIC)
     llm._tools = LIGHT_TOOLS
+    direct_llm.set_known_tools(["set_light", "express"])
     llm._call_tool = lambda name, args: llm.moves.append(args) or "OK: kitchen light on"
     reply, lang, heard = run(llm)
     assert llm.moves == [{"room": "kitchen", "on": True}]
@@ -238,8 +250,9 @@ def test_generic_service_honest_when_retry_does_nothing():
     llm = make([("[sv] Nu har jag släckt lampan.", None),
                 ("YES", None),                                   # judge
                 ("[sv] Nu har jag släckt lampan.", None),        # retry: still no tool
-                ("[sv] Förlåt, jag har inte släckt lampan.", None)])
+                ("[sv] Förlåt, jag har inte släckt lampan.", None)], policy=GENERIC)
     llm._tools = LIGHT_TOOLS
+    direct_llm.set_known_tools(["set_light", "express"])
     reply, lang, heard = run(llm)
     assert llm.moves == []
     # An unknown phrasing streams before the judge rules; the honest
@@ -249,8 +262,9 @@ def test_generic_service_honest_when_retry_does_nothing():
 
 def test_generic_written_tool_call_is_recovered():
     llm = make([('set_light{room:<|"|>hall<|"|>,on:<|"|>false<|"|>} [en] Done.', None),
-                ("[en] The hall light is off.", None)])
+                ("[en] The hall light is off.", None)], policy=GENERIC)
     llm._tools = LIGHT_TOOLS
+    direct_llm.set_known_tools(["set_light", "express"])
     llm._call_tool = lambda name, args: llm.moves.append(args) or "OK"
     reply, lang, heard = run(llm)
     assert llm.moves == [{"room": "hall", "on": "false"}]

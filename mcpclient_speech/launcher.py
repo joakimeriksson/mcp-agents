@@ -1379,12 +1379,16 @@ class Launcher:
         if m:
             n = int(m.group(1))
             st("calib", "progress", f"{n}/4 candies seen — need exactly 4, one in each corner")
-            extra = "Remove the extra candies!" if n > 4 else "Place ONE candy in each corner (A1, A3, D1, D3)."
+            extra = ("Remove the extra candies!" if n > 4 else
+                     "Clear the board completely, or put ONE candy in each corner (A1, A3, D1, D3).")
+            mb = re.search(r"(\d+)/12 printed boxes seen", s)
+            if n == 0 and mb:
+                extra = f"Empty board: {mb.group(1)}/12 printed boxes seen (is one in shadow or out of view?)"
             self.set_banner(f"CALIBRATING: {n}/4 candies seen.  {extra}", "calib")
         elif has("calibrating: place"):
             st("calib", "progress", "waiting for 4 corner candies")
-            self.set_banner("CALIBRATING: place ONE candy in each corner (A1, A3, D1, D3), "
-                            "nothing else on the board", "calib")
+            self.set_banner("CALIBRATING: clear the board completely (the printed boxes are used), "
+                            "or place ONE candy in each corner (A1, A3, D1, D3)", "calib")
             self._calib_warn = []
         elif has("calibration WARNING:"):
             w = s.split("calibration WARNING:", 1)[1].strip()

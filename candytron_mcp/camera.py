@@ -34,7 +34,9 @@ def find_board_boxes(frame) -> list[tuple]:
     """(cx, cy, w, h) of every printed box outline found on the paper."""
     g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    paper = ((hsv[..., 2] > 140) & (hsv[..., 1] < 60)).astype(np.uint8) * 255
+    # Paper = low colour saturation (the table is strongly blue). Not "bright":
+    # the arm's shadow darkened D3 enough to drop its box (Nov 2026).
+    paper = ((hsv[..., 2] > 70) & (hsv[..., 1] < 60)).astype(np.uint8) * 255
     paper = cv2.morphologyEx(paper, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
     th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 15)
     th = cv2.bitwise_and(th, paper)
@@ -74,11 +76,47 @@ def snap_to_boxes(positions: dict, boxes: list[tuple]) -> int:
     return snapped
 
 
+def _complete_grid(boxes: list[tuple], n: int, m: int):
+    """11 of 12 boxes (one in shadow or covered): add the missing one where
+    the grid says it must be, if exactly one cell is empty. Else None."""
+    pts = np.array([[b[0], b[1]] for b in boxes], np.float32)
+    # rows by y (rotation is small here; grid_from_boxes re-checks everything)
+    order = np.argsort(pts[:, 1])
+    gaps = np.diff(pts[order, 1])
+    hmed = float(np.median([b[3] for b in boxes]))
+    cuts = [k + 1 for k, g in enumerate(gaps) if g > 0.6 * hmed]
+    rows = np.split(order, cuts)
+    if len(rows) != m or sorted(len(r) for r in rows) != [n - 1] + [n] * (m - 1):
+        return None
+    full = [sorted(r, key=lambda k: pts[k, 0]) for r in rows if len(r) == n]
+    short_i = next(i for i, r in enumerate(rows) if len(r) == n - 1)
+    short = sorted(rows[short_i], key=lambda k: pts[k, 0])
+    # the neighbouring full row tells where the columns are
+    ref = full[0] if short_i == 0 else [sorted(rows[short_i - 1], key=lambda k: pts[k, 0])][0]
+    if len(ref) != n:
+        ref = full[0]
+    ref_x = [pts[k, 0] for k in ref]
+    have = [int(np.argmin([abs(pts[k, 0] - rx) for rx in ref_x])) for k in short]
+    missing = [c for c in range(n) if c not in have]
+    if len(missing) != 1 or len(set(have)) != n - 1:
+        return None
+    c = missing[0]
+    # the missing cell = the same column in the reference row, shifted by the
+    # row offset measured on the boxes the two rows share
+    shift = np.mean([pts[short[i]] - pts[ref[have[i]]] for i in range(n - 1)], axis=0)
+    x, y = pts[ref[c]] + shift
+    w, h = boxes[ref[c]][2], boxes[ref[c]][3]
+    logger.info("box calibration: filled in the missing box from the grid")
+    return list(boxes) + [(float(x), float(y), w, h)]
+
+
 def grid_from_boxes(boxes: list[tuple], n: int, m: int):
     """{tag: (x, y)} if *boxes* are exactly an m-row x n-column grid, else None.
     Rows are letters (A at the BOTTOM of the image), columns numbers (1 left),
     the same orientation as the 4-candy calibration."""
-    if len(boxes) != n * m:
+    if len(boxes) == n * m - 1:
+        boxes = _complete_grid(boxes, n, m)
+    if boxes is None or len(boxes) != n * m:
         return None
     # The paper is rarely square to the camera: estimate the grid's angle
     # from the direction to each box's nearest neighbour (folded into
@@ -122,6 +160,7 @@ class CameraManager:
     def __init__(self, camera_index: int = 0, model_path: str = 'models/best-m.pt',
                  show_window: bool = True, simulate: bool = False):
         self.loose_pick = False   # --loose-pick: report candy outside the boxes as L1, L2...
+        self.seen_px: dict = {}   # {"B2": (x, y)} pixel position of the candy in each box
         self.loose: dict = {}     # {"L1": (x, y)} pixel position of loose candy
         self.camera_index = camera_index
         self.model_path = os.path.join(self._SOURCE_DIR, model_path)
@@ -324,6 +363,7 @@ class CameraManager:
                     self.last_box_count = snap_to_boxes(positions, find_board_boxes(raw))
                 except Exception as e:  # noqa: BLE001
                     logger.warning("box snapping failed: %s", e)
+        old_positions, old_thres = self.positions, self.positions_thresdist
         self.positions = positions
         self.positions_thresdist = min(
             (tr[1] + br[1] - tl[1] - bl[1]) / (n - 1) / 4,
@@ -333,6 +373,16 @@ class CameraManager:
             {'tl': tl, 'bl': bl, 'tr': tr, 'br': br})
         for w in self.calibration_warnings:
             logger.warning("Calibration: %s", w)
+        # 4 candies somewhere on the board are NOT 4 corners: a skewed or tiny
+        # quadrilateral, or none of the empty boxes matching, means the result
+        # would send the arm to the wrong places. Refuse; keep trying.
+        bad = [w for w in self.calibration_warnings if "skewed" in w or "tiny" in w]
+        if bad or (self.has_camera() and getattr(self, "last_box_count", 0) == 0
+                   and len(find_board_boxes(self.get_last_raw_frame())) >= 4):
+            logger.warning("Calibration rejected: the 4 candies are not the 4 corners")
+            self.positions, self.positions_thresdist = old_positions, old_thres
+            self.last_detection_count = -4     # tells the loop why
+            return False
         self.calibration_method = "candies"
         logger.info("Calibration successful: %d positions mapped (%d snapped to printed boxes)",
                     len(self.positions), getattr(self, "last_box_count", 0))
@@ -387,14 +437,19 @@ class CameraManager:
         scene_one = self.acquire_scene_one()
         result = {}
         loose = []
+        seen_px = {}
         for ele in scene_one:
             ptag = self.find_position((ele[1], ele[2]))
             if ptag:
                 result[ptag] = ele[0]
+                seen_px[ptag] = (float(ele[1]), float(ele[2]))
             elif self.loose_pick and self._on_board((float(ele[1]), float(ele[2]))):
                 loose.append((ele[0], float(ele[1]), float(ele[2])))
         # Candy on the board but in no box: "L1", "L2"... (left to right), so
         # the arm can pick it from its coordinate (--loose-pick).
+        # Where in its box each candy actually lies (pixel), so the arm can
+        # grip a candy that sits off-centre (--loose-pick).
+        self.seen_px = seen_px
         loose.sort(key=lambda t: (t[1], t[2]))
         self.loose = {}
         for k, (name, x, y) in enumerate(loose[:9]):

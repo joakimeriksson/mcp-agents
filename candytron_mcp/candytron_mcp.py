@@ -132,10 +132,15 @@ def move_between(src: str, dst: str) -> str:
         logger.warning("Refused move %r -> %r: %s", src, dst, refusal)
         return refusal
     src, dst = src.strip().upper(), dst.strip().upper()
-    if _LOOSE_TAG.match(src):
+    adj = None if _LOOSE_TAG.match(src) else adjusted_box_pose(src)
+    if adj is not None:
+        ahead = ned_move_from_pose(src, adj, dst)
+    elif _LOOSE_TAG.match(src):
         pose = loose_pose(src)
         if pose is None:
-            return f"Refused: cannot reach the loose candy {src} safely; nothing was moved."
+            return (f"Refused: the {src} candy lies outside the boxes where the arm cannot "
+                    f"pick it safely; nothing was moved. Ask the person to put it in one "
+                    f"of the boxes, then you can hand it out.")
         ahead = ned_move_from_pose(src, pose, dst)
     else:
         ahead = ned_move_between(src, dst)
@@ -235,10 +240,58 @@ def fit_table_mapping() -> bool:
         return False
 
 
+def _pose_at_pixel(px, label: str):
+    """(pose, distance to nearest taught square in m, that square) for the
+    table point under pixel *px*, or None."""
+    import numpy as np
+    import cv2
+    if robotarm.ned is None or not cam:
+        return None
+    if _table_h is None or _table_for is not cam.positions:
+        globals()["_table_for"] = cam.positions
+        if not fit_table_mapping():
+            return None
+    x, y = cv2.perspectiveTransform(np.float32([[px]]), _table_h)[0][0]
+    poses = {t: p for t, p in robotarm.ned.get_poses().items() if t in cam.positions}
+    if not poses:
+        return None
+    near_t, near = min(poses.items(), key=lambda kv: (kv[1].x - x) ** 2 + (kv[1].y - y) ** 2)
+    pose = near.copy_with_offsets(x_offset=float(x) - near.x, y_offset=float(y) - near.y)
+    pose.metadata = near.metadata
+    return pose, float(np.hypot(near.x - x, near.y - y)), near_t
+
+
+def adjusted_box_pose(tag: str):
+    """For a candy IN box *tag*: the taught pose shifted to where the camera
+    sees the candy, when it lies 8 mm - 3 cm off-centre. Otherwise None
+    (use the taught pose)."""
+    if not loose_pick or not cam or tag not in getattr(cam, "seen_px", {}):
+        return None
+    try:
+        r = _pose_at_pixel(cam.seen_px[tag], tag)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pick adjust: %s failed: %s", tag, e)
+        return None
+    if r is None:
+        return None
+    pose, d, near_t = r
+    taught = robotarm.ned.get_pose(tag)
+    import math
+    off = math.hypot(pose.x - taught.x, pose.y - taught.y)
+    if off < 0.008 or off > 0.03:      # below 8 mm is mapping noise
+        if off > 0.03:
+            logger.warning("pick adjust: %s seen %.1f cm off its box -- using the taught pose", tag, 100 * off)
+        return None
+    pose = taught.copy_with_offsets(x_offset=pose.x - taught.x, y_offset=pose.y - taught.y)
+    pose.metadata = taught.metadata
+    logger.warning("pick adjust: %s candy is %.1f cm off-centre -- gripping where it lies", tag, 100 * off)
+    return pose
+
+
 def loose_pose(tag: str):
     """Arm pose to pick the loose candy *tag*, or None if unsafe/unknown:
     the nearest taught square's pose (height and gripper angle), moved to
-    the candy's x/y -- only within 6 cm of a taught square."""
+    the candy's x/y -- only within 8 cm of a taught square."""
     import numpy as np
     import cv2
     if not cam or tag not in cam.loose or robotarm.ned is None:
@@ -256,7 +309,7 @@ def loose_pose(tag: str):
         return None
     near_t, near = min(poses.items(), key=lambda kv: (kv[1].x - x) ** 2 + (kv[1].y - y) ** 2)
     d = float(np.hypot(near.x - x, near.y - y))
-    if d > 0.06:
+    if d > 0.08:     # the middle between 4 squares is ~6.3 cm from each
         logger.warning("loose pick: %s at (%.3f, %.3f) is %.1f cm from the nearest square "
                        "%s -- refused", tag, x, y, 100 * d, near_t)
         return None
@@ -437,19 +490,31 @@ def main():
         once a second. Returns False on timeout; exits on 'q'. A previous
         calibration stays in force until a new one succeeds."""
         status("calibrating: place ONE candy in each of the 4 corners "
-               "(A1, A3, D1, D3) and nothing else on the board")
+               "(A1, A3, D1, D3) and nothing else on the board -- or clear the "
+               "board completely (then the printed boxes are used)")
         t0 = last = time.monotonic()
         while True:
             if cam.calibrate_positions(3, 4):
                 for w in cam.calibration_warnings:
                     status(f"calibration WARNING: {w}")
-                status(f"calibrated ({len(cam.camera_positions())} positions)")
+                how = ("from the 12 printed boxes (empty board)"
+                       if getattr(cam, "calibration_method", "") == "boxes" else
+                       f"from the 4 corner candies, {getattr(cam, 'last_box_count', 0)} "
+                       f"squares snapped to their printed boxes")
+                status(f"calibrated ({len(cam.camera_positions())} positions, {how})")
                 return True
             now = time.monotonic()
             if now - last >= 1.0:
                 last = now
                 n = cam.last_detection_count
-                hint = "remove extra candies" if n > 4 else "one in each corner"
+                if n == -4:
+                    status("calibrating: 4/4 candies seen but they are NOT in the 4 corners "
+                           "-- move them to A1, A3, D1, D3, or clear the board")
+                    n = 4
+                hint = ("remove extra candies" if n > 4 else
+                        "one in each corner, or none at all")
+                if n == 0:
+                    hint += f"; {getattr(cam, 'last_box_count', 0)}/12 printed boxes seen"
                 status(f"calibrating: {n}/4 candies seen (need exactly 4, {hint}) "
                        f"[{now - t0:.0f}s]")
             if timeout_s is not None and now - t0 > timeout_s:

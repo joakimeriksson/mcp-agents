@@ -24,6 +24,7 @@ logger = logging.getLogger("candytron")
 mcp = FastMCP("Candytron 4000")
 
 cam: CameraManager | None = None
+sim_table = None          # sim_table.SimTable when running without hardware
 scene_state = SceneState()
 scene_logger: SceneLogger | None = None
 use_robot = True
@@ -377,6 +378,78 @@ def default_action() -> str:
     return "Did nothing: no physical action was taken, the arm did not move."
 
 
+# ------------------------------------------------------------ simulated table
+# A web view of the simulated table (--simulate-robot --simulate-camera):
+# http://127.0.0.1:7999/sim -- also shown in the control panel.
+from starlette.requests import Request  # noqa: E402
+from starlette.responses import (HTMLResponse, JSONResponse, PlainTextResponse,  # noqa: E402
+                                 Response, StreamingResponse)
+
+_NO_SIM = "no simulated table (start with --simulate-robot --simulate-camera)"
+
+
+@mcp.custom_route("/sim", methods=["GET"])
+async def sim_page(_request: Request) -> Response:
+    if sim_table is None:
+        return PlainTextResponse(_NO_SIM, status_code=404)
+    from sim_page import PAGE
+    return HTMLResponse(PAGE)
+
+
+@mcp.custom_route("/sim/stream", methods=["GET"])
+async def sim_stream(_request: Request) -> Response:
+    """MJPEG: the table as the camera sees it, with what YOLO found."""
+    import asyncio
+    if sim_table is None:
+        return PlainTextResponse(_NO_SIM, status_code=404)
+
+    async def frames():
+        while True:
+            jpg = await asyncio.to_thread(sim_table.jpeg)
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                   + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+            await asyncio.sleep(1 / 12)
+    return StreamingResponse(frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@mcp.custom_route("/sim/frame.jpg", methods=["GET"])
+async def sim_frame(_request: Request) -> Response:
+    import asyncio
+    if sim_table is None:
+        return PlainTextResponse(_NO_SIM, status_code=404)
+    return Response(await asyncio.to_thread(sim_table.jpeg), media_type="image/jpeg")
+
+
+@mcp.custom_route("/sim/state", methods=["GET"])
+async def sim_state(_request: Request) -> Response:
+    """What is really on the table next to what the vision system reports."""
+    if sim_table is None:
+        return JSONResponse({"error": _NO_SIM}, status_code=404)
+    st = sim_table.state()
+    st["seen"] = scene_state.get_scene()
+    st["planned"] = planned_scene()
+    st["queue"] = [list(m) for m in ned_pending_moves()]
+    return JSONResponse(st)
+
+
+@mcp.custom_route("/sim/do/{action}", methods=["POST"])
+async def sim_action(request: Request) -> Response:
+    if sim_table is None:
+        return JSONResponse({"error": _NO_SIM}, status_code=404)
+    a = request.path_params["action"]
+    if a == "restock":
+        sim_table.restock()
+    elif a == "clear":
+        sim_table.clear()
+    elif a == "loose":
+        sim_table.drop_loose()
+    elif a == "fail":
+        sim_table.set_fail_next(not sim_table.fail_next)
+    else:
+        return JSONResponse({"error": f"unknown action {a!r}"}, status_code=400)
+    return JSONResponse({"ok": True, "fail_next": sim_table.fail_next})
+
+
 def _run_mcp_server(args):
     """Run the MCP server. Called in a daemon thread."""
     try:
@@ -389,7 +462,7 @@ def _run_mcp_server(args):
 
 
 def main():
-    global use_robot, robot_ip, cam, scene_logger, loose_pick
+    global use_robot, robot_ip, cam, scene_logger, loose_pick, sim_table
 
     parser = argparse.ArgumentParser(description=mcp.name)
     parser.add_argument('--host', default="127.0.0.1", help='Host to bind to')
@@ -407,6 +480,17 @@ def main():
     parser.add_argument('--loose-pick', action='store_true',
                         help='Also pick candy lying OUTSIDE the boxes (on the board), from its '
                              'camera coordinate. Test carefully on the real arm first.')
+    parser.add_argument('--sim-vision', choices=('yolo', 'direct'), default='yolo',
+                        help="Simulated table: run the real YOLO model on the drawn table "
+                             "(yolo, default) or report exactly what is on it (direct)")
+    parser.add_argument('--sim-speed', type=float, default=1.0,
+                        help='Simulated arm speed factor (2 = twice as fast)')
+    parser.add_argument('--sim-misses-dir', default=None,
+                        help="Simulated table: save frames the YOLO model gets wrong, with "
+                             "the true labels, here (default candytron_mcp/sim_misses; "
+                             "'' turns it off)")
+    parser.add_argument('--sim-static', action='store_true',
+                        help='Old simulation: a fixed list of candies that never changes')
     parser.add_argument('--log-scenes-dir', default=None, help='If set, log every scene request (annotated camera frame + returned state) to this directory')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Increase verbosity (-v for INFO, -vv for DEBUG)')
     args = parser.parse_args()
@@ -491,6 +575,18 @@ def main():
             raise
         status("robot ready" if use_robot else "robot ready (simulated)")
 
+    # Without robot AND camera: a simulated table that is both (sim_table.py).
+    if simulate_camera and args.simulate_robot and not args.sim_static:
+        from sim_table import SimTable, MISSES_DIR
+        misses = MISSES_DIR if args.sim_misses_dir is None else args.sim_misses_dir
+        sim_table = SimTable(vision=args.sim_vision, speed=args.sim_speed, misses_dir=misses)
+        robotarm.sim_arm = sim_table
+        status(f"simulated table: {sim_table.describe()} -- watch it at "
+               f"http://{args.host}:{args.port}/sim")
+        if misses:
+            status(f"simulated table: frames YOLO gets wrong are saved with the true "
+                   f"labels to {misses}")
+
     # Initialize camera
     status(f"table camera {'simulated' if simulate_camera else camera_index}: "
            f"opening camera + loading YOLO model")
@@ -498,6 +594,7 @@ def main():
         camera_index=camera_index,
         show_window=not args.no_window,
         simulate=simulate_camera,
+        sim=sim_table,
     )
     loose_pick = bool(args.loose_pick)
     cam.loose_pick = loose_pick
@@ -561,8 +658,12 @@ def main():
                 cam.exit_cam()
                 sys.exit(0)
 
-    # Calibration loop — retries until success or user presses 'q'
+    # Calibration loop — retries until success or user presses 'q'.
+    # The simulated table starts empty, so the printed boxes are found the
+    # same way as on the real board, and is stocked afterwards.
     calibrate()
+    if sim_table is not None:
+        sim_table.restock()
 
     # Register cleanup for robot shutdown
     atexit.register(exit_ned)
@@ -575,14 +676,20 @@ def main():
 
     # Main thread: continuous camera refresh loop (~5 fps)
     logger.info("Starting continuous camera refresh loop")
+    if sim_table is not None:
+        status("simulated table keys (in its window): r refill, l loose candy, "
+               "f next grip slips, x clear, c recalibrate, q quit")
     try:
         while True:
             scene = cam.grab_and_detect()
             scene_state.update(scene)
-            key = cam.poll_key(wait_ms=200)
+            key = cam.poll_key(wait_ms=100 if sim_table is not None else 200)
             if key == 'q':
                 logger.info("User requested exit via 'q' key")
                 break
+            if sim_table is not None and key in ('r', 'l', 'f', 'x'):
+                {'r': sim_table.restock, 'l': sim_table.drop_loose, 'x': sim_table.clear,
+                 'f': lambda: sim_table.set_fail_next(not sim_table.fail_next)}[key]()
             recal = key == 'c'
             if os.path.exists(recal_flag):
                 try:
@@ -592,7 +699,11 @@ def main():
                 recal = True
             if recal:
                 status("recalibration requested")
-                calibrate(timeout_s=120)
+                if sim_table is not None:
+                    with sim_table.cleared():
+                        calibrate(timeout_s=120)
+                else:
+                    calibrate(timeout_s=120)
     except KeyboardInterrupt:
         logger.info("Shutting down (KeyboardInterrupt)")
     finally:

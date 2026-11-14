@@ -40,6 +40,11 @@ the CandyTron eye/speech client — and Ctrl-C stops what it started.
 `./start-demo.sh` is the same as `--sim`; `./stop-demo.sh` kills stragglers
 (`--all` also stops the voice server).
 
+`--sim` runs a **simulated table**: real candy pictures on a drawn board, the
+real YOLO vision on it, and a pretend arm that really moves the candy. Watch
+it at <http://127.0.0.1:7999/sim> or in the control panel; see
+[candytron_mcp/README.md](candytron_mcp/README.md#simulated-table-no-robot-no-camera).
+
 Options: `--robot-ip IP` (or `$NIRYO_IP`), `--robot-camera N` for the table
 camera, `--simulate-robot` / `--simulate-camera` individually,
 `--no-voice-server`, `--face-agent` to use the face agent as the client.

@@ -41,7 +41,7 @@ from launcher import prompts  # face/prompts.py
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 SESSION_LOG_DIR = os.path.join(L.HERE, "logs")
@@ -208,8 +208,8 @@ class Panel:
             people = best_p
             notes.append(f"PEOPLE #{people} (face seen)")
         else:
-            ok = [i for i in sorted(faces) if i != table]
-            if people == table or people not in faces:
+            ok = [i for i in sorted(faces) if i != table or sim_cam]
+            if (people == table and not sim_cam) or people not in faces:
                 people = ok[0] if ok else people
             notes.append(f"PEOPLE: no face seen — using #{people}")
         changed = (table, people) != (self.cfg["table_cam"], self.cfg["people_cam"])
@@ -279,8 +279,13 @@ class Panel:
         with self.lock:
             if self.running():
                 return "already running"
-            if not skip_auto and not self.cfg.get("sim_camera"):
-                bad = [i for i in (int(self.cfg["table_cam"]), int(self.cfg["people_cam"]))
+            if not skip_auto:
+                # The people camera is real even with the simulated table (a
+                # stale index crashed the client, Nov 2026).
+                need = [int(self.cfg["people_cam"])]
+                if not self.cfg.get("sim_camera"):
+                    need.insert(0, int(self.cfg["table_cam"]))
+                bad = [i for i in need
                        if self.cams.get(i) is None or self.cams.get(i).state() != "ok"]
                 if bad and not self.cams.opening:
                     self.say(f"camera(s) {bad} give no picture — re-detecting before start", "warn")
@@ -566,6 +571,40 @@ async def index(_r: Request):
     return HTMLResponse(PAGE)
 
 
+async def sim_proxy(r: Request):
+    """The simulated table's page, video and buttons live in candytron_mcp
+    (/sim on the MCP port); passed through here so the panel works when it
+    is opened from another machine."""
+    import httpx
+    url = f"http://127.0.0.1:{MCP_PORT}{r.url.path}" + (f"?{r.url.query}" if r.url.query else "")
+    down = Response("the simulated table is not running (start the stack with sim robot + "
+                    "sim camera)", status_code=503, media_type="text/plain")
+    if r.url.path == "/sim/stream":
+        client = httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=None))
+        try:
+            resp = await client.send(client.build_request("GET", url), stream=True)
+        except httpx.HTTPError:
+            await client.aclose()
+            return down
+
+        async def body():
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+        return StreamingResponse(body(), status_code=resp.status_code,
+                                 media_type=resp.headers.get("content-type"))
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            resp = await c.request(r.method, url, content=await r.body())
+    except httpx.HTTPError:
+        return down
+    return Response(resp.content, status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type"))
+
+
 async def api_state(r: Request):
     return JSONResponse(PANEL.state(int(r.query_params.get("since", 0))))
 
@@ -685,7 +724,7 @@ textarea{width:100%;min-height:340px;font:12px/1.45 ui-monospace,Menlo,monospace
 <div class="row"><span id="findmsg" class="d" style="color:var(--mut)"></span></div>
 <div class="row"><label>Table cam</label><select id="table_cam"></select><label style="min-width:0">People cam</label><select id="people_cam"></select></div>
 <div class="row"><label>Microphone</label><select id="mic_name"></select></div>
-<div class="row"><label><input type="checkbox" id="sim_robot"> sim robot</label><label><input type="checkbox" id="sim_camera"> sim camera</label></div>
+<div class="row"><label><input type="checkbox" id="sim_robot"> sim robot</label><span class="d" style="color:var(--mut)">sim robot + table cam "Simulated table" = the drawn table with a pretend arm</span></div>
 <div class="row"><label><input type="checkbox" id="start_voice"> voice server</label><label><input type="checkbox" id="expressive"> expressive</label></div>
 <div class="row"><label><input type="checkbox" id="loose_pick"> pick candy outside the boxes (experimental)</label></div>
 <div class="row"><label>Ear</label><select id="ear"><option value="whisper">Whisper transcribes → gemma4 reads text</option><option value="gemma4">gemma4 hears the audio</option></select></div>
@@ -694,6 +733,8 @@ textarea{width:100%;min-height:340px;font:12px/1.45 ui-monospace,Menlo,monospace
 </div>
 <div class="card"><h2>Cameras <span style="text-transform:none;font-weight:400">(previews only while stopped; orange = table, blue = people)</span></h2><div id="cams" class="cams"></div></div>
 </div><div>
+<div class="card" id="simcard" style="display:none"><h2>Simulated table · <a href="/sim" target="_blank" style="text-transform:none">open the full view (truth vs. vision, buttons)</a></h2>
+<img id="simimg" alt="the simulated table" style="width:100%;border-radius:8px;background:#000;display:block"></div>
 <div class="card"><div class="tabs" id="tabs"></div><div id="tabbody"></div>
 <div class="row" style="color:var(--mut);font-size:12px">Plain text: <a href="/log.txt" target="_blank">log.txt</a> · <a href="/transcript.txt" target="_blank">transcript.txt</a></div></div>
 </div></main>
@@ -703,7 +744,8 @@ const G={pending:'○',progress:'◐',done:'✓',warn:'!',failed:'✗',skipped:'
 async function act(a){const r=await fetch('/api/'+a,{method:'POST'});const j=await r.json();toast(j.msg)}
 function toast(m){$('cfgmsg').textContent=m||'';setTimeout(()=>$('cfgmsg').textContent='',4000)}
 async function saveCfg(){const c={};for(const k of ['robot_ip','extra_args','mic_name','ear'])c[k]=$(k).value;
- for(const k of ['table_cam','people_cam'])c[k]=+$(k).value;for(const k of ['sim_robot','sim_camera','start_voice','expressive','loose_pick'])c[k]=$(k).checked;
+ c.sim_camera=$('table_cam').value=='sim';if(!c.sim_camera)c.table_cam=+$('table_cam').value;c.people_cam=+$('people_cam').value;
+ for(const k of ['sim_robot','start_voice','expressive','loose_pick'])c[k]=$(k).checked;
  const r=await fetch('/api/cfg',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(c)});toast((await r.json()).msg);editing=false}
 document.addEventListener('input',e=>{if(e.target.closest('.card')&&!e.target.closest('#tabbody'))editing=true});
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -716,11 +758,16 @@ function render(){const s=S;$('banner').textContent=s.banner[0];$('banner').clas
   (s.monitor.session&&s.monitor.session.last_turn?`<span></span><span>Last turn</span><span class="d">${new Date(s.monitor.session.last_turn).toLocaleTimeString()}</span>`:'');
  $('findmsg').textContent=s.find_msg;$('bDetect').disabled=s.running||s.auto_running;
  if(!editing){const cfg=s.cfg;$('robot_ip').value=cfg.robot_ip;$('extra_args').value=cfg.extra_args;$('ear').value=cfg.ear||'whisper';
-  for(const k of ['sim_robot','sim_camera','start_voice','expressive','loose_pick'])$(k).checked=!!cfg[k];
-  for(const k of ['table_cam','people_cam']){$(k).innerHTML=s.cams.map(x=>`<option value="${x.idx}">#${x.idx} ${x.state}</option>`).join('');$(k).value=cfg[k]}
+  for(const k of ['sim_robot','start_voice','expressive','loose_pick'])$(k).checked=!!cfg[k];
+  for(const k of ['table_cam','people_cam']){$(k).innerHTML=(k=='table_cam'?'<option value="sim">Simulated table (no camera)</option>':'')+s.cams.map(x=>`<option value="${x.idx}">#${x.idx} ${x.state}</option>`).join('');$(k).value=cfg[k]}
+  if(cfg.sim_camera)$('table_cam').value='sim';
   $('mic_name').innerHTML=[...new Set([cfg.mic_name,...s.mics])].map(n=>`<option>${esc(n)}</option>`).join('');$('mic_name').value=cfg.mic_name}
- const t=+s.cfg.table_cam,p=+s.cfg.people_cam,stamp=Date.now();
+ showSim(s.running&&!!s.cfg.sim_robot&&!!s.cfg.sim_camera);
+ const t=s.cfg.sim_camera?-1:+s.cfg.table_cam,p=+s.cfg.people_cam,stamp=Date.now();
  $('cams').innerHTML=s.cams.map(x=>`<div class="cam ${x.idx==t?'t':''} ${x.idx==p?'p':''}">${(!s.running&&x.state=='ok'||x.state=='black')?`<img src="/cam/${x.idx}.jpg?${stamp}">`:'<div style="aspect-ratio:4/3;display:grid;place-items:center;color:var(--mut)">'+(s.running?'in use':x.state)+'</div>'}#${x.idx} ${x.idx==t?'TABLE':''}${x.idx==p?'PEOPLE':''}</div>`).join('')}
+let simShown=false;
+function showSim(on){if(on==simShown)return;simShown=on;$('simcard').style.display=on?'':'none';
+ const img=$('simimg');if(on){img.onerror=()=>{if(simShown)setTimeout(()=>{img.src='/sim/stream?'+Date.now()},2000)};img.src='/sim/stream?'+Date.now()}else{img.onerror=null;img.removeAttribute('src')}}
 let logLines=[];
 async function poll(){try{const r=await fetch('/api/state?since='+since);S=await r.json();for(const l of S.log)logLines.push(l);if(logLines.length>1500)logLines=logLines.slice(-1500);
  since=S.log_seq;render();if(tab=='log')drawLog();if(tab=='transcript')drawTranscript()}catch(e){$('banner').textContent='Panel server not reachable';$('banner').className='k-bad'}
@@ -769,6 +816,8 @@ def main():
         Route("/api/prompts", api_prompts, methods=["GET", "POST"]),
         Route("/api/{name}", api_action, methods=["POST"]),
         Route("/cam/{idx:int}.jpg", cam),
+        Route("/sim", sim_proxy),
+        Route("/sim/{rest:path}", sim_proxy, methods=["GET", "POST"]),
     ])
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.port}"
     print(f"CandyTron control panel: {url}", flush=True)

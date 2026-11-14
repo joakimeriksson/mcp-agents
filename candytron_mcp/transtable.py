@@ -75,3 +75,9 @@ transtable = {
                     'fr': ("Refreshers", "rectangle bleu avec texte rouge, saveur de citron"),
                     'es': ("Refreshers", "rectángulo azul con texto rojo, sabor a limón")},
     }
+
+# The YOLO model also knows three candies under newer class names; without
+# these the server silently dropped them from what the robot is told.
+for _new, _old in (("NutcremePear", "Pearnut"), ("Nutcreme", "Whitenut"),
+                   ("VanillaToffee", "VanillaFudge")):
+    transtable.setdefault(_new, transtable[_old])

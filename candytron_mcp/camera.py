@@ -158,7 +158,7 @@ class CameraManager:
     _SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
     def __init__(self, camera_index: int = 0, model_path: str = 'models/best-m.pt',
-                 show_window: bool = True, simulate: bool = False):
+                 show_window: bool = True, simulate: bool = False, sim=None):
         self.loose_pick = False   # --loose-pick: report candy outside the boxes as L1, L2...
         self.seen_px: dict = {}   # {"B2": (x, y)} pixel position of the candy in each box
         self.loose: dict = {}     # {"L1": (x, y)} pixel position of loose candy
@@ -166,6 +166,10 @@ class CameraManager:
         self.model_path = os.path.join(self._SOURCE_DIR, model_path)
         self.show_window = show_window
         self.simulate = simulate
+        # sim_table.SimTable: a drawn table that stands in for the camera.
+        # Its frames go through the same YOLO + calibration code as real ones
+        # (or, with vision="direct", it reports what is on it).
+        self.sim = sim
         self.capture: cv2.VideoCapture | None = None
         self.yolomodel: YOLO | None = None
         self.positions: dict[str, tuple] = {}
@@ -206,6 +210,14 @@ class CameraManager:
         return None
 
     def init_cam(self) -> None:
+        if self.sim is not None:
+            if self.sim.vision == "yolo":
+                if not os.path.isfile(self.model_path):
+                    raise RuntimeError(f"YOLO model not found: {self.model_path}")
+                self.yolomodel = YOLO(self.model_path)
+            self.capture = self.sim
+            logger.info("Simulated table as the camera (vision: %s)", self.sim.vision)
+            return
         if self.simulate:
             logger.info("Camera simulation mode enabled")
             return
@@ -227,7 +239,7 @@ class CameraManager:
             self.capture = None
 
     def has_camera(self) -> bool:
-        return self.yolomodel is not None
+        return self.yolomodel is not None or self.sim is not None
 
     def get_last_frame(self):
         """Return a copy of the most recent annotated camera frame, or None if unavailable."""
@@ -256,25 +268,41 @@ class CameraManager:
             logger.error("Failed to read frame from camera")
             return []
         self._frame_size = (fr.shape[1], fr.shape[0])
+        if self.yolomodel is None:          # simulated table, direct vision
+            dets = self.sim.detections()
+            with self._last_frame_lock:
+                self._last_frame = self.sim.annotate(fr, dets)
+                self._last_raw_frame = fr
+            self._show(self._last_frame)
+            return dets
         res = self.yolomodel(fr, verbose=False)[0]
         annotated_frame = res.plot()
         with self._last_frame_lock:
             self._last_frame = annotated_frame
             self._last_raw_frame = fr
+        if self.sim is not None:
+            self.sim.set_vision([(res.names[int(b.cls)], float(b.conf), *map(float, b.xyxy[0]))
+                                 for b in res.boxes], frame=fr)
 
-        if self.show_window:
-            h, w = annotated_frame.shape[:2]
-            display_frame = annotated_frame
-            if w > 1280:
-                display_frame = cv2.resize(annotated_frame, (w // 2, h // 2))
-            cv2.imshow(f'CandyTron 4000 - Table camera {self.camera_index} (YOLO)', display_frame)
-            if self._open_window_count == 0:
-                cv2.moveWindow('YOLO Detection', 200, 50)
-            self._open_window_count += 1
+        self._show(annotated_frame)
 
         return [(res.names[int(bx.cls)],
                  (bx.xyxy[0][0] + bx.xyxy[0][2]) / 2,
                  (bx.xyxy[0][1] + bx.xyxy[0][3]) / 2) for bx in res.boxes]
+
+    def _show(self, annotated_frame) -> None:
+        if not self.show_window:
+            return
+        h, w = annotated_frame.shape[:2]
+        display_frame = annotated_frame
+        if w > 1280:
+            display_frame = cv2.resize(annotated_frame, (w // 2, h // 2))
+        title = ("CandyTron 4000 - simulated table" if self.sim is not None
+                 else f'CandyTron 4000 - Table camera {self.camera_index} (YOLO)')
+        cv2.imshow(title, display_frame)
+        if self._open_window_count == 0:
+            cv2.moveWindow('YOLO Detection', 200, 50)
+        self._open_window_count += 1
 
     def poll_key(self, wait_ms: int = 50) -> str | None:
         """Pump the GUI event loop and pace the caller.

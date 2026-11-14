@@ -18,3 +18,8 @@ env.sh
 
 # Output files
 *.png
+
+# candy pictures for the simulated table (candytron_mcp/sim_table.py)
+!candytron_mcp/sim_assets/*.png
+# frames the YOLO model got wrong on the simulated table (training material)
+candytron_mcp/sim_misses/

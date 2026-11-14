@@ -107,6 +107,9 @@ class MoveQueue:
 ned: ned2.Ned2 | None = None
 _ned_worker: MoveQueue | None = None
 _simulated = False
+# The simulated table (sim_table.SimTable) when running without hardware:
+# moves are acted out there, with the same poses the real arm would get.
+sim_arm = None
 
 
 def _async_ned_call(args: dict) -> None:
@@ -114,6 +117,9 @@ def _async_ned_call(args: dict) -> None:
         return
     op = args.get('op')
     if op == 'home':
+        if _simulated and sim_arm is not None:
+            sim_arm.home()
+            return
         ned.move_to_home_pose()
     elif op == 'move':
         src, dst = args['from'], args['to']
@@ -123,7 +129,14 @@ def _async_ned_call(args: dict) -> None:
         logger.warning("arm: starting move %s%s", name, " (simulated)" if _simulated else "")
         t0 = time.monotonic()
         if _simulated:
-            time.sleep(SIM_MOVE_SECONDS)
+            if sim_arm is None:
+                time.sleep(SIM_MOVE_SECONDS)
+                return
+            ok = sim_arm.pick_and_place(src, dst, name)
+            logger.warning("arm: move %s %s after %.1f s (simulated)", name,
+                           "done" if ok else "delivered nothing", time.monotonic() - t0)
+            if _ned_worker is None or _ned_worker.moves_waiting() <= 1:
+                sim_arm.home()
             return
         try:
             result = ned.pick_and_place(src, dst)

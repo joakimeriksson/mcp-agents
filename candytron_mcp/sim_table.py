@@ -69,7 +69,22 @@ PAPER_MARGIN_M = 0.045
 TRAY_R_M = 0.050
 TABLE_Z = 0.095                # z of the taught poses = gripping height
 APPROACH_DZ = 0.07             # the real pick_and_place goes 7 cm above
-L1, L2 = 0.26, 0.24            # simulated arm links (reach 0.50 m)
+
+# The arm is drawn as a Niryo Ned2 seen from above: a turret on a round base
+# turns towards the target (joint 1), shoulder/elbow/wrist pitch in that
+# vertical plane, the gripper points straight down. Poses are the tool
+# flange (as on the real arm); the base stands on the table at z = 0.
+NED_SHOULDER_Z = 0.17
+NED_L1, NED_L2 = 0.221, 0.237  # upper arm, elbow -> wrist
+NED_WRIST_DZ = 0.024           # wrist joint above the tool flange
+NED_TOOL_DZ = 0.085            # flange -> fingertips
+NED_BASE_R = 0.075
+CAM_H = 1.6                    # sizes grow with height as seen from a camera this high
+NED_BLUE = (215, 120, 20)      # BGR
+NED_BLUE_LIGHT = (250, 190, 110)
+NED_BLUE_DARK = (110, 55, 10)
+NED_GREY = (52, 52, 58)
+NED_GREY_LIGHT = (95, 95, 102)
 
 # Long side of each candy (wrapper included), metres.
 # (About 20 % above life size: the real camera sits closer than this one, and
@@ -436,13 +451,17 @@ class SimTable:
             self.event(f"the visitor took the {c.name}")
 
     # --------------------------------------------------------------- arm
-    def _ik(self, x: float, y: float):
-        """Elbow position of the two-link arm reaching (x, y)."""
-        r = max(abs(L1 - L2) + 1e-3, min(L1 + L2 - 1e-4, math.hypot(x, y)))
+    @staticmethod
+    def _ned(x: float, y: float, z: float):
+        """Ned2 joint positions for the tool flange at (x, y, z): joint-1 angle,
+        then (radius, height) of the elbow and of the wrist, elbow up."""
         th = math.atan2(y, x)
-        a = math.acos((L1 * L1 + r * r - L2 * L2) / (2 * L1 * r))
-        th1 = th + a                     # elbow towards +y (the open table on the right)
-        return L1 * math.cos(th1), L1 * math.sin(th1)
+        wr, wz = math.hypot(x, y), z + NED_WRIST_DZ
+        dz = wz - NED_SHOULDER_Z
+        d = max(abs(NED_L1 - NED_L2) + 1e-3, min(NED_L1 + NED_L2 - 1e-4, math.hypot(wr, dz)))
+        a = math.acos(max(-1.0, min(1.0, (NED_L1 ** 2 + d * d - NED_L2 ** 2) / (2 * NED_L1 * d))))
+        phi = math.atan2(dz, wr) + a
+        return th, (NED_L1 * math.cos(phi), NED_SHOULDER_Z + NED_L1 * math.sin(phi)), (wr, wz)
 
     def _glide(self, x: float, y: float, z: float, dur: float | None = None):
         a = self.arm
@@ -561,6 +580,17 @@ class SimTable:
                 logger.warning("sim: could not save a missed case: %s", e)
 
     # ------------------------------------------------- missed-case capture
+    def board_px(self, margin: int = 24) -> tuple[int, int, int, int]:
+        """Pixel rectangle (x1, y1, x2, y2) of the paper board -- what the real
+        table camera's window shows."""
+        xs = [p[0] for p in self.boxes.values()]
+        ys = [p[1] for p in self.boxes.values()]
+        m = BOX_M / 2 + PAPER_MARGIN_M
+        x1, y1 = _ipt(min(xs) - m, min(ys) - m)
+        x2, y2 = _ipt(max(xs) + m, max(ys) + m)
+        return (max(0, x1 - margin), max(0, y1 - margin),
+                min(FRAME_W, x2 + margin), min(FRAME_H, y2 + margin))
+
     def label_boxes(self, candies) -> list:
         """[(candy, x1, y1, x2, y2)]: where each candy's wrapper is in the
         frame (the visible pixels of its picture)."""
@@ -662,9 +692,10 @@ class SimTable:
                     (230, 230, 230), 1, cv2.LINE_AA)
         # the robot's base
         bx, by = _ipt(0, 0)
-        cv2.circle(img, (bx + 5, by + 6), int(0.07 * SCALE), (95, 60, 22), -1, cv2.LINE_AA)
-        cv2.circle(img, (bx, by), int(0.07 * SCALE), (70, 70, 74), -1, cv2.LINE_AA)
-        cv2.circle(img, (bx, by), int(0.05 * SCALE), (95, 95, 100), -1, cv2.LINE_AA)
+        r = int(NED_BASE_R * SCALE)
+        cv2.circle(img, (bx + 6, by + 8), r, (95, 60, 22), -1, cv2.LINE_AA)
+        cv2.circle(img, (bx, by), r, (40, 40, 45), -1, cv2.LINE_AA)
+        cv2.circle(img, (bx, by), r - 6, (62, 62, 68), -1, cv2.LINE_AA)
         return img
 
     def _sprite(self, c: Candy, scale: float = 1.0):
@@ -708,11 +739,7 @@ class SimTable:
                 self._recorded = (labels, idle)
         for c in candies:
             _paste(img, self._sprite(c), *to_px(c.x, c.y), shadow=(3, 4))
-        lift = 1.0 + 2.2 * max(0.0, a.z - TABLE_Z)
-        if a.held is not None:
-            off = int(30 * (a.z - TABLE_Z) * SCALE / 100)
-            _paste(img, self._sprite(a.held, lift), *to_px(a.x, a.y), shadow=(3 + off, 4 + off))
-        self._draw_arm(img, a, lift)
+        self._draw_arm(img, a)
         self._frame_no += 1
         base = img.astype(np.int16)
         if self.light != 1.0:
@@ -723,41 +750,71 @@ class SimTable:
             self._overlay(noisy)
         return noisy
 
-    def _draw_arm(self, img, a: ArmState, lift: float):
-        ex, ey = self._ik(a.x, a.y)
-        base, elbow, tip = _ipt(0, 0), _ipt(ex, ey), _ipt(a.x, a.y)
-        sh = int(8 + 60 * max(0.0, a.z - TABLE_Z))
+    def _draw_arm(self, img, a: ArmState):
+        """The Ned2 from above, lowest parts first; widths grow with height."""
+        th, (er, ez), (wr, wz) = self._ned(a.x, a.y, a.z)
+        c, sn = math.cos(th), math.sin(th)
+
+        def at(r, z, side=0.0):         # pixel (float) of a point in the arm's plane
+            px, py = to_px(r * c - side * sn, r * sn + side * c)
+            return np.array([px, py]), _size(z)
+
+        base, _ = at(0, 0)
+        sh, s_sh = at(0, NED_SHOULDER_Z)
+        el, s_el = at(er, ez)
+        wr_, s_wr = at(wr, wz)
+        fl, s_fl = at(wr, a.z)
+        u = np.array(to_px(c, sn)) - np.array(to_px(0, 0))
+        u /= np.linalg.norm(u)                            # along the arm, in pixels
+        v = np.array([-u[1], u[0]])                       # across (joint axes)
+        m = SCALE
+
+        # shadow of the whole arm, cast down-right, further for higher parts
         shadow = img.copy()
-        for p, q, w in ((base, elbow, 40), (elbow, tip, 32)):
-            cv2.line(shadow, (p[0] + sh, p[1] + sh), (q[0] + sh, q[1] + sh), (0, 0, 0), w, cv2.LINE_AA)
-        cv2.addWeighted(shadow, 0.25, img, 0.75, 0, img)
-        for p, q, w in ((base, elbow, 40), (elbow, tip, 32)):
-            cv2.line(img, p, q, (55, 55, 60), w + 4, cv2.LINE_AA)
-            cv2.line(img, p, q, (225, 225, 228), w, cv2.LINE_AA)
-        for p, r in ((base, 26), (elbow, 22)):
-            cv2.circle(img, p, r, (55, 55, 60), -1, cv2.LINE_AA)
-            cv2.circle(img, p, r - 6, (0, 140, 255), -1, cv2.LINE_AA)
-        # the gripper: two fingers across the forearm, further apart when open
-        dx, dy = tip[0] - elbow[0], tip[1] - elbow[1]
-        n = math.hypot(dx, dy) or 1.0
-        ux, uy = dx / n, dy / n                          # along the forearm
-        vx, vy = -uy, ux                                 # across
-        gap = (0.008 + 0.018 * (1 - a.grip)) * SCALE * lift
-        flen = 0.022 * SCALE * lift
-        # the wrist plate the fingers slide on
-        wx, wy = vx * (gap + 6), vy * (gap + 6)
-        cv2.line(img, (int(tip[0] - wx), int(tip[1] - wy)), (int(tip[0] + wx), int(tip[1] + wy)),
-                 (55, 55, 60), int(12 * lift), cv2.LINE_AA)
-        for s in (-1, 1):
-            cx, cy = tip[0] + s * vx * gap, tip[1] + s * vy * gap
-            p = (int(cx - ux * flen / 2), int(cy - uy * flen / 2))
-            q = (int(cx + ux * flen / 2), int(cy + uy * flen / 2))
-            cv2.line(img, p, q, (30, 30, 34), int(10 * lift), cv2.LINE_AA)
-            cv2.line(img, p, q, (0, 140, 255) if a.grip > 0.5 else (120, 120, 125),
-                     max(2, int(4 * lift)), cv2.LINE_AA)
-        cv2.circle(img, tip, int(14 * lift), (55, 55, 60), -1, cv2.LINE_AA)
-        cv2.circle(img, tip, int(8 * lift), (0, 140, 255) if a.moving else (150, 150, 155),
-                   -1, cv2.LINE_AA)
+        segs = ((sh, NED_SHOULDER_Z, el, ez, 0.050), (el, ez, wr_, wz, 0.040),
+                (wr_, wz, fl, a.z - NED_TOOL_DZ, 0.035))
+        for p, zp, q, zq, w in segs:
+            cv2.line(shadow, _i(p + _shadow_px(zp)), _i(q + _shadow_px(zq)), (0, 0, 0),
+                     int(w * m), cv2.LINE_AA)
+        cv2.circle(shadow, _i(sh + _shadow_px(0.1)), int(0.05 * m), (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.addWeighted(shadow, 0.28, img, 0.72, 0, img)
+
+        # base: LED ring (green = ready, cyan = moving) and the turning turret
+        led = (255, 230, 60) if a.moving else (90, 220, 60)
+        cv2.circle(img, _i(base), int((NED_BASE_R - 0.012) * m), led, 4, cv2.LINE_AA)
+        _bar(img, sh - u * 0.030 * m, sh + u * 0.020 * m, 0.090 * m * s_sh, 0.080 * m * s_sh,
+             NED_BLUE, NED_BLUE_DARK, NED_BLUE_LIGHT, v)
+        # shoulder motor inside the turret, upper arm, wrist housing, forearm
+        _bar(img, sh - v * 0.030 * m * s_sh, sh + v * 0.030 * m * s_sh, 0.030 * m * s_sh,
+             0.030 * m * s_sh, NED_GREY, (25, 25, 28), NED_GREY_LIGHT, u)
+        _bar(img, sh, el, 0.050 * m * s_sh, 0.046 * m * s_el, NED_BLUE, NED_BLUE_DARK,
+             NED_BLUE_LIGHT, v)
+        _bar(img, wr_ - v * 0.017 * m * s_wr, wr_ + v * 0.017 * m * s_wr, 0.028 * m * s_wr,
+             0.028 * m * s_wr, NED_GREY, (25, 25, 28), NED_GREY_LIGHT, u)
+        _bar(img, el, wr_, 0.040 * m * s_el, 0.030 * m * s_wr, NED_BLUE, NED_BLUE_DARK,
+             NED_BLUE_LIGHT, v)
+        # the gripper hangs below the wrist; drawn on top so it can be seen:
+        # body across the arm, fingers further apart when open
+        gap = (0.008 + 0.016 * (1 - a.grip)) * m * s_fl
+        flen, fw = 0.020 * m * s_fl, max(3, int(0.007 * m * s_fl))
+        _bar(img, fl - v * (gap + 6), fl + v * (gap + 6), 0.016 * m * s_fl, 0.016 * m * s_fl,
+             NED_GREY, (25, 25, 28), NED_GREY_LIGHT, u)
+        if a.held is not None:                            # between the fingers
+            h = max(0.0, a.z - TABLE_Z)
+            off = int(_shadow_px(h)[0])
+            _paste(img, self._sprite(a.held, 1.0 + 2.2 * h), *to_px(a.x, a.y),
+                   shadow=(3 + off, 4 + off))
+        for k in (-1, 1):
+            f = fl + v * k * gap
+            cv2.line(img, _i(f - u * flen / 2), _i(f + u * flen / 2), (25, 25, 28), fw + 4,
+                     cv2.LINE_AA)
+            cv2.line(img, _i(f - u * flen / 2), _i(f + u * flen / 2),
+                     (0, 170, 255) if a.grip > 0.5 else (185, 185, 190), fw, cv2.LINE_AA)
+        # the elbow, highest of all
+        _bar(img, el - v * 0.026 * m * s_el, el + v * 0.026 * m * s_el, 0.034 * m * s_el,
+             0.034 * m * s_el, NED_GREY, (25, 25, 28), NED_GREY_LIGHT, u)
+        cv2.circle(img, _i(el), int(0.013 * m * s_el), NED_BLUE, -1, cv2.LINE_AA)
+        cv2.circle(img, _i(el), int(0.006 * m * s_el), (235, 235, 235), -1, cv2.LINE_AA)
 
     def _overlay(self, img):
         with self._lock:
@@ -892,6 +949,40 @@ def _rounded_rect(img, p1, p2, r, color, thickness):
     for (cx, cy), ang in (((x1 + r, y1 + r), 180), ((x2 - r, y1 + r), 270),
                           ((x2 - r, y2 - r), 0), ((x1 + r, y2 - r), 90)):
         cv2.ellipse(img, (cx, cy), (r, r), ang, 0, 90, color, thickness, cv2.LINE_AA)
+
+
+def _size(z: float) -> float:
+    """How much bigger something z metres above the table looks to the camera."""
+    return CAM_H / (CAM_H - min(max(z, 0.0), CAM_H * 0.6))
+
+
+def _shadow_px(z: float) -> np.ndarray:
+    return np.array([60.0, 75.0]) * max(z, 0.0)
+
+
+def _i(p) -> tuple[int, int]:
+    return int(round(p[0])), int(round(p[1]))
+
+
+def _bar(img, p, q, wp: float, wq: float, fill, edge, light, across):
+    """A rounded, tapered bar from p to q (pixels), wp/wq wide, outlined and
+    with a highlight on the side the light comes from (-across)."""
+    p, q = np.asarray(p, float), np.asarray(q, float)
+    d = q - p
+    n = max(float(np.linalg.norm(d)), 1e-6)
+    t = np.array([-d[1], d[0]]) / n if n >= 1.0 else np.asarray(across, float)
+    for col, grow in ((edge, 2.5), (fill, 0.0)):
+        a, b = wp / 2 + grow, wq / 2 + grow
+        poly = np.array([p + t * a, q + t * b, q - t * b, p - t * a])
+        cv2.fillConvexPoly(img, np.round(poly).astype(np.int32), col, cv2.LINE_AA)
+        cv2.circle(img, _i(p), max(1, int(a)), col, -1, cv2.LINE_AA)
+        cv2.circle(img, _i(q), max(1, int(b)), col, -1, cv2.LINE_AA)
+    # highlight stripe towards the light (up-left)
+    side = t if (t[0] + t[1]) < 0 else -t
+    off = 0.22
+    hw = max(1, int(min(wp, wq) * 0.18))
+    if n >= 1.0:
+        cv2.line(img, _i(p + side * wp * off), _i(q + side * wq * off), light, hw, cv2.LINE_AA)
 
 
 def _paste(img, sp, cx: float, cy: float, shadow=(0, 0)):

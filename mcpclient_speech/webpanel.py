@@ -691,7 +691,8 @@ h1{font-size:18px;margin:0 8px 0 0}button{font:inherit;padding:7px 14px;border-r
 button.primary{background:var(--acc);border-color:var(--acc);color:#fff}button.danger{color:var(--bad)}button:disabled{opacity:.45;cursor:default}
 #banner{margin:12px 16px;padding:10px 14px;border-radius:8px;font-weight:600}
 .k-info{background:#8881;}.k-busy{background:#ffb54733}.k-calib{background:#ff8c2a44}.k-ok{background:#2ea04333}.k-warn{background:#d2992233}.k-bad{background:#f8514933}
-main{display:grid;grid-template-columns:minmax(300px,420px) 1fr;gap:14px;padding:0 16px 16px}
+main{display:grid;grid-template-columns:minmax(300px,420px) minmax(0,1fr);gap:14px;padding:0 16px 16px}
+main>div{min-width:0}
 @media (max-width:900px){main{grid-template-columns:1fr}main>div:last-child{order:-1}}
 #tabbody pre{min-height:300px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px}
@@ -734,7 +735,7 @@ textarea{width:100%;min-height:340px;font:12px/1.45 ui-monospace,Menlo,monospace
 <div class="card"><h2>Cameras <span style="text-transform:none;font-weight:400">(previews only while stopped; orange = table, blue = people)</span></h2><div id="cams" class="cams"></div></div>
 </div><div>
 <div class="card" id="simcard" style="display:none"><h2>Simulated table · <a href="/sim" target="_blank" style="text-transform:none">open the full view (truth vs. vision, buttons)</a></h2>
-<img id="simimg" alt="the simulated table" style="width:100%;border-radius:8px;background:#000;display:block"></div>
+<img id="simimg" alt="the simulated table" style="width:100%;max-height:72vh;object-fit:contain;border-radius:8px;background:#000;display:block"></div>
 <div class="card"><div class="tabs" id="tabs"></div><div id="tabbody"></div>
 <div class="row" style="color:var(--mut);font-size:12px">Plain text: <a href="/log.txt" target="_blank">log.txt</a> · <a href="/transcript.txt" target="_blank">transcript.txt</a></div></div>
 </div></main>

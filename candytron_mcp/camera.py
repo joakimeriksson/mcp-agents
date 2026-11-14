@@ -293,6 +293,9 @@ class CameraManager:
     def _show(self, annotated_frame) -> None:
         if not self.show_window:
             return
+        if self.sim is not None:            # the board only, like the real camera
+            x1, y1, x2, y2 = self.sim.board_px()
+            annotated_frame = annotated_frame[y1:y2, x1:x2]
         h, w = annotated_frame.shape[:2]
         display_frame = annotated_frame
         if w > 1280:

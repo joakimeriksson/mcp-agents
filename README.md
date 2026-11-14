@@ -41,7 +41,7 @@ the CandyTron eye/speech client — and Ctrl-C stops what it started.
 (`--all` also stops the voice server).
 
 `--sim` runs a **simulated table**: real candy pictures on a drawn board, the
-real YOLO vision on it, and a pretend arm that really moves the candy. Watch
+real YOLO vision on it, and a simulated Ned2 arm (drawn from above) that really moves the candy. Watch
 it at <http://127.0.0.1:7999/sim> or in the control panel; see
 [candytron_mcp/README.md](candytron_mcp/README.md#simulated-table-no-robot-no-camera).
 

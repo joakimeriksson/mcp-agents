@@ -24,7 +24,7 @@ th{color:var(--mut);font-weight:500}.ok{color:var(--ok)}.bad{color:var(--bad);fo
 ul{list-style:none;margin:0;padding:0;font-size:13px;max-height:260px;overflow:auto}li{padding:2px 0;border-bottom:1px dashed var(--line)}
 .pill{font-size:12px;padding:2px 8px;border-radius:99px;background:#8882}
 </style></head><body>
-<header><h1>Simulated candy table</h1><span class="mut">drawn table + real YOLO vision + a pretend arm</span><span id="mode" class="pill"></span></header>
+<header><h1>Simulated candy table</h1><span class="mut">drawn table + real YOLO vision + a simulated Ned2 arm</span><span id="mode" class="pill"></span></header>
 <main><div>
 <div class="card"><img src="/sim/stream" alt="the simulated table, as the table camera sees it"></div>
 <div class="card"><h2>Do something to the table</h2><div class="btns">

@@ -185,6 +185,7 @@ def _clean_spoken(sentence: str) -> tuple:
         return mm.group(0)
     sentence = _BRACKET_MOOD.sub(_bm, sentence)
     sentence = _JUNK_TAG.sub(" ", sentence)
+    sentence = _EMPTY_TAG.sub(" ", sentence)
     sentence = re.sub(r"\*+([^*]+)\*+", r"\1", sentence).replace("*", "")
     sentence = re.sub(r"\s+", " ", sentence).strip()
     sentence = re.sub(r"^[!?.,;:\s]+", "", sentence)
@@ -249,11 +250,15 @@ SHORT_UTTERANCE_S = 1.0
 _LEAD_TAGS = re.compile(r"^\s*(?:\[[^\[\]]{1,24}\]\s*)+")
 
 
+_EMPTY_TAG = re.compile(r"\s*\[\s*\]\s*")
+
+
 def _split_lang(text: str, default: str) -> tuple:
     """('sv', 'Hej!') from '[sv] Hej!'; the tag is never spoken. The language
     tag may come after a mood tag ("[glad] [en] Here...") -- the mood tag is
-    kept, only the language tag is removed."""
-    text = text or ""
+    kept, only the language tag is removed. An empty tag ("[ ] Varsågod")
+    -- gemma4 sometimes leaves one -- is dropped."""
+    text = _EMPTY_TAG.sub(" ", text or "").strip()
     m = _LANG_TAG.match(text)
     if m:
         return m.group(1).lower(), text[m.end():].strip()
@@ -347,6 +352,9 @@ class DirectAudioLLM:
                  temperature: float = 0.2):
         self.last_tool_calls: list = []
         self.rejected_tool_calls: list = []
+        # What the service's policy found worth remembering this turn
+        # ("was given a Dumle"); the client keeps it in its visit memory.
+        self.last_notes: list = []
         import ollama
         self._client = ollama.Client(host=host)
         self._model = model
@@ -395,6 +403,20 @@ class DirectAudioLLM:
         logger.info(f"direct: {len(mapped)} tool(s) from {url}: {names}")
         return mapped
 
+    def _record(self, name: str, args: dict, result: str, state: dict) -> None:
+        """A call the service ran: keep it, let the policy note what is
+        worth remembering about the visitor (on the state the call acted
+        on), then let it update the state."""
+        self.last_tool_calls.append((name, args, result))
+        try:
+            note = self.policy.remember(name, args, result, state)
+        except Exception as e:  # noqa: BLE001 - a policy bug must not break the turn
+            logger.warning(f"direct: policy.remember failed: {e}")
+            note = None
+        if note:
+            self.last_notes.append(note)
+        self.policy.apply(name, args, result, state)
+
     def _call_tool(self, name: str, args: dict) -> str:
         async def _call():
             from fastmcp import Client
@@ -418,6 +440,23 @@ class DirectAudioLLM:
               "setting? Offers (\"would you like...\", \"I can...\"), questions and "
               "descriptions of what it CAN do are NO. Answer with one word: YES or NO.")
 
+    # With the person's words (Whisper ear): catches AGREEMENTS -- "Can I have
+    # a Plopp?" -> "Of course, you can have a Plopp!" with no move. The
+    # reply-only judge above missed 6/6 of those (Nov 2026, gemma4); this one
+    # got 17/18 over request/answer/offer/question pairs, and its one miss
+    # was the safe kind (a demo request judged NO, never a question judged YES).
+    _JUDGE_REQUEST = ("An assistant acts in the real world ONLY through these tools:\n"
+                      "{tools}\n\n"
+                      "The person said:\n\"{request}\"\n\n"
+                      "The assistant replied:\n\"{reply}\"\n\n"
+                      "Answer YES only if BOTH are true: (1) the person asked for a specific "
+                      "thing to be done for them NOW (\"can I have X\", \"give me X\", "
+                      "\"I want X\"), and (2) the reply agrees to do it or says it is done "
+                      "or being done. Answer NO if the person asked a question about what "
+                      "exists or what the assistant can do, or if the reply only answers, "
+                      "offers (\"would you like one?\"), asks back, or refuses. Answer with "
+                      "one word: YES or NO.")
+
     def _tool_summary(self) -> str:
         lines = []
         for t in self._tools or []:
@@ -428,23 +467,30 @@ class DirectAudioLLM:
             lines.append(f"- {fn.get('name')}: {desc[0][:120] if desc else ''}")
         return "\n".join(lines) or "- (none)"
 
-    def _judge_claims_action(self, reply: str) -> bool:
-        """Language-independent check: does *reply* claim a physical action?"""
+    def _judge_claims_action(self, reply: str, request: Optional[str] = None) -> bool:
+        """Language-independent check: does *reply* claim (or agree to) an
+        action that needs a tool? With *request* (what the person said) it also
+        catches a "yes, you can have one" that never called the tool."""
         text = _split_lang(_strip_tool_text(reply), "")[1]
         if not text:
             return False
+        if request:
+            prompt = self._JUDGE_REQUEST.format(tools=self._tool_summary(),
+                                                request=request[:300], reply=text[:400])
+        else:
+            prompt = self._JUDGE.format(tools=self._tool_summary(), reply=text[:400])
         t0 = time.time()
         try:
             out = self._client.chat(model=self._model, messages=[{"role": "user", "content":
-                                    self._JUDGE.format(tools=self._tool_summary(),
-                                                       reply=text[:400])}],
+                                    prompt}],
                                     options={"temperature": 0, "num_predict": 3}, think=False,
                                     stream=False, keep_alive=KEEP_ALIVE)["message"]["content"]
         except Exception as e:  # noqa: BLE001
             logger.warning(f"direct: action judge failed: {e}")
             return False
         verdict = (out or "").strip().upper().startswith(("YES", "JA"))
-        logger.info(f"direct: action judge {'YES' if verdict else 'NO'} in "
+        logger.info(f"direct: action judge{' (with request)' if request else ''} "
+                    f"{'YES' if verdict else 'NO'} in "
                     f"{time.time() - t0:.2f}s for {text[:60]!r}")
         if verdict:
             logger.warning(f"direct: judge says the reply claims an action: {text[:70]!r}")
@@ -579,18 +625,20 @@ class DirectAudioLLM:
               augmentation: Optional[str] = None,
               history: Optional[list] = None,
               on_sentence: Optional[Callable[[str, str], None]] = None,
+              context: str = "",
               ) -> tuple[str, str]:
         """Text-only greeting turn, streamed sentence by sentence and without
         tools (a greeting never moves the arm), so the first words are heard
-        well under a second after contact."""
+        well under a second after contact. ``context``: what we remember
+        about the person (e.g. the visit memory's "Earlier: ..." line)."""
         lname = self._LANG_NAMES.get(language, "Swedish")
         lang_rule = (f"- Reply in {lname} (tag [{language}]) unless the person "
                      f"spoke another language earlier in the conversation.\n")
-        system = self._system(service_prompt, augmentation, language, "", lang_rule)
+        system = self._system(service_prompt, augmentation, language, context, lang_rule)
         messages = [{"role": "system", "content": system}]
         messages += _history_messages(history)
         messages.append({"role": "user", "content": instruction})
-        self.last_tool_calls, self.rejected_tool_calls = [], []
+        self.last_tool_calls, self.rejected_tool_calls, self.last_notes = [], [], []
         start = time.time()
         msg = self._chat(messages, None, on_sentence, language)
         lang, reply = _split_lang((msg.get("content") or "").strip(), language)
@@ -676,11 +724,16 @@ class DirectAudioLLM:
             from lang_id import language_name
             heard = self.lang_id.transcribe(
                 audio, self.policy.hint_words(self.policy.parse_state(aug)))
+            fixed = self.policy.normalize_heard(heard.text, self.policy.parse_state(aug)) \
+                if heard.text else heard.text
+            if fixed != heard.text:
+                logger.info(f"direct: heard {heard.text!r} -> {fixed!r} (service vocabulary)")
+                heard = heard._replace(text=fixed)
             self.last_heard = heard
             if not heard.text:
                 # Noise, a cough, crowd babble: say nothing rather than answer it.
                 logger.info(f"direct: whisper heard nothing usable ({heard.reason})")
-                self.last_tool_calls, self.rejected_tool_calls = [], []
+                self.last_tool_calls, self.rejected_tool_calls, self.last_notes = [], [], []
                 return "", language_hint or "en"
             code = heard.language
             prob = 1.0
@@ -732,6 +785,7 @@ class DirectAudioLLM:
         # same as one where it works, so this must not be INFO-only.
         self.last_tool_calls = []
         self.rejected_tool_calls = []
+        self.last_notes = []
         scene = self.policy.parse_state(aug)
         scene_at_start = dict(scene)   # policy.apply updates `scene` as calls happen
         reply, used_tools = "", False
@@ -797,8 +851,7 @@ class DirectAudioLLM:
                                      "content": refusal})
                     continue
                 result = self._call_tool(fn["name"], args)
-                self.last_tool_calls.append((fn["name"], args, result))
-                self.policy.apply(fn["name"], args, result, scene)
+                self._record(fn["name"], args, result, scene)
                 messages.append({"role": "tool", "tool_name": fn["name"],
                                  "content": result})
 
@@ -820,10 +873,19 @@ class DirectAudioLLM:
             # The phrase list only knows phrasings it has seen. Ask the model
             # itself -- any language, any wording -- whether the reply says it
             # handed something over. Runs while the reply is already playing.
-            is_claim = self._judge_claims_action(reply)
+            # With a transcript it also sees the request, so an agreement
+            # ("Of course, you can have a Plopp!") counts too.
+            is_claim = self._judge_claims_action(reply, heard.text if heard is not None else None)
             if is_claim:
                 claimed_kinds = self.policy.claimed_items([reply], scene_at_start)
                 claimed = len(claimed_kinds)
+                if not claimed and scene_at_start:
+                    # The judge's YES names nothing the service has: too weak
+                    # to replace a possibly fine answer with "that did not
+                    # work" (the phrase list's own claims still are).
+                    logger.info("direct: judge YES but nothing in the service state "
+                                f"is named -- leaving the reply: {reply[:60]!r}")
+                    is_claim = False
         if (self._tools and reply and is_claim and moved == 0 and not claimed
                 and scene_at_start):
             # It claimed acting on something the service does not have (at the demo:
@@ -879,8 +941,7 @@ class DirectAudioLLM:
                         continue
                     logger.info(f"direct: recovered tool call {fn['name']}({args})")
                     result = self._call_tool(fn["name"], args)
-                    self.last_tool_calls.append((fn["name"], args, result))
-                    self.policy.apply(fn["name"], args, result, scene)
+                    self._record(fn["name"], args, result, scene)
                     messages.append({"role": "tool", "tool_name": fn["name"],
                                      "content": result})
                 # Only take the retry's words if it produced any: after a

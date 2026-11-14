@@ -83,6 +83,31 @@ class CandyPolicy(ServicePolicy):
                         for n in re.split(r"[()]", d.split(",")[0]) if n.strip()})
         return ", ".join(kinds)
 
+    def normalize_heard(self, text, state):
+        """Whisper wrote "plop" for Plopp and gemma4 then said there was no
+        Plopp on the table. A word close to exactly one one-word candy name
+        (similarity >= 0.8, at least 4 letters) is replaced by that name."""
+        import difflib
+        names = {}
+        for desc in state.values():
+            for part in re.split(r"[()]", desc.split(",")[0]):
+                part = part.strip()
+                if part and " " not in part and len(part) >= 4:
+                    names[part.lower()] = part
+        if not names:
+            return text
+
+        def fix(m):
+            w = m.group(0)
+            low = w.lower()
+            if len(low) < 4 or low in names:
+                return w
+            close = difflib.get_close_matches(low, names, n=2, cutoff=0.8)
+            if len(close) == 1:
+                return names[close[0]]
+            return w
+        return re.sub(r"[^\W\d_][\w\-]*", fix, text)
+
     # --- tool calls -------------------------------------------------------
     def reject(self, name, args, state):
         """The server happily reports "Successfully moved from B1 to O0" for an
@@ -133,6 +158,30 @@ class CandyPolicy(ServicePolicy):
         if name == "show_demo_move":
             return "demo move (random candy)"
         return None
+
+    # --- memory -----------------------------------------------------------
+    def remember(self, name, args, result, state):
+        """"was given a Dumle" when a candy really went to the visitor, so
+        the model can say "another Dumle?" when they come back."""
+        if name != "move_between" or not _MOVE_OK.match(result or ""):
+            return None
+        if _pos(args, "dst") != HAND_OUT:
+            return None
+        desc = state.get(_pos(args, "src")) or ""
+        kind = desc.split(",")[0].strip()
+        return f"was given a {kind}" if kind else "was given a candy"
+
+    _FAVOURITE_CANDY = {
+        "en": ["Hi {name}! What's your favourite candy?",
+               "Hey {name}, got a favourite sweet?",
+               "Hello {name}! Any candy you can't resist?"],
+        "sv": ["Hej {name}! Vilket är ditt favoritgodis?",
+               "Hejsan {name}, har du något favoritgodis?",
+               "Hej {name}! Vad är du för sorts godismänniska?"],
+    }
+
+    def interview_topics(self):
+        return {"favourite_candy": self._FAVOURITE_CANDY}
 
     # --- claims -----------------------------------------------------------
     def claimed_items(self, sentences, state):

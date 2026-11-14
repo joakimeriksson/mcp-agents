@@ -454,6 +454,19 @@ class FaceDatabase:
             logger.info(f"Removed {removed} encodings for {person_id!r}")
         return removed
 
+    def forget_person(self, person_id: str) -> int:
+        """"Forget me": drop ``person_id``'s encodings AND its saved face
+        crops. Returns the number of encodings removed."""
+        removed = self.remove_person(person_id)
+        crops = os.path.realpath(os.path.join(self.db_dir, person_id))
+        root = os.path.realpath(self.db_dir)
+        if (person_id and os.path.dirname(crops) == root
+                and os.path.isdir(crops)):
+            import shutil
+            shutil.rmtree(crops, ignore_errors=True)
+            logger.info(f"Deleted face crops of {person_id!r}")
+        return removed
+
     def rename_person(self, old_id: str, new_id: str) -> int:
         """Reassign all of ``old_id``'s encodings and saved crops to ``new_id``.
 
@@ -992,6 +1005,19 @@ class FaceTracker:
             if pid:
                 result.append(pid)
         return result
+
+    def forget_person(self, person_id: str) -> int:
+        """"Forget me": delete the person's encodings and face crops, and
+        unbind any visible track from that id. The track stays marked as
+        enrolled, so the person in front of the camera is not re-enrolled
+        on the spot; a later visit starts as a stranger."""
+        n = self.db.forget_person(person_id)
+        with self._lock:
+            for tid in [t for t, ident in self._identities.items()
+                        if ident.person_id == person_id]:
+                del self._identities[tid]
+                self._enrolled_track_ids.add(tid)
+        return n
 
     def learn_face(self, track_id: int, person_id: str, frame: np.ndarray) -> bool:
         face = self.get_face_by_id(track_id)

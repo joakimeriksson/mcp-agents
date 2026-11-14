@@ -11,7 +11,8 @@
 #   ask_name   — Prompts for asking an unknown person's name
 #
 # Interview greetings live under [languages.<code>.interview.<topic>].
-# Supported topics: favourite_colour, hobby, favourite_food, favourite_music
+# Topics: the keys under [languages.en.interview]. A service adds its own
+# (ServicePolicy.interview_topics) -- e.g. CandyTron asks about favourite candy.
 #
 # The default language (used when none is detected) is set below.
 
@@ -47,11 +48,6 @@ ask_name = [
 ]
 
 [languages.en.interview]
-favourite_candy = [
-    "Hi {name}! What's your favourite candy?",
-    "Hey {name}, got a favourite sweet?",
-    "Hello {name}! Any candy you can't resist?",
-]
 favourite_coffee = [
     "Hi {name}! How do you like your coffee?",
     "Hey {name}, what's your go-to coffee order?",
@@ -114,11 +110,6 @@ ask_name = [
 ]
 
 [languages.sv.interview]
-favourite_candy = [
-    "Hej {name}! Vilket är ditt favoritgodis?",
-    "Hejsan {name}, har du något favoritgodis?",
-    "Hej {name}! Vad är du för sorts godismänniska?",
-]
 favourite_coffee = [
     "Hej {name}! Hur tar du ditt kaffe?",
     "Hejsan {name}, vad är ditt favoritkaffe?",

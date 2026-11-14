@@ -90,13 +90,19 @@ class Person:
         self.lang = default_lang
         self.lasttime = None
         self.lastmessages = []
+        self.distilled_len = 0   # len(lastmessages) when it was last distilled
         self.profileinfo = None
 
 persondict = {}
 
 curr_person = None
+curr_face_id = None
+# What the service did for whom ("was given a Dumle"), 2 h, in memory only.
+from visit_memory import VisitMemory
+visits = VisitMemory()
 last_greeting_at = 0.0     # time.time() of the last greeting
 REGREET_SECONDS = 20.0     # no new greeting this soon after the last one
+VISIT_MEMORY_SECONDS = 600.0   # a returning face continues its conversation this long
 
 curr_prompt = ""
 curr_audio = None   # the utterance that started the current turn (direct-audio)
@@ -391,7 +397,7 @@ def on_exit(state):
     state['newstate'] = 'exit'
 
 def on_face_change(id):
-    global messages, state, curr_person
+    global messages, state, curr_person, curr_face_id
     logger.info("Face change event")
     if muted or state['newstate'] == 'exit':
         return
@@ -400,8 +406,13 @@ def on_face_change(id):
     if curr_person:
         logger.info("Storing current person")
         curr_person.lasttime = time.time()
-        if not omit_names_and_prefs and curr_person.lastmessages is not messages: # Does this work? I try to see if anything new has been said, otherwise there is no point extracting again. If there are many switches between people.
-            curr_person.lastmessages = messages
+        # Always keep the conversation: a visitor who steps out of view and
+        # back continues it (it used to be kept only when name distillation
+        # was on -- off at the demo -- so they came back to an empty history).
+        curr_person.lastmessages = messages
+        if not omit_names_and_prefs and len(messages) > curr_person.distilled_len:
+            # Something new was said since the last distillation.
+            curr_person.distilled_len = len(messages)
             target_person = curr_person
             msgs_to_distill = list(messages)
             def _async_distill():
@@ -429,6 +440,7 @@ def on_face_change(id):
             threading.Thread(target=_async_distill, daemon=True).start()
         else:
             print("(Nothing new to extract)")
+    curr_face_id = id
     if id is None:
         _ilog("face_change", face_id=None, status="none", name=None, lang=None, last_seen_seconds_ago=None)
         messages = []
@@ -438,7 +450,15 @@ def on_face_change(id):
     else:
         if id in persondict:
             curr_person = persondict[id]
-            messages = list(curr_person.lastmessages or [])
+            # The same list, not a copy: what is said now is kept with them.
+            # Only within one visit: after VISIT_MEMORY_SECONDS they start
+            # fresh, so a wrong face match much later cannot hand a stranger
+            # someone else's conversation.
+            if (curr_person.lasttime is None
+                    or time.time() - curr_person.lasttime > VISIT_MEMORY_SECONDS):
+                curr_person.lastmessages = []
+                curr_person.distilled_len = 0
+            messages = curr_person.lastmessages
             logger.info("Retrieving person %s from memory", id)
             last_seen = (time.time() - curr_person.lasttime) if curr_person.lasttime else None
             _ilog("face_change",
@@ -459,6 +479,7 @@ def on_face_change(id):
             messages = []
             logger.info("Creating person %s", id)
             _ilog("face_change", face_id=id, status="new", name=None, lang=None, last_seen_seconds_ago=None)
+        visits.seen(id, curr_person.lang)
         state['evtime'] = time.time()
         if curr_person.lasttime and state['evtime'] - curr_person.lasttime < 60:
             state['newstate'] = 'listen'
@@ -1209,6 +1230,7 @@ async def main(args):
                 on_face_change(person_id)
 
         def _on_face_event(ev):
+            global curr_face_id
             if ev.type == FaceEventType.FOCUS_CHANGED:
                 tid = ev.payload.new_track_id
                 focus_state["track_id"] = tid if tid else None
@@ -1231,6 +1253,9 @@ async def main(args):
                         # so the ongoing conversation is NOT restarted.
                         if provisional in persondict:
                             persondict[ev.payload.person_id] = persondict.pop(provisional)
+                        visits.rekey(provisional, ev.payload.person_id)
+                        if curr_face_id == provisional:
+                            curr_face_id = ev.payload.person_id
                         if voice_db is not None:
                             voice_db.rename(provisional, ev.payload.person_id)
                         focus_state["person_id"] = ev.payload.person_id
@@ -1497,6 +1522,10 @@ async def main(args):
                                and prompt == RAW_AUDIO_TEXT and turn_audio is not None)
                 greet_stream = direct_llm is not None and newstate == 'greet'
                 turn_lines = []   # direct turns print as one block once the transcript is in
+                # This visitor's conversation for the whole turn: the camera thread
+                # rebinds the global `messages` when the face changes, and the reply
+                # that arrives afterwards belongs to the person who asked, not the next one.
+                turn_msgs = messages
                 if direct_turn:
                     # Consumed: never reuse this utterance for a later turn (#26).
                     curr_audio = None
@@ -1505,12 +1534,12 @@ async def main(args):
                           lang=lang, seconds=round(len(turn_audio) / voice_in.sample_rate, 2))
                     prompt_source = None
                     pending_user_msg = {"role": "user", "content": "(audio — transcribing)"}
-                    messages.append(pending_user_msg)
+                    turn_msgs.append(pending_user_msg)
                 elif newstate == 'process':
                     turn_user_line = f"  User:   ({lang}, typed) {prompt}"
                     _ilog("user_turn", kind=prompt_source or "unknown", content=prompt, lang=lang)
                     prompt_source = None
-                    messages.append(user_message(prompt))
+                    turn_msgs.append(user_message(prompt))
                 elif newstate == 'greet':
                     if omit_names_and_prefs:
                         greetprompt = greet_prompt_noname()
@@ -1521,12 +1550,12 @@ async def main(args):
                           kind="greet_noname" if omit_names_and_prefs else "greet",
                           content=greetprompt['content'],
                           lang=lang)
-                    messages.append(greetprompt)
+                    turn_msgs.append(greetprompt)
 
                 tts_streamed = False
                 if direct_turn:
                     # One multimodal call: hear + persona + live scene + tools.
-                    history = _text_history(messages[:-1], messages_trunclen)
+                    history = _text_history(turn_msgs[:-1], messages_trunclen)
                     t0 = time.time()
                     _ilog("direct_request", lang=lang, history_turns=len(history),
                           tool_count=len(direct_llm._tools))
@@ -1576,14 +1605,18 @@ async def main(args):
                         _ilog("tool_call_rejected", name=_tn, arguments=_ta, reason=_tr)
                     for _tn, _ta, _tr in getattr(direct_llm, "last_tool_calls", []):
                         _ilog("tool_call", name=_tn, arguments=_ta, result=_tr)
+                    if curr_face_id:
+                        for _note in getattr(direct_llm, "last_notes", []):
+                            visits.note(curr_face_id, _note)
+                            _ilog("visit_note", face_id=curr_face_id, note=_note)
                     _done = [(n, a, r) for n, a, r in getattr(direct_llm, "last_tool_calls", [])]
                     if _done:
                         # Keep the arm calls in the history (see _text_history).
-                        messages.append({"role": "assistant", "content": "", "tool_calls": [
+                        turn_msgs.append({"role": "assistant", "content": "", "tool_calls": [
                             {"function": {"name": n, "arguments": a}} for n, a, _r in _done]})
-                        messages.extend({"role": "tool", "tool_name": n, "content": r}
+                        turn_msgs.extend({"role": "tool", "tool_name": n, "content": r}
                                         for n, _a, r in _done)
-                    messages.append({"role": "assistant", "content": reply_text})
+                    turn_msgs.append({"role": "assistant", "content": reply_text})
                     _ilog("direct_response", content=reply_text, lang=lang,
                           lang_id=list(getattr(direct_llm, "last_lid", (None, 0.0))),
                           tool_calls=[{"name": n, "arguments": a}
@@ -1625,12 +1658,16 @@ async def main(args):
                         sentence_q.put(sentence)
                     try:
                         reply_text, _glang = await asyncio.to_thread(
-                            direct_llm.greet, messages[-1]['content'],
+                            direct_llm.greet, turn_msgs[-1]['content'],
                             language=lang,
                             service_prompt=sysprompt['content'],
                             augmentation=augprompt['content'] if augprompt else None,
-                            history=_text_history(messages[:-1], messages_trunclen),
-                            on_sentence=None if muted else _on_greet_sentence)
+                            history=_text_history(turn_msgs[:-1], messages_trunclen),
+                            on_sentence=None if muted else _on_greet_sentence,
+                            # Greeting only: in a tool turn the line made gemma4
+                            # promise "one more" without moving, or pick the
+                            # wrong candy (simulation, 2026-11-14).
+                            context=visits.line(curr_face_id) if curr_face_id else "")
                     except Exception as e:
                         logger.exception("greeting failed")
                         _ilog("llm_error", error_class=type(e).__name__, error_message=str(e))
@@ -1638,17 +1675,17 @@ async def main(args):
                     finally:
                         sentence_q.put(None)
                     tts_streamed = bool(stream_lang)
-                    messages.append({"role": "assistant", "content": reply_text})
+                    turn_msgs.append({"role": "assistant", "content": reply_text})
                     _ilog("greet_response", content=reply_text, lang=lang,
                           seconds=round(time.time() - t0, 2))
                 else:
                     iteration = 0
-                    msg = compose_messages(sysprompt, messages, augpromptlist)
+                    msg = compose_messages(sysprompt, turn_msgs, augpromptlist)
                     #messagedump(msg)
                     _ilog("llm_request",
                           iteration=iteration,
                           model=model,
-                          messages_full=list(messages),
+                          messages_full=list(turn_msgs),
                           messages_sent=msg,
                           tool_count=len(tools or []))
                     try:
@@ -1675,7 +1712,7 @@ async def main(args):
                     tool_calls = rmsg.tool_calls
                     turn_scene_pos = policy.parse_state(augprompt['content'] if augprompt else None)
                     while tool_calls and iteration < 4:
-                        messages.append(rhist)
+                        turn_msgs.append(rhist)
                         for tool_call in tool_calls:
                             try:
                                 args_parsed = json.loads(tool_call.function.arguments)
@@ -1685,7 +1722,7 @@ async def main(args):
                                        if isinstance(args_parsed, dict) else None)
                             if refusal:
                                 logger.warning(f"classic: refused {tool_call.function.name}({args_parsed}): {refusal}")
-                                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                turn_msgs.append({"role": "tool", "tool_call_id": tool_call.id,
                                                  "content": json.dumps({"result": refusal})})
                                 continue
                             try:
@@ -1709,7 +1746,7 @@ async def main(args):
                                       arguments_parsed=args_parsed,
                                       success=True,
                                       result_text=resulttxt)
-                                messages.append(result_message)
+                                turn_msgs.append(result_message)
                             except exceptions.ToolError as te:
                                 result_message = {
                                     "role": "tool",
@@ -1725,15 +1762,15 @@ async def main(args):
                                       arguments_parsed=args_parsed,
                                       success=False,
                                       error_message=f"ToolError: {te}")
-                                messages.append(result_message)
+                                turn_msgs.append(result_message)
 
                         iteration += 1
-                        msg = compose_messages(sysprompt, messages, augpromptlist)
+                        msg = compose_messages(sysprompt, turn_msgs, augpromptlist)
                         #messagedump(msg)
                         _ilog("llm_request",
                               iteration=iteration,
                               model=model,
-                              messages_full=list(messages),
+                              messages_full=list(turn_msgs),
                               messages_sent=msg,
                               tool_count=len(tools or []))
                         try:
@@ -1760,7 +1797,7 @@ async def main(args):
                     # store leftover tool syntax.
                     reply_text = _strip_tool_text(rmsg.content or "") if has_tool_text(rmsg.content or "") else (rmsg.content or "")
                     reply_text = _split_lang(reply_text, "")[1]
-                    messages.append({"role": "assistant", "content": reply_text})
+                    turn_msgs.append({"role": "assistant", "content": reply_text})
                 if not direct_turn:
                     emit_turn([turn_scene, turn_user_line, f"  Agent:  ({lang}) {reply_text}",
                                *actions_block(classic_calls)],

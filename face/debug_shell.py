@@ -13,7 +13,13 @@ import logging
 import time
 from typing import Optional
 
-from people_memory import PeopleMemory, INTERVIEW_TOPICS
+from people_memory import PeopleMemory
+from languages_config import get_language_config
+
+
+def _topics() -> list[str]:
+    """The generic interview topics (a service may add more at runtime)."""
+    return list(get_language_config().get("interview", {}).keys())
 
 
 MEMORY_HELP = """\
@@ -137,9 +143,9 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
                     person = mem.get_by_name(name)
                     if not person:
                         continue
-                    last = person.last_seen_dt()
+                    last = person.last_seen_dt
                     last_str = last.strftime("%Y-%m-%d %H:%M:%S") if last else "-"
-                    missing = person.missing_topics() or []
+                    missing = person.missing_topics(_topics()) or []
                     topics_str = (f"{len(missing)} pending"
                                   if missing else "all asked")
                     rows.append((
@@ -177,7 +183,9 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
                     print("  Facts:")
                     if person.facts:
                         for f in person.facts:
-                            print(f"    - {f}")
+                            mark = "✓" if f.confirmed else "?"
+                            print(f"    {mark} {f.text}  (x{f.count}"
+                                  f"{', stated' if f.explicit else ''})")
                     else:
                         print("    (none)")
                     print("  Asked topics:")
@@ -186,7 +194,7 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
                             print(f"    - {t}")
                     else:
                         print("    (none)")
-                    missing = person.missing_topics()
+                    missing = person.missing_topics(_topics())
                     if missing:
                         print(f"  Not yet asked: {', '.join(missing)}")
         elif cmd == "context":
@@ -200,7 +208,7 @@ def run_shell(mem: PeopleMemory, agent: Optional[object] = None):
                 if not person:
                     print(f"No person named '{name}'")
                 else:
-                    missing = person.missing_topics()
+                    missing = person.missing_topics(_topics())
                     if not missing:
                         print("All interview topics have been asked.")
                     else:

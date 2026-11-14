@@ -18,15 +18,13 @@ import threading
 import logging
 import urllib.request
 import urllib.error
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
 
-from pydantic_ai import Agent as PydanticAgent, RunContext
+from pydantic_ai import Agent as PydanticAgent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.usage import UsageLimits
 
 from people_memory import PeopleMemory
 from languages_config import get_language_config
@@ -52,16 +50,23 @@ Rules:
   only when it genuinely makes the reply more personal.
 - No markdown or emojis. Keep spoken responses natural and conversational."""
 
-# ---------------------------------------------------------------------------
-# Tool deps — passed to pydantic-ai tools via RunContext
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ConversationDeps:
-    """Dependencies injected into pydantic-ai tool calls."""
-    memory: PeopleMemory
-    track_id: int
-    person_id: str = ""
+def parse_visit_json(raw: str) -> Optional[dict]:
+    """The end-of-visit pass's JSON, tolerating a <think> block, code
+    fences or prose around it. None if there is no JSON object."""
+    import re
+    text = re.sub(r"<think>.*?</think>", " ", raw or "", flags=re.S)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("facts", []), list):
+        data["facts"] = []
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +88,8 @@ class ConversationLLM:
                  agent_name: str = "Face Agent",
                  smart_greetings: bool = False,
                  service_prompt: Optional[str] = None,
-                 augmentation_provider: Optional[Callable[[str], Optional[str]]] = None):
+                 augmentation_provider: Optional[Callable[[str], Optional[str]]] = None,
+                 interview_topics: Optional[dict] = None):
         provider = OpenAIProvider(base_url=ollama_url, api_key="ollama")
         model = OpenAIChatModel(model_name, provider=provider)
         self._model = model
@@ -94,8 +100,11 @@ class ConversationLLM:
         self._smart_greetings = smart_greetings
         self._service_prompt = service_prompt
         # Called before each response with the language code; returns fresh
-        # service state (e.g. candy positions) to inject before the user turn.
+        # service state (e.g. what its camera sees) to inject before the user turn.
         self._augmentation_provider = augmentation_provider
+        # Small-talk topics the service adds ({topic: {lang: [templates]}},
+        # ServicePolicy.interview_topics); the generic ones are in languages.toml.
+        self._service_topics = interview_topics or {}
 
         # Build capabilities text from MCP descriptions
         if mcp_descriptions:
@@ -211,7 +220,8 @@ class ConversationLLM:
     def generate_greeting(self, memory: PeopleMemory, track_id: int,
                           emotion: str = "",
                           interview_topic: Optional[str] = None,
-                          language: str = "en") -> str:
+                          language: str = "en",
+                          extra_context: str = "") -> str:
         """Return a greeting for ``track_id``.
 
         By default picks a random canned template — instant, no LLM call.
@@ -224,7 +234,9 @@ class ConversationLLM:
         if not self._smart_greetings:
             return self._canned_greeting(name, interview_topic, language)
 
-        context = memory.get_context_for_llm(track_id, max_dialogues=5)
+        context = memory.get_context_for_llm(track_id)
+        if extra_context:   # the visit memory: "They came back ... Earlier: ..."
+            context += "\n" + extra_context
         lang_name = self._LANG_NAMES.get(language, language)
         lang_instruction = f"You MUST reply in {lang_name}." if language != "en" else ""
         if interview_topic:
@@ -241,6 +253,11 @@ Emotion: {emotion or 'neutral'}"""
         fallback = self._canned_greeting(name, interview_topic, language)
         return self._call_llm(prompt, "greeting", fallback)
 
+    def interview_topics(self) -> list[str]:
+        """Topics to ask about, in order: languages.toml's, then the service's."""
+        generic = list(get_language_config().get("interview", {}).keys())
+        return generic + [t for t in self._service_topics if t not in generic]
+
     def _canned_greeting(self, name: str,
                          interview_topic: Optional[str],
                          language: str = "en") -> str:
@@ -250,8 +267,9 @@ Emotion: {emotion or 'neutral'}"""
         if name == "someone":
             return random.choice(greetings).format(name=name) if greetings else f"Hello {name}!"
         if interview_topic:
-            interview = cfg.get("interview", {})
-            options = interview.get(interview_topic)
+            service = self._service_topics.get(interview_topic, {})
+            options = (service.get(language) or service.get("en")
+                       or cfg.get("interview", {}).get(interview_topic))
             if not options:
                 options = get_language_config().get("interview", {}).get(interview_topic)
             if options:
@@ -271,12 +289,12 @@ Emotion: {emotion or 'neutral'}"""
                           heard_text: str, language: str = "en") -> str:
         """Generate a conversational response.
 
-        Fact extraction happens separately in a background call (see
-        ``extract_facts``). This method focuses on fast response generation.
+        Facts are learned separately, once per visit (``consolidate_visit``).
+        This method focuses on fast response generation.
         MCP toolsets are wired in if configured.
         """
         if track_id:
-            context = memory.get_context_for_llm(track_id, max_dialogues=5)
+            context = memory.get_context_for_llm(track_id)
         else:
             context = "Unknown person."
 
@@ -304,126 +322,78 @@ You MUST reply in {lang_name}. Keep it to 1-2 short sentences. Address them by n
         prefix = _fallbacks.get(language, "I heard you say: ")
         return self._call_llm(prompt, "response", f"{prefix}{heard_text}")
 
-    def extract_facts_with_tools(self, memory: PeopleMemory, track_id: int,
-                                person_said: str, agent_said: str = ""):
-        """Background: use tool calling to extract and store facts.
+    # --- End-of-visit memory pass -------------------------------------
 
-        Runs WITHOUT reasoning_effort:none so the model can call tools.
-        Slower (~5-13s) but uses proper function calling. Meant to run
-        in a background thread so the user doesn't wait.
-        """
+    _VISIT_SYSTEM = (
+        "You maintain a robot's long-term memory of one person. You get what "
+        "was said during one visit (speech recognition: it can be wrong) and "
+        "what is already known. Output ONLY JSON:\n"
+        '{"facts": [{"fact": "...", "quote": "...", "explicit": true}], '
+        '"summary": "..."}\n\n'
+        "facts: only lasting things the person said about THEMSELVES (work, "
+        "home town, family, hobbies, likes and dislikes, plans). Each fact is "
+        "a short English bare predicate with no subject: 'works as a nurse', "
+        "'likes black coffee'. quote: the exact words from a 'Them:' line it "
+        "came from, copied in the original language. explicit: true only if "
+        "they said it plainly about themselves ('I work as a nurse').\n"
+        "NOT facts: what they asked, said or talked about ('mentioned X', "
+        "'asked about Y'), what they want right now, their name, anything "
+        "about the robot, and anything garbled or out of place -- that is "
+        "probably misheard. A TV, radio or other people may be in the "
+        "transcript: only what the person says about THEMSELVES, in the "
+        "first person, counts. Repeat a known fact only if they said it "
+        "again. No facts is fine and common: {\"facts\": [], \"summary\": \"\"}.\n"
+        "summary: who this person is, for next time (1-2 sentences, English, "
+        "at most 200 characters), merging the previous summary with what you "
+        "learned. Describe the PERSON, never the conversation or its topics. "
+        "Empty string if you learned nothing about them.")
+
+    def consolidate_visit(self, memory: PeopleMemory, track_id: int,
+                          timeout: float = 90.0) -> Optional[dict]:
+        """Turn the dialogue since the last pass into facts and a summary
+        (one LLM call, no tools, off the critical path). The result goes
+        through ``memory.apply_visit_facts``, which keeps only facts whose
+        quote really is in what the person said. Returns its report, or
+        None when there was nothing new or the call failed (the lines then
+        stay pending for the next pass)."""
         person = memory.get(track_id)
-        if not person:
-            return
-        person_id = person.persistent_id or ""
-        context = memory.get_context_for_llm(track_id, max_dialogues=5)
-
-        prompt = f"""Here is what we know about this person:
-
-{context}
-
-The person just said: "{person_said}"
-
-Look at the "Known facts" above. Only call write_fact for facts that are
-NOT already listed. Do NOT repeat existing facts.
-If the person revealed something genuinely new, call write_fact.
-If nothing new was revealed, say "Nothing new." """
-
-        deps = ConversationDeps(
-            memory=memory, track_id=track_id, person_id=person_id)
-        logger.info(f"[LLM:tools] extracting facts with tool calling")
+        lines = memory.pending_visit_lines(track_id)
+        heard = [d.text for d in lines if d.speaker == "person" and d.text.strip()]
+        if not person or not heard:
+            if lines:
+                memory.mark_consolidated(track_id, lines[-1].timestamp)
+            return None
+        known = "; ".join(f.text for f in person.facts) or "(nothing yet)"
+        transcript = "\n".join(
+            f"{'Them' if d.speaker == 'person' else 'Robot'}: {d.text}" for d in lines)
+        prompt = (f"Known facts: {known}\n"
+                  f"Previous summary: {person.summary or '(none)'}\n\n"
+                  f"This visit:\n{transcript}")
         start = time.time()
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._arun_with_tools(prompt, deps), self._loop)
-            output = future.result(timeout=30)
-            elapsed = time.time() - start
-            logger.info(f"[LLM:tools] done ({elapsed:.1f}s): {output}")
+            future = asyncio.run_coroutine_threadsafe(self._arun_plain(
+                self._VISIT_SYSTEM, prompt), self._loop)
+            raw = future.result(timeout=timeout)
         except Exception as e:
-            elapsed = time.time() - start
-            logger.warning(f"[LLM:tools] failed after {elapsed:.1f}s: {e}")
+            logger.warning(f"[LLM:visit] failed after {time.time() - start:.1f}s: {e}")
+            return None
+        parsed = parse_visit_json(raw)
+        if parsed is None:
+            logger.warning(f"[LLM:visit] unparseable output: {raw[:200]!r}")
+            return None
+        report = memory.apply_visit_facts(
+            track_id, parsed.get("facts") or [], "\n".join(heard),
+            summary=parsed.get("summary") if isinstance(parsed.get("summary"), str) else None)
+        memory.mark_consolidated(track_id, lines[-1].timestamp)
+        logger.info(f"[LLM:visit] {time.time() - start:.1f}s: kept {report['kept']}, "
+                    f"dropped {len(report['dropped'])}")
+        return report
 
-    def _make_tool_agent(self) -> PydanticAgent:
-        """Create a pydantic-ai agent with write_fact, replace_fact, set_name.
-
-        Thinking stays enabled here -- the model needs reasoning to decide
-        which tools to call and to produce quality facts.
-        """
-        agent = PydanticAgent(
-            self._model,
-            system_prompt=(
-                "You are a fact extraction assistant. Your ONLY job is to use "
-                "the tools to store NEW personal facts about the person.\n\n"
-                "Rules:\n"
-                "- NEVER store a fact that is already in the Known facts list.\n"
-                "- Only call write_fact for genuinely NEW information.\n"
-                "- Call replace_fact when a fact updates or contradicts an "
-                "existing one.\n"
-                "- Call set_name if they state or correct their name.\n"
-                "- If nothing new was said, do NOT call any tools.\n\n"
-                "Fact formatting — VERY IMPORTANT:\n"
-                "- Write facts as bare predicates with NO subject.\n"
-                "- GOOD: 'likes chess', 'is a musician', 'mentioned a hotel'.\n"
-                "- BAD:  'Joakim likes chess', 'The person is a musician', "
-                "'He mentioned a hotel'.\n"
-                "- Do not add a trailing period. Keep it short."
-            ),
-            deps_type=ConversationDeps,
-            toolsets=self._mcp_servers,
-        )
-
-        @agent.tool
-        def write_fact(ctx: RunContext[ConversationDeps], fact: str) -> str:
-            """Remember a personal fact about the person.
-
-            Always write the fact in English (translating if needed) and as a
-            BARE PREDICATE — no subject, no name, no pronoun. For example:
-            write 'likes chess', not 'Joakim likes chess' or 'He likes chess'.
-            Storage will auto-strip subjects, but keep the input clean.
-            """
-            logger.info(f"[TOOL:write_fact] {fact}")
-            ctx.deps.memory.add_fact(ctx.deps.track_id, fact)
-            return "Stored."
-
-        @agent.tool
-        def replace_fact(ctx: RunContext[ConversationDeps], old_fact: str, new_fact: str) -> str:
-            """Replace an outdated fact with an updated version."""
-            logger.info(f"[TOOL:replace_fact] {old_fact!r} -> {new_fact!r}")
-            ctx.deps.memory.replace_fact(ctx.deps.track_id, old_fact, new_fact)
-            return "Replaced."
-
-        @agent.tool
-        def set_name(ctx: RunContext[ConversationDeps], name: str) -> str:
-            """Update the person's name if they corrected or stated it."""
-            logger.info(f"[TOOL:set_name] {name}")
-            ctx.deps.memory.set_name(ctx.deps.track_id, name)
-            return "Name updated."
-
-        return agent
-
-    async def _arun_with_tools(self, prompt: str, deps: ConversationDeps) -> str:
-        """Run the tool-calling agent (write_fact, replace_fact, set_name).
-
-        Uses request_limit=2: request 1 = model calls tools, request 2 =
-        model sees tool results and responds. This works around an Ollama
-        /v1 bug where a 3rd request (pydantic-ai retry after an empty
-        assistant message) includes content:null which Ollama rejects.
-        """
-        from pydantic_ai.exceptions import UsageLimitExceeded
-        limits = UsageLimits(request_limit=2)
-        agent = self._make_tool_agent()
-        try:
-            if self._mcp_servers:
-                async with agent:
-                    result = await agent.run(prompt, deps=deps, usage_limits=limits)
-                    return result.output.strip()
-            else:
-                result = await agent.run(prompt, deps=deps, usage_limits=limits)
-                return result.output.strip()
-        except UsageLimitExceeded:
-            # Tools already ran — the limit just prevented the
-            # problematic retry that Ollama can't handle.
-            return "Tools executed."
+    async def _arun_plain(self, system: str, prompt: str) -> str:
+        """One LLM call with NO tools (memory work must never move an arm)."""
+        agent = PydanticAgent(self._model, system_prompt=system)
+        result = await agent.run(prompt)
+        return result.output.strip()
 
     def generate_ask_name(self, track_id: int, language: str = "en") -> str:
         """Return a random 'what's your name?' prompt. Always canned."""

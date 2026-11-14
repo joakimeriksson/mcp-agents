@@ -29,6 +29,8 @@ import numpy as np
 from voice_input import VoiceInput, AudioMonitor, ContinuousListener, EchoDetector
 from voice_output import VoiceOutput
 from people_memory import PeopleMemory
+from visit_memory import VisitMemory
+from forget import is_forget_request, confirmation as forget_confirmation
 from llm import ConversationLLM
 from languages_config import get_goodbye, get_default_language
 
@@ -177,6 +179,12 @@ class Agent:
         # AEC auto-disable: skip after repeated failures
         self._aec_failures: int = 0
         self._aec_disabled: bool = False
+
+        # Short-term: what the service did for whom ("was given a Dumle").
+        self.visits = VisitMemory()
+        # Long-term facts are learned once per visit, in the background.
+        self._consolidating: set = set()
+        self._consolidate_lock = threading.Lock()
 
         # Cooldown tracking
         self._greeted: dict[str, float] = {}      # person_id -> timestamp
@@ -487,6 +495,7 @@ class Agent:
         face = self.tracker.get_face_by_id(tid)
         self.memory.identify(tid, p.person_id)
         self.memory.update_seen(tid, face.emotion if face else "")
+        self.visits.seen(p.person_id)
         self._try_greet(tid, p.person_id)
 
     def _handle_face_appeared(self, event: FaceEvent):
@@ -498,6 +507,7 @@ class Agent:
         if p.initial_person_id:
             self.memory.identify(tid, p.initial_person_id)
             self.memory.update_seen(tid, p.emotion)
+            self.visits.seen(p.initial_person_id)
             self._try_greet(tid, p.initial_person_id)
 
     def _try_greet(self, track_id: int, person_id: str):
@@ -519,6 +529,8 @@ class Agent:
             return
 
         tid = event.track_id
+        # They left: turn this visit's conversation into facts.
+        self._consolidate_async(tid)
         person = self.memory.get(tid) or self.memory.get_by_id(pid)
         name = person.name if person else None
         if not name:
@@ -606,6 +618,10 @@ class Agent:
             name = person.name if person else None
             lang = self.voice_in.detected_language or "en"
 
+            if is_forget_request(text):
+                self._forget(tid, lang)
+                return
+
             # Log dialogue
             if tid:
                 self.memory.add_dialogue(tid, "person", text,
@@ -633,13 +649,10 @@ class Agent:
             self.state = "TALKING"
             self.speak(response, language=lang)
 
-            # Background fact extraction — runs for both identified and
-            # unidentified people so set_name can catch names from
-            # normal conversation (not just the ask-name flow).
-            if tid and person:
-                threading.Thread(target=self._extract_facts,
-                                 args=(tid, text),
-                                 daemon=True).start()
+            # Facts are learned once per visit (when they leave, or after a
+            # long talk), not after every sentence.
+            if tid:
+                self._maybe_consolidate(tid)
 
         finally:
             self._clear_busy()
@@ -666,15 +679,22 @@ class Agent:
             tid = primary.track_id if primary else None
             person = self.memory.get(tid) if tid else None
             name = person.name if person else None
-            context = (self.memory.get_context_for_llm(tid, max_dialogues=5)
+            context = (self.memory.get_context_for_llm(tid)
                        if tid else "Unknown person.")
             lang_hint = self.voice_in.detected_language or "en"
+            visit_key = self._visit_key(tid)
+            self.visits.seen(visit_key, lang_hint)
+            # The visit line ("Earlier: was given a Dumle") goes to greetings
+            # only: in a tool turn it made gemma4 promise "one more" without
+            # calling the tool, or pick the wrong item.
 
             self.state = "THINKING"
             response, lang = self.direct_llm.respond(
                 audio, context=context, language_hint=lang_hint)
             # Keep downstream consumers (goodbyes, next hint) consistent
             self.voice_in.detected_language = lang
+            for note in getattr(self.direct_llm, "last_notes", []):
+                self.visits.note(visit_key, note)
 
             self._emit(AgentEventType.RESPONDING, RespondingPayload(
                 track_id=tid, name=name, heard="[audio]",
@@ -702,12 +722,14 @@ class Agent:
                     return
                 if not text:
                     return
+                if is_forget_request(text):
+                    self._forget(tid, lang, wait_for_turn=True)
+                    return
                 if tid:
                     self.memory.add_dialogue(tid, "person", text, language=lang)
                     if person and not person.is_identified:
                         self._try_learn_name(tid, text)
-                    if person:
-                        self._extract_facts(tid, text)
+                    self._maybe_consolidate(tid)
             threading.Thread(target=_memorize, daemon=True).start()
 
         finally:
@@ -741,7 +763,7 @@ class Agent:
             person = self.memory.get(track_id)
             interview_topic: Optional[str] = None
             if person and person.is_identified:
-                missing = person.missing_topics()
+                missing = person.missing_topics(self.llm.interview_topics())
                 if missing:
                     interview_topic = missing[0]
                     logger.info(f"[AGENT] interview: will ask {name} about {interview_topic}")
@@ -750,7 +772,8 @@ class Agent:
             logger.info(f"[AGENT] _do_greet: generating greeting for {name} (emotion={emotion}, lang={lang})")
             greeting = self.llm.generate_greeting(
                 self.memory, track_id, emotion, interview_topic=interview_topic,
-                language=lang or "en")
+                language=lang or "en",
+                extra_context=self.visits.line(self._visit_key(track_id)))
             logger.info(f"[AGENT] _do_greet: greeting ready")
 
             if interview_topic:
@@ -813,23 +836,69 @@ class Agent:
         person_id = self.memory.set_name(track_id, extracted)
         logger.info(f"[AGENT] learned name {extracted!r} for track {track_id} ({person_id})")
 
-    def _extract_facts(self, track_id: int, person_said: str):
-        """Background: extract facts via tool calling (write_fact, replace_fact, set_name).
+    # --- Memory: visits, facts, forgetting ---
 
-        Uses proper function calling — the LLM calls tools to store facts.
-        Runs without reasoning_effort:none so tools work. Slower but runs
-        in a background thread so the user doesn't wait.
-        """
-        person = self.memory.get(track_id)
-        if not person:
+    LONG_VISIT_LINES = 12   # consolidate mid-visit after this many new lines
+
+    def _visit_key(self, tid):
+        """Visit memory key: the stable person id when known, else the track."""
+        person = self.memory.get(tid) if tid else None
+        return (person.persistent_id if person and person.persistent_id
+                else f"track{tid}")
+
+    def _maybe_consolidate(self, tid: int):
+        """Mid-visit pass for someone who talks for a long time."""
+        if len(self.memory.pending_visit_lines(tid)) >= self.LONG_VISIT_LINES:
+            self._consolidate_async(tid)
+
+    def _consolidate_async(self, tid: Optional[int]):
+        """Background: learn facts from the visit (named people only -- an
+        anonymous visitor is not profiled). One pass per person at a time;
+        lines that arrive meanwhile wait for the next one."""
+        person = self.memory.get(tid) if tid is not None else None
+        if not person or not person.is_identified:
             return
-        last_agent_said = ""
-        for d in reversed(person.dialogues):
-            if d.speaker == "system":
-                last_agent_said = d.text
-                break
-        self.llm.extract_facts_with_tools(
-            self.memory, track_id, person_said, agent_said=last_agent_said)
+        if not self.memory.pending_visit_lines(tid):
+            return
+        with self._consolidate_lock:
+            if tid in self._consolidating:
+                return
+            self._consolidating.add(tid)
+
+        def run():
+            try:
+                self.llm.consolidate_visit(self.memory, tid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[AGENT] visit consolidation failed: {e}")
+            finally:
+                with self._consolidate_lock:
+                    self._consolidating.discard(tid)
+        threading.Thread(target=run, daemon=True, name="visit-memory").start()
+
+    def _forget(self, tid: Optional[int], lang: str, wait_for_turn: bool = False):
+        """"Forget me": delete their memory record, face encodings, face
+        crops and visit memory, then confirm out loud."""
+        person = self.memory.get(tid) if tid is not None else None
+        pid = person.persistent_id if person else ""
+        if not pid and tid is not None:
+            ident = self.tracker.get_identity(tid)
+            pid = getattr(ident, "person_id", "") or ""
+        self.visits.forget(self._visit_key(tid))
+        if pid:
+            self.memory.forget(pid)
+            self.tracker.forget_person(pid)
+            self.visits.forget(pid)
+            self._greeted.pop(pid, None)
+        logger.info(f"[AGENT] forgot {pid or 'an unknown person'} (track {tid}) on request")
+        text = forget_confirmation(lang)
+        if wait_for_turn:
+            # Called from the background transcript: the reply may still be
+            # playing; wait for it rather than talk over it.
+            for _ in range(100):
+                if not self.voice_out.speaking and not self._busy:
+                    break
+                time.sleep(0.1)
+        self.speak(text, language=lang)
 
     def _emit(self, etype, payload):
         event = AgentEvent(type=etype, timestamp=time.time(), payload=payload)
@@ -984,6 +1053,7 @@ def main():
     service = ServiceHost(args.service_server) if args.service_server else None
     agent_name = args.agent_name
     service_prompt = None
+    policy = None
     if service:
         if not service.init():
             print(f"ERROR: service_init failed at {args.service_server}",
@@ -993,6 +1063,7 @@ def main():
         if name and args.agent_name == "Face Agent":  # not overridden by CLI
             agent_name = name
         service_prompt = service.fetch_prompt(get_default_language())
+        policy = service.fetch_policy()
         logger.info(f"Service: name={name!r}, "
                     f"persona={'yes' if service_prompt else 'no'}")
 
@@ -1005,6 +1076,7 @@ def main():
         smart_greetings=args.smart_greeting,
         service_prompt=service_prompt,
         augmentation_provider=service.fetch_augmentation if service else None,
+        interview_topics=policy.interview_topics() if policy else None,
     )
     try:
         llm.validate()
@@ -1024,7 +1096,7 @@ def main():
             service_prompt=service_prompt,
             augmentation_provider=service.fetch_augmentation if service else None,
             tools_url=args.service_server,
-            policy=service.fetch_policy() if service else None,
+            policy=policy,
         )
         if service:
             direct_llm.service_rules = service.fetch_rules(get_default_language()) or ""

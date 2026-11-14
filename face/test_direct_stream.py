@@ -269,3 +269,82 @@ def test_generic_written_tool_call_is_recovered():
     reply, lang, heard = run(llm)
     assert llm.moves == [{"room": "hall", "on": "false"}]
     assert all("set_light" not in s and "{" not in s for s, _, _ in heard)
+
+
+# --- Whisper ear: the judge sees the request; transcripts snap to candy names ---
+
+PLOPP_SCENE = "Positions:\nC1 : Plopp, chocolate.\nD2 : Dumle, toffee."
+
+
+class FakeEar:
+    """Stands in for lang_id.LanguageID with a fixed transcript."""
+    available = True
+
+    def __init__(self, text, lang="en"):
+        from lang_id import Heard
+        self.heard = Heard(text, lang, "ok")
+
+    def transcribe(self, audio, hint_words=""):
+        self.hint_words = hint_words
+        return self.heard
+
+    def detect(self, audio):
+        return self.heard.language, 0.99
+
+
+def whisper(llm, text, lang="en"):
+    llm.ear, llm.lang_id = "whisper", FakeEar(text, lang)
+    return llm
+
+
+def run_heard(llm, lang="en"):
+    heard = []
+    reply, rlang = llm.respond(np.zeros(32000, np.float32), language_hint=lang,
+                               augmentation=PLOPP_SCENE,
+                               on_sentence=lambda s, l: heard.append((s, l, len(llm.moves))))
+    return reply, rlang, heard
+
+
+def test_agreement_without_tool_is_retried_with_the_request():
+    # Seen in simulation: "Can I have a plop?" -> "Of course, you can have a
+    # Plopp!" and nothing moved; the reply-only judge said NO.
+    PLOPP = {"function": {"name": "move_between", "arguments": {"src": "C1", "dst": "O0"}}}
+    llm = whisper(make([("[en] Of course, you can have a Plopp!", None),
+                        ("YES", None),                          # judge (with request)
+                        ("[en]", [PLOPP]),                      # retry moves it
+                        ("[en] There you go, one Plopp!", None)]), "Can I have a plop please?")
+    prompts_seen = []
+    chat = llm._client.chat
+    llm._client.chat = lambda **kw: prompts_seen.append(kw["messages"]) or chat(**kw)
+    reply, lang, heard = run_heard(llm)
+    assert llm.moves == [{"src": "C1", "dst": "O0"}]
+    judge = prompts_seen[1][0]["content"]
+    assert "The person said" in judge and "Plopp" in judge     # request, name snapped
+    assert "plop please" not in judge
+
+
+def test_question_answered_is_not_a_claim():
+    llm = whisper(make([("[en] Yes, we have Plopp! Would you like one?", None),
+                        ("NO", None)]), "Do you have Plopp?")
+    reply, lang, heard = run_heard(llm)
+    assert llm.moves == [] and reply == "Yes, we have Plopp! Would you like one?"
+
+
+def test_judge_yes_naming_nothing_on_the_table_keeps_the_reply():
+    # "What can you do?" -> "I can hand you candy!" judged YES must not turn
+    # into "Sorry, that didn't work".
+    llm = whisper(make([("[en] I hand out candy with my robot arm!", None),
+                        ("YES", None)]), "What can you do?")
+    reply, lang, heard = run_heard(llm)
+    assert llm.moves == [] and reply == "I hand out candy with my robot arm!"
+
+
+def test_transcript_snaps_to_candy_names():
+    p = CandyPolicy()
+    scene = {"C1": "Plopp, chocolate", "B2": "Geisha, nougat",
+             "A2": "Riesen toffee (Riesen-kola), toffee"}
+    assert p.normalize_heard("Can I have a plop please?", scene) == "Can I have a Plopp please?"
+    assert p.normalize_heard("Kann ich ein Geischa haben?", scene) == "Kann ich ein Geisha haben?"
+    for keep in ("Kan jag få en dumma?", "Can I have a toffee", "Kan jag få en kola"):
+        assert p.normalize_heard(keep, scene) == keep
+    assert GENERIC.normalize_heard("plop", scene) == "plop"

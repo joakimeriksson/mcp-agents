@@ -53,6 +53,11 @@ class ServicePolicy:
         """Vocabulary for speech recognition (names the user may say)."""
         return ""
 
+    def normalize_heard(self, text: str, state: dict) -> str:
+        """Snap near-misses in the transcript onto names the service knows
+        ("plop" -> "Plopp"), so the model does not say it is not there."""
+        return text
+
     # --- tool calls -------------------------------------------------------
     def reject(self, name: str, args: dict, state: dict) -> Optional[str]:
         """Reason to refuse a call before it reaches the service, or None."""
@@ -69,6 +74,21 @@ class ServicePolicy:
     def describe_call(self, name: str, args: dict) -> Optional[str]:
         """Human-readable action for the transcript, or None for the default."""
         return None
+
+    # --- memory -----------------------------------------------------------
+    def remember(self, name: str, args: dict, result: str, state: dict) -> Optional[str]:
+        """A short note worth remembering about this visitor after a call
+        the service accepted ("was given a Dumle"), or None. Called BEFORE
+        ``apply``, so *state* is the state the call acted on. The client
+        keeps the notes in its visit memory (visit_memory.py) and shows them
+        to the model as "Earlier: was given a Dumle (6 min ago)"."""
+        return None
+
+    def interview_topics(self) -> dict:
+        """Small-talk topics this service adds to the greeting interview:
+        {topic: {lang: ["Hi {name}! ...", ...]}}. The generic ones live in
+        languages.toml."""
+        return {}
 
     # --- claims -----------------------------------------------------------
     def claimed_items(self, sentences: list, state: dict) -> set:
